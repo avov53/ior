@@ -5,6 +5,8 @@ set "ROOT=%~dp0"
 set "DIST=%ROOT%dist"
 set "DIST10=%DIST%\windows-10"
 set "DIST11=%DIST%\windows-11"
+set "ZIP10=%DIST%\ior-windows-10.zip"
+set "ZIP11=%DIST%\ior-windows-11.zip"
 set "PROJECT=%ROOT%HappBox.csproj"
 set "CORE10=%ROOT%core\win10\sing-box.exe"
 set "CORE11=%ROOT%core\win11\sing-box.exe"
@@ -92,12 +94,27 @@ if errorlevel 1 (
 )
 
 echo.
+echo Creating release ZIP files...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%DIST10%\*' -DestinationPath '%ZIP10%' -Force"
+if errorlevel 1 (
+    echo Failed to create Windows 10 ZIP.
+    goto error
+)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%DIST11%\*' -DestinationPath '%ZIP11%' -Force"
+if errorlevel 1 (
+    echo Failed to create Windows 11 ZIP.
+    goto error
+)
+
+echo.
 echo Done.
 echo Output: %DIST%
 echo Windows 10 app: %DIST10%\ior.exe
 echo Windows 11 app: %DIST11%\ior.exe
 echo Windows 10 core: %DIST10%\core\sing-box.exe
 echo Windows 11 core: %DIST11%\core\sing-box.exe
+echo Windows 10 ZIP: %ZIP10%
+echo Windows 11 ZIP: %ZIP11%
 echo.
 echo Note: these builds are portable and reliable on paths with Cyrillic characters.
 echo Keep all files inside each windows-* folder together when moving the app.

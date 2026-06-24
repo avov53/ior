@@ -29,6 +29,7 @@ public sealed class AppState
         "wildberries.ru",
         "www.wildberries.ru"
     ];
+    public List<string> RoutingProxySites { get; set; } = [];
     public string? SelectedProfileId { get; set; }
     public int? ActiveProcessId { get; set; }
     public DateTime? ActiveConnectionStartedUtc { get; set; }
@@ -36,6 +37,7 @@ public sealed class AppState
     public bool? PreviousProxyEnabled { get; set; }
     public string? PreviousProxyServer { get; set; }
     public string? PreviousProxyOverride { get; set; }
+    public AppLanguage Language { get; set; } = AppLanguage.Russian;
     public AppTheme Theme { get; set; } = AppTheme.Dark;
     public int AccentColorArgb { get; set; } = unchecked((int)0xFF7C69FF);
     public NavPanelPosition NavPanelPosition { get; set; } = NavPanelPosition.Left;
@@ -121,4 +123,10 @@ public enum AppTheme
     Darker,
     Violet,
     Graphite
+}
+
+public enum AppLanguage
+{
+    Russian,
+    English
 }

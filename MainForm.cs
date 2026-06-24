@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.IO.Compression;
+using System.Net.Sockets;
+using System.Security.Authentication;
 using Microsoft.Win32;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -11,9 +13,11 @@ namespace HappBox;
 
 public sealed class MainForm : Form
 {
-    private const string AppVersion = "0.1.0";
+    private const string AppVersion = "0.1.1";
     private const string GitHubRepositoryUrl = "https://github.com/avov53/ior";
     private const string GitHubLatestReleaseApiUrl = "https://api.github.com/repos/avov53/ior/releases/latest";
+    private const int SingBoxStartupTimeoutMs = 6000;
+    private const int SingBoxStartupRetryDelayMs = 700;
     private const int EmLineScroll = 0x00B6;
     private const int EmGetFirstVisibleLine = 0x00CE;
     private static readonly string[] DefaultRoutingBypassSites =
@@ -74,6 +78,7 @@ public sealed class MainForm : Form
     private long _lastReceivedBytes;
     private long _lastSentBytes;
     private bool _serviceCheckRunning;
+    private bool _connectionTransitionInProgress;
     private DateTime _lastServiceCheckUtc = DateTime.MinValue;
     private Process? _process;
     private bool? _previousProxyEnabled;
@@ -219,6 +224,14 @@ public sealed class MainForm : Form
         root.Controls.Add(_contentHost, isTop ? 0 : 1, isTop ? 1 : 0);
         _shellRoot.ResumeLayout(true);
         if (showCurrentView) ShowCurrentView();
+    }
+
+    private void ResetCachedMainViews()
+    {
+        _serverListView?.Dispose();
+        _connectionView?.Dispose();
+        _serverListView = null;
+        _connectionView = null;
     }
 
     private Control BuildTitleBar()
@@ -482,8 +495,8 @@ public sealed class MainForm : Form
         }
 
         var index = 0;
-        AddNavButton(nav, SideButton("→", NavigateBack, "Back", selectOnClick: false), index++, isTop);
-        AddNavButton(nav, SideButton("+", () => { NavigateTo(AppView.Servers); ShowInlineImport(); }, "Import", selectOnClick: false), index++, isTop);
+        AddNavButton(nav, SideButton("→", NavigateBack, T("nav.back"), selectOnClick: false), index++, isTop);
+        AddNavButton(nav, SideButton("+", () => { NavigateTo(AppView.Servers); ShowInlineImport(); }, T("nav.import"), selectOnClick: false), index++, isTop);
         if (_state.ShowNavSeparators) AddNavButton(nav, new NavSeparator { PanelPosition = _state.NavPanelPosition }, index++, isTop);
         foreach (var id in visibleItems)
         {
@@ -544,7 +557,7 @@ public sealed class MainForm : Form
     private SideNavButton BuildNavItemButton(string id)
     {
         var (icon, tooltip, view) = NavItemInfo(id);
-        var button = (SideNavButton)SideButton(icon, () => NavigateTo(view), tooltip, active: _currentView == view);
+        var button = (SideNavButton)SideButton(icon, () => NavigateTo(view), NavItemTitle(id), active: _currentView == view);
         switch (id)
         {
             case "servers":
@@ -580,12 +593,153 @@ public sealed class MainForm : Form
         };
     }
 
+    private string NavItemTitle(string id)
+    {
+        return id switch
+        {
+            "servers" => T("nav.servers"),
+            "settings" => T("nav.settings"),
+            "config" => T("nav.config"),
+            "logs" => T("nav.logs"),
+            "info" => T("nav.info"),
+            _ => T("nav.servers")
+        };
+    }
+
+    private string T(string key)
+    {
+        var ru = _state.Language == AppLanguage.Russian;
+        return key switch
+        {
+            "nav.servers" => ru ? "Серверы" : "Servers",
+            "nav.settings" => ru ? "Настройки" : "Settings",
+            "nav.config" => ru ? "Конфиг" : "Config",
+            "nav.logs" => ru ? "Логи" : "Logs",
+            "nav.info" => ru ? "Информация" : "Info",
+            "nav.back" => ru ? "Назад" : "Back",
+            "nav.import" => ru ? "Импорт" : "Import",
+            "servers.title" => ru ? "Серверы" : "Servers",
+            "servers.list" => ru ? "Список серверов" : "Server list",
+            "servers.empty" => ru ? "Серверов пока нет" : "No servers yet",
+            "servers.paste" => ru ? "Вставить из буфера" : "Paste from clipboard",
+            "servers.enter" => ru ? "+ Ввести" : "+ Enter",
+            "servers.add" => ru ? "Добавить" : "Add",
+            "servers.placeholder" => ru ? "Вставьте ссылку или подписку" : "Paste a link or subscription",
+            "servers.delete.all" => ru ? "Удалить все серверы" : "Delete all servers",
+            "servers.rename" => ru ? "Переименовать" : "Rename",
+            "servers.delete" => ru ? "Удалить" : "Delete",
+            "servers.delete.confirm" => ru ? "Удалить этот сервер из списка?" : "Delete this server from the list?",
+            "servers.server" => ru ? "Сервер" : "Server",
+            "servers.name" => ru ? "Имя сервера" : "Server name",
+            "servers.none" => ru ? "Нет выбранного сервера" : "No server selected",
+            "servers.add.subscription" => ru ? "Добавьте подписку или ссылку" : "Add a subscription or link",
+            "settings.title" => ru ? "Настройки" : "Settings",
+            "settings.core" => ru ? "Основное" : "Core",
+            "settings.connection" => ru ? "Подключение" : "Connection",
+            "settings.dns" => "DNS",
+            "settings.routing" => ru ? "Маршрутизация" : "Routing",
+            "settings.advanced" => ru ? "Расширенные" : "Advanced",
+            "settings.customization" => ru ? "Кастомизация" : "Customization",
+            "settings.browse" => ru ? "Обзор" : "Browse",
+            "settings.save" => ru ? "Сохранить" : "Save",
+            "settings.mode" => ru ? "Режим" : "Mode",
+            "settings.proxy" => ru ? "Прокси" : "Proxy",
+            "settings.proxy.port" => ru ? "Порт прокси" : "Proxy port",
+            "settings.tun.address" => ru ? "Адрес TUN" : "TUN address",
+            "settings.dns.server" => ru ? "DNS-сервер" : "DNS server",
+            "settings.strategy" => ru ? "Стратегия" : "Strategy",
+            "settings.proxy.mode.only" => ru ? "Только для режима прокси" : "Proxy mode only",
+            "settings.excluded.sites" => ru ? "Исключённые сайты" : "Excluded sites",
+            "settings.proxied.sites" => ru ? "Проксируемые сайты" : "Proxied sites",
+            "settings.route" => ru ? "Маршрут" : "Route",
+            "settings.log.level" => ru ? "Уровень логов" : "Log level",
+            "settings.sniff" => ru ? "Анализировать трафик" : "Sniff traffic",
+            "settings.auto.route" => ru ? "Автомаршрут" : "Auto route",
+            "settings.strict.route" => ru ? "Строгий маршрут" : "Strict route",
+            "settings.system.stack" => ru ? "Системный стек" : "System stack",
+            "settings.allow.insecure" => ru ? "Разрешить небезопасные сертификаты" : "Allow insecure certificates",
+            "settings.system.proxy" => ru ? "Включать системный прокси Windows в режиме Proxy" : "Set Windows system proxy in Proxy mode",
+            "custom.position" => ru ? "Положение" : "Position",
+            "custom.theme" => ru ? "Тема" : "Theme",
+            "custom.language" => ru ? "Язык" : "Language",
+            "custom.accent" => ru ? "Акцент" : "Accent",
+            "custom.icon.size" => ru ? "Размер иконок" : "Icon size",
+            "custom.visible.tabs" => ru ? "Видимые вкладки" : "Visible tabs",
+            "custom.options" => ru ? "Опции" : "Options",
+            "custom.tooltips" => ru ? "Подсказки" : "Tooltips",
+            "custom.separators" => ru ? "Разделители" : "Separators",
+            "custom.glass" => ru ? "Стеклянная панель" : "Glass panel",
+            "custom.pick" => ru ? "Выбрать" : "Pick",
+            "custom.reset" => ru ? "Сброс" : "Reset",
+            "custom.export" => ru ? "Экспорт" : "Export",
+            "custom.import" => ru ? "Импорт" : "Import",
+            "custom.title" => ru ? "Настройка панели" : "Panel customization",
+            "custom.hint" => ru ? "Перетаскивайте иконки вкладок внутри предпросмотра." : "Drag the tab icons inside the preview.",
+            "config.title" => ru ? "Сгенерированный конфиг" : "Generated config",
+            "config.write" => ru ? "Записать конфиг" : "Write config file",
+            "config.select.profile" => ru ? "Сначала импортируйте и выберите профиль." : "Import and select a profile first.",
+            "logs.title" => ru ? "Логи" : "Logs",
+            "info.title" => ru ? "Информация" : "Information",
+            "info.current.version" => ru ? "Текущая версия" : "Current version",
+            "update.checking" => ru ? "Проверка обновлений..." : "Checking for updates...",
+            "update.none" => ru ? "Обновлений пока нет или релизы GitHub ещё не опубликованы." : "No updates yet or GitHub releases have not been published.",
+            "update.available" => ru ? "Доступна новая версия" : "New version available",
+            "update.latest" => ru ? "Установлена последняя версия." : "The latest version is installed.",
+            "update.check.failed" => ru ? "Не удалось проверить обновления" : "Could not check for updates",
+            "update.check.network" => ru ? "нет доступа к GitHub или сбой SSL/сертификата. Подробности в логах." : "GitHub is unreachable or SSL/certificate validation failed. Check logs for details.",
+            "update.button" => ru ? "Обновить" : "Update",
+            "update.downloading" => ru ? "Скачивание обновления..." : "Downloading update...",
+            "update.preparing" => ru ? "Подготовка файлов..." : "Preparing files...",
+            "update.exe.missing" => ru ? "В архиве обновления не найден ior.exe." : "ior.exe was not found in the update archive.",
+            "update.install.failed" => ru ? "Не удалось установить обновление" : "Could not install update",
+            "import.title" => ru ? "Добавить сервер" : "Add server",
+            "import.links" => ru ? "Ссылки или подписки" : "Links or subscriptions",
+            "import.placeholder" => ru ? "vless://, vmess://, ss://, hysteria2:// или ссылка подписки" : "vless://, vmess://, ss://, hysteria2:// or a subscription link",
+            "import.download.failed" => ru ? "Не удалось скачать подписку" : "Cannot download subscription",
+            "import.none" => ru ? "Поддерживаемые профили не найдены." : "No supported profiles found.",
+            "import.clipboard.empty" => ru ? "Буфер обмена пуст." : "Clipboard is empty.",
+            "import.clipboard" => ru ? "Буфер обмена" : "Clipboard",
+            "import.title.short" => ru ? "Импорт" : "Import",
+            "common.cancel" => ru ? "Отмена" : "Cancel",
+            "common.ok" => "OK",
+            "start.title" => ru ? "Запуск" : "Start",
+            "start.select.profile" => ru ? "Сначала импортируйте и выберите профиль." : "Import and select a profile first.",
+            "connection.failed" => ru ? "Ошибка подключения" : "Connection failed",
+            "connection.not.ready" => ru ? "sing-box не стал готовым. Подробности смотрите в логах." : "sing-box did not become ready. Check logs for details.",
+            "singbox.cannot.start" => ru ? "Не удалось запустить sing-box" : "Cannot start sing-box",
+            "config.check.failed" => ru ? "Проверка конфига не прошла" : "Config check failed",
+            "config.check.timeout" => ru ? "Проверка sing-box превысила время ожидания." : "sing-box check timed out.",
+            "config.rejected" => ru ? "sing-box отклонил сгенерированный конфиг. Подробности смотрите в логах." : "sing-box rejected the generated config. Check logs for details.",
+            "config.check.cannot.run" => ru ? "Не удалось запустить проверку sing-box" : "Cannot run sing-box check",
+            "ping.title" => ru ? "Пинг" : "Ping",
+            "ping.failed" => ru ? "Пинг не удался" : "Ping failed",
+            "metrics.download" => ru ? "Вход" : "Download",
+            "metrics.upload" => ru ? "Исход" : "Upload",
+            "metrics.ping" => ru ? "Пинг" : "Ping",
+            "metrics.quality" => ru ? "Качество" : "Quality",
+            "quality.good" => ru ? "Хорошее" : "Good",
+            "quality.fair" => ru ? "Среднее" : "Fair",
+            "quality.poor" => ru ? "Плохое" : "Poor",
+            "status.connected" => ru ? "ПОДКЛЮЧЁН" : "CONNECTED",
+            "status.disconnected" => ru ? "НЕ ПОДКЛЮЧЕН" : "DISCONNECTED",
+            "dialog.singbox.title" => ru ? "Выберите sing-box.exe" : "Select sing-box.exe",
+            "dialog.exe.files" => ru ? "Исполняемые файлы" : "Executable files",
+            "dialog.all.files" => ru ? "Все файлы" : "All files",
+            "layout.export.title" => ru ? "Экспорт настроек интерфейса" : "Export layout settings",
+            "layout.import.title" => ru ? "Импорт настроек интерфейса" : "Import layout settings",
+            "layout.import.error" => ru ? "Импорт интерфейса" : "Import layout",
+            "layout.filter" => ru ? "Настройки интерфейса (*.json)|*.json|Все файлы (*.*)|*.*" : "Layout settings (*.json)|*.json|All files (*.*)|*.*",
+            _ => key
+        };
+    }
+
     private void NormalizeNavCustomization()
     {
         _state.NavItemOrder = NormalizeNavItemOrder(_state.NavItemOrder);
         _state.HiddenNavItems = NormalizeHiddenNavItems(_state.HiddenNavItems);
         if (!Enum.IsDefined(_state.NavIconSize)) _state.NavIconSize = NavIconSize.Normal;
         if (!Enum.IsDefined(_state.Theme)) _state.Theme = AppTheme.Dark;
+        if (!Enum.IsDefined(_state.Language)) _state.Language = AppLanguage.Russian;
     }
 
     private static List<string> NormalizeNavItemOrder(IEnumerable<string>? order)
@@ -708,7 +862,7 @@ public sealed class MainForm : Form
 
         area.Controls.Add(new Label
         {
-            Text = "Серверы",
+            Text = T("servers.title"),
             Dock = DockStyle.Fill,
             ForeColor = TextColor,
             Font = new Font("Segoe UI", 24f, FontStyle.Bold),
@@ -750,7 +904,7 @@ public sealed class MainForm : Form
         serverHeader.Controls.Add(_serverExpandButton, 0, 0);
         var serverTitle = new Label
         {
-            Text = "Список серверов",
+            Text = T("servers.list"),
             Dock = DockStyle.Fill,
             ForeColor = TextColor,
             Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
@@ -810,7 +964,7 @@ public sealed class MainForm : Form
 
         var hint = new Label
         {
-            Text = "Серверов пока нет",
+            Text = T("servers.empty"),
             Dock = DockStyle.Fill,
             ForeColor = Muted,
             Font = new Font("Segoe UI", 12f),
@@ -827,9 +981,9 @@ public sealed class MainForm : Form
         };
         actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         actions.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 174));
-        var pasteButton = MainButton("Вставить из буфера", ImportFromClipboard, 0);
+        var pasteButton = MainButton(T("servers.paste"), ImportFromClipboard, 0);
         pasteButton.Dock = DockStyle.Fill;
-        var manualButton = MainButton("+ Ввести", ShowInlineImport, 164, true);
+        var manualButton = MainButton(T("servers.enter"), ShowInlineImport, 164, true);
         manualButton.Dock = DockStyle.Fill;
         actions.Controls.Add(pasteButton, 0, 0);
         actions.Controls.Add(manualButton, 1, 0);
@@ -867,14 +1021,14 @@ public sealed class MainForm : Form
         _inlineImportBox.BorderStyle = BorderStyle.None;
         _inlineImportBox.BackColor = Color.FromArgb(43, 44, 44);
         _inlineImportBox.ForeColor = Color.White;
-        _inlineImportBox.PlaceholderText = "Вставьте ссылку или подписку";
+        _inlineImportBox.PlaceholderText = T("servers.placeholder");
         _inlineImportBox.Location = new Point(14, 46);
         _inlineImportBox.Width = 300;
         _inlineImportBox.Height = 76;
         _inlineImportBox.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
         _inlineImportPanel.Resize += (_, _) => _inlineImportBox.Width = Math.Max(120, _inlineImportPanel.Width - 178);
 
-        var add = MainButton("Добавить", async () =>
+        var add = MainButton(T("servers.add"), async () =>
         {
             if (await ImportProfilesFromTextAsync(_inlineImportBox.Text))
             {
@@ -907,7 +1061,7 @@ public sealed class MainForm : Form
         _powerButton.Cursor = Cursors.Hand;
         _powerButton.Click += (_, _) => ToggleConnection();
 
-        _statusLabel.Text = "НЕ ПОДКЛЮЧЕН";
+        _statusLabel.Text = T("status.disconnected");
         _statusLabel.ForeColor = Color.FromArgb(188, 188, 196);
         _statusLabel.Font = new Font("Segoe UI", 10f);
         _statusLabel.TextAlign = ContentAlignment.MiddleCenter;
@@ -951,7 +1105,8 @@ public sealed class MainForm : Form
         {
             Width = 210,
             Height = 48,
-            IsTun = _state.TunEnabled
+            IsTun = _state.TunEnabled,
+            ProxyText = T("settings.proxy")
         };
         modeSwitch.ModeChanged += (_, tunEnabled) =>
         {
@@ -1014,10 +1169,10 @@ public sealed class MainForm : Form
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
 
-        grid.Controls.Add(BuildMetricCard("\u0412\u0445\u043e\u0434", _downloadSpeedValue), 0, 0);
-        grid.Controls.Add(BuildMetricCard("\u0418\u0441\u0445\u043e\u0434", _uploadSpeedValue), 1, 0);
-        grid.Controls.Add(BuildMetricCard("\u041f\u0438\u043d\u0433", _pingValue), 2, 0);
-        grid.Controls.Add(BuildMetricCard("Quality", _qualityValue), 3, 0);
+        grid.Controls.Add(BuildMetricCard(T("metrics.download"), _downloadSpeedValue), 0, 0);
+        grid.Controls.Add(BuildMetricCard(T("metrics.upload"), _uploadSpeedValue), 1, 0);
+        grid.Controls.Add(BuildMetricCard(T("metrics.ping"), _pingValue), 2, 0);
+        grid.Controls.Add(BuildMetricCard(T("metrics.quality"), _qualityValue), 3, 0);
         grid.Controls.Add(BuildServiceCard("Discord"), 0, 1);
         grid.Controls.Add(BuildServiceCard("YouTube"), 1, 1);
         grid.Controls.Add(BuildServiceCard("Telegram"), 2, 1);
@@ -1227,13 +1382,13 @@ public sealed class MainForm : Form
                 ShowEmbeddedPage(BuildSettingsView());
                 break;
             case AppView.Config:
-                ShowEmbeddedPage(BuildToolPage("Generated config", BuildConfigSection()));
+                ShowEmbeddedPage(BuildToolPage(T("config.title"), BuildConfigSection()));
                 break;
             case AppView.Logs:
-                ShowEmbeddedPage(BuildToolPage("Logs", BuildLogSection()));
+                ShowEmbeddedPage(BuildToolPage(T("logs.title"), BuildLogSection()));
                 break;
             case AppView.Info:
-                ShowEmbeddedPage(BuildToolPage("Information", BuildInformationSection()));
+                ShowEmbeddedPage(BuildToolPage(T("info.title"), BuildInformationSection()));
                 break;
         }
     }
@@ -1250,13 +1405,13 @@ public sealed class MainForm : Form
                 ShowEmbeddedPage(BuildSettingsView());
                 break;
             case AppView.Config:
-                ShowEmbeddedPage(BuildToolPage("Generated config", BuildConfigSection()));
+                ShowEmbeddedPage(BuildToolPage(T("config.title"), BuildConfigSection()));
                 break;
             case AppView.Logs:
-                ShowEmbeddedPage(BuildToolPage("Logs", BuildLogSection()));
+                ShowEmbeddedPage(BuildToolPage(T("logs.title"), BuildLogSection()));
                 break;
             case AppView.Info:
-                ShowEmbeddedPage(BuildToolPage("Information", BuildInformationSection()));
+                ShowEmbeddedPage(BuildToolPage(T("info.title"), BuildInformationSection()));
                 break;
         }
     }
@@ -1317,12 +1472,12 @@ public sealed class MainForm : Form
 
     private void ShowConfigWindow()
     {
-        ShowEmbeddedPage(BuildToolPage("Generated config", BuildConfigSection()));
+        ShowEmbeddedPage(BuildToolPage(T("config.title"), BuildConfigSection()));
     }
 
     private void ShowLogWindow()
     {
-        ShowEmbeddedPage(BuildToolPage("Logs", BuildLogSection()));
+        ShowEmbeddedPage(BuildToolPage(T("logs.title"), BuildLogSection()));
     }
 
     private void ShowEmbeddedPage(Control page)
@@ -1397,7 +1552,7 @@ public sealed class MainForm : Form
 
         page.Controls.Add(new Label
         {
-            Text = "Settings",
+            Text = T("settings.title"),
             Dock = DockStyle.Fill,
             ForeColor = TextColor,
             Font = new Font("Segoe UI", 24f, FontStyle.Bold),
@@ -1466,14 +1621,14 @@ public sealed class MainForm : Form
             return button;
         }
 
-        var general = AddSection("Core", BuildGeneralSettingsSection);
-        AddSection("Connection", BuildConnectionSettingsSection);
-        AddSection("DNS", BuildDnsSettingsSection);
-        AddSection("Routing", BuildRoutingSettingsSection);
-        AddSection("Advanced", BuildAdvancedSettingsSection);
-        AddSection("Customization", BuildCustomizationSettingsSection);
-        AddSection("Config", BuildConfigSection);
-        AddSection("Logs", BuildLogSection);
+        var general = AddSection(T("settings.core"), BuildGeneralSettingsSection);
+        AddSection(T("settings.connection"), BuildConnectionSettingsSection);
+        AddSection(T("settings.dns"), BuildDnsSettingsSection);
+        AddSection(T("settings.routing"), BuildRoutingSettingsSection);
+        AddSection(T("settings.advanced"), BuildAdvancedSettingsSection);
+        AddSection(T("settings.customization"), BuildCustomizationSettingsSection);
+        AddSection(T("nav.config"), BuildConfigSection);
+        AddSection(T("nav.logs"), BuildLogSection);
 
         body.Controls.Add(sections, 0, 0);
         body.Controls.Add(contentHost, 1, 0);
@@ -1492,8 +1647,8 @@ public sealed class MainForm : Form
 
         panel.Controls.Add(FieldLabel("sing-box.exe"), 0, 0);
         panel.Controls.Add(SettingsTextInput(singBoxPath), 1, 0);
-        panel.Controls.Add(LightButton("Browse", () => BrowseSingBox(singBoxPath)), 2, 0);
-        panel.Controls.Add(LightButton("Save", () =>
+        panel.Controls.Add(LightButton(T("settings.browse"), () => BrowseSingBox(singBoxPath)), 2, 0);
+        panel.Controls.Add(LightButton(T("settings.save"), () =>
         {
             _state.SingBoxPath = singBoxPath.Text.Trim();
             SaveSettings();
@@ -1505,7 +1660,7 @@ public sealed class MainForm : Form
     {
         var panel = SettingsCard();
         var tunEnabled = new CheckBox { Text = "TUN", AutoSize = true, Checked = _state.TunEnabled };
-        var mixedEnabled = new CheckBox { Text = "Proxy", AutoSize = true, Checked = _state.MixedProxyEnabled };
+        var mixedEnabled = new CheckBox { Text = T("settings.proxy"), AutoSize = true, Checked = _state.MixedProxyEnabled };
         var mixedPort = new SettingsNumberInput { Minimum = 1, Maximum = 65535, Width = 110, Value = Math.Clamp(_state.MixedProxyPort, 1, 65535) };
         var tunMtu = new SettingsNumberInput { Minimum = 1280, Maximum = 10000, Width = 110, Value = Math.Clamp(_state.TunMtu, 1280, 10000) };
         var tunAddress = new TextBox { Width = 180, Text = _state.TunAddress };
@@ -1517,15 +1672,15 @@ public sealed class MainForm : Form
         modes.Controls.Add(tunEnabled);
         modes.Controls.Add(mixedEnabled);
 
-        panel.Controls.Add(FieldLabel("Mode"), 0, 0);
+        panel.Controls.Add(FieldLabel(T("settings.mode")), 0, 0);
         panel.Controls.Add(modes, 1, 0);
-        panel.Controls.Add(FieldLabel("Proxy port"), 0, 1);
+        panel.Controls.Add(FieldLabel(T("settings.proxy.port")), 0, 1);
         panel.Controls.Add(mixedPort, 1, 1);
-        panel.Controls.Add(FieldLabel("TUN address"), 0, 2);
+        panel.Controls.Add(FieldLabel(T("settings.tun.address")), 0, 2);
         panel.Controls.Add(SettingsTextInput(tunAddress, 180), 1, 2);
         panel.Controls.Add(FieldLabel("TUN MTU"), 0, 3);
         panel.Controls.Add(tunMtu, 1, 3);
-        panel.Controls.Add(LightButton("Save", () =>
+        panel.Controls.Add(LightButton(T("settings.save"), () =>
         {
             _state.TunEnabled = tunEnabled.Checked;
             _state.MixedProxyEnabled = mixedEnabled.Checked;
@@ -1543,11 +1698,11 @@ public sealed class MainForm : Form
         var dnsServer = new TextBox { Width = 180, Text = _state.DnsServer };
         var dnsStrategy = Combo(["prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only"], _state.DnsStrategy);
         StyleInput(dnsServer);
-        panel.Controls.Add(FieldLabel("DNS server"), 0, 0);
+        panel.Controls.Add(FieldLabel(T("settings.dns.server")), 0, 0);
         panel.Controls.Add(SettingsTextInput(dnsServer, 180), 1, 0);
-        panel.Controls.Add(FieldLabel("Strategy"), 0, 1);
+        panel.Controls.Add(FieldLabel(T("settings.strategy")), 0, 1);
         panel.Controls.Add(dnsStrategy, 1, 1);
-        panel.Controls.Add(LightButton("Save", () =>
+        panel.Controls.Add(LightButton(T("settings.save"), () =>
         {
             _state.DnsServer = dnsServer.Text.Trim();
             _state.DnsStrategy = dnsStrategy.Text;
@@ -1559,7 +1714,11 @@ public sealed class MainForm : Form
     private Control BuildRoutingSettingsSection()
     {
         var panel = SettingsCard();
-        panel.RowCount = 3;
+        panel.RowCount = 4;
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 150));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 150));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
         var bypassSites = new TextBox
         {
             Text = string.Join(Environment.NewLine, _state.RoutingBypassSites),
@@ -1568,28 +1727,42 @@ public sealed class MainForm : Form
             WordWrap = false,
             ScrollBars = ScrollBars.None
         };
+        var proxySites = new TextBox
+        {
+            Text = string.Join(Environment.NewLine, _state.RoutingProxySites),
+            Multiline = true,
+            AcceptsReturn = true,
+            WordWrap = false,
+            ScrollBars = ScrollBars.None
+        };
         StyleInput(bypassSites);
+        StyleInput(proxySites);
 
-        panel.Controls.Add(FieldLabel("Proxy mode only"), 1, 0);
-        panel.Controls.Add(FieldLabel("Excluded sites"), 0, 1);
+        var modeHint = FieldLabel(T("settings.proxy.mode.only"));
+        modeHint.Margin = new Padding(8, 6, 8, 8);
+        panel.Controls.Add(modeHint, 1, 0);
+        panel.Controls.Add(FieldLabel(T("settings.excluded.sites")), 0, 1);
         panel.Controls.Add(SettingsTextInput(bypassSites, height: 142), 1, 1);
-        panel.Controls.Add(LightButton("Save", () =>
+        panel.Controls.Add(FieldLabel(T("settings.proxied.sites")), 0, 2);
+        panel.Controls.Add(SettingsTextInput(proxySites, height: 142), 1, 2);
+        panel.Controls.Add(LightButton(T("settings.save"), () =>
         {
             _state.RoutingBypassSites = ParseSiteList(bypassSites.Text);
+            _state.RoutingProxySites = ParseSiteList(proxySites.Text);
             SaveSettings();
-        }, primary: true), 1, 2);
+        }, primary: true), 1, 3);
         return panel;
     }
 
     private Control BuildAdvancedSettingsSection()
     {
         var panel = SettingsCard();
-        var sniffEnabled = new CheckBox { Text = "Sniff traffic", AutoSize = true, Checked = _state.SniffEnabled };
-        var autoRoute = new CheckBox { Text = "Auto route", AutoSize = true, Checked = _state.AutoRoute };
-        var strictRoute = new CheckBox { Text = "Strict route", AutoSize = true, Checked = _state.StrictRoute };
-        var stackSystem = new CheckBox { Text = "System stack", AutoSize = true, Checked = _state.StackSystem };
-        var allowInsecure = new CheckBox { Text = "Разрешить небезопасные сертификаты", AutoSize = true, Checked = _state.AllowInsecureCertificates };
-        var setSystemProxy = new CheckBox { Text = "Set Windows system proxy in Proxy mode", AutoSize = true, Checked = _state.SetSystemProxy };
+        var sniffEnabled = new CheckBox { Text = T("settings.sniff"), AutoSize = true, Checked = _state.SniffEnabled };
+        var autoRoute = new CheckBox { Text = T("settings.auto.route"), AutoSize = true, Checked = _state.AutoRoute };
+        var strictRoute = new CheckBox { Text = T("settings.strict.route"), AutoSize = true, Checked = _state.StrictRoute };
+        var stackSystem = new CheckBox { Text = T("settings.system.stack"), AutoSize = true, Checked = _state.StackSystem };
+        var allowInsecure = new CheckBox { Text = T("settings.allow.insecure"), AutoSize = true, Checked = _state.AllowInsecureCertificates };
+        var setSystemProxy = new CheckBox { Text = T("settings.system.proxy"), AutoSize = true, Checked = _state.SetSystemProxy };
         var logLevel = Combo(["trace", "debug", "info", "warn", "error", "fatal", "panic"], _state.LogLevel);
 
         var routeOptions = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, BackColor = Bg };
@@ -1599,11 +1772,11 @@ public sealed class MainForm : Form
             routeOptions.Controls.Add(box);
         }
 
-        panel.Controls.Add(FieldLabel("Route"), 0, 0);
+        panel.Controls.Add(FieldLabel(T("settings.route")), 0, 0);
         panel.Controls.Add(routeOptions, 1, 0);
-        panel.Controls.Add(FieldLabel("Log level"), 0, 1);
+        panel.Controls.Add(FieldLabel(T("settings.log.level")), 0, 1);
         panel.Controls.Add(logLevel, 1, 1);
-        panel.Controls.Add(LightButton("Save", () =>
+        panel.Controls.Add(LightButton(T("settings.save"), () =>
         {
             _state.SniffEnabled = sniffEnabled.Checked;
             _state.AutoRoute = autoRoute.Checked;
@@ -1621,12 +1794,17 @@ public sealed class MainForm : Form
     {
         NormalizeNavCustomization();
         var order = _state.NavItemOrder.ToList();
-        var position = Combo(["Left", "Top"], _state.NavPanelPosition.ToString());
-        var theme = Combo(["Dark", "Darker", "Violet", "Graphite"], _state.Theme.ToString());
-        var iconSize = Combo(["Compact", "Normal", "Large"], _state.NavIconSize.ToString());
-        var showTooltips = new CheckBox { Text = "Tooltips", AutoSize = true, Checked = _state.ShowNavTooltips };
-        var showSeparators = new CheckBox { Text = "Separators", AutoSize = true, Checked = _state.ShowNavSeparators };
-        var useGlass = new CheckBox { Text = "Glass panel", AutoSize = true, Checked = _state.UsePanelGlass && GlassSupported(), Enabled = GlassSupported() };
+        var position = Combo([PositionDisplayName(NavPanelPosition.Left), PositionDisplayName(NavPanelPosition.Top)], PositionDisplayName(_state.NavPanelPosition));
+        var theme = Combo(
+            [ThemeDisplayName(AppTheme.Dark), ThemeDisplayName(AppTheme.Darker), ThemeDisplayName(AppTheme.Violet), ThemeDisplayName(AppTheme.Graphite)],
+            ThemeDisplayName(_state.Theme));
+        var language = Combo(["\u0420\u0443\u0441\u0441\u043a\u0438\u0439", "English"], LanguageDisplayName(_state.Language));
+        var iconSize = Combo(
+            [IconSizeDisplayName(NavIconSize.Compact), IconSizeDisplayName(NavIconSize.Normal), IconSizeDisplayName(NavIconSize.Large)],
+            IconSizeDisplayName(_state.NavIconSize));
+        var showTooltips = new CheckBox { Text = T("custom.tooltips"), AutoSize = true, Checked = _state.ShowNavTooltips };
+        var showSeparators = new CheckBox { Text = T("custom.separators"), AutoSize = true, Checked = _state.ShowNavSeparators };
+        var useGlass = new CheckBox { Text = T("custom.glass"), AutoSize = true, Checked = _state.UsePanelGlass && GlassSupported(), Enabled = GlassSupported() };
         foreach (var box in new[] { showTooltips, showSeparators, useGlass })
         {
             StyleCheck(box);
@@ -1644,10 +1822,9 @@ public sealed class MainForm : Form
         var visibilityBoxes = new Dictionary<string, CheckBox>(StringComparer.OrdinalIgnoreCase);
         foreach (var id in DefaultNavItemOrder)
         {
-            var (_, tooltip, _) = NavItemInfo(id);
             var box = new CheckBox
             {
-                Text = tooltip,
+                Text = NavItemTitle(id),
                 AutoSize = true,
                 Checked = !_state.HiddenNavItems.Contains(id, StringComparer.OrdinalIgnoreCase),
                 Enabled = id != "settings",
@@ -1677,7 +1854,7 @@ public sealed class MainForm : Form
             Margin = Padding.Empty
         };
         accentRow.Controls.Add(accentPreview);
-        accentRow.Controls.Add(LightButton("Pick", () =>
+        accentRow.Controls.Add(LightButton(T("custom.pick"), () =>
         {
             using var dialog = new ColorDialog
             {
@@ -1714,29 +1891,30 @@ public sealed class MainForm : Form
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 3,
-            RowCount = 9,
+            RowCount = 10,
             BackColor = Bg,
             Padding = new Padding(0, 6, 0, 22)
         };
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 132));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 104));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 320));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 104));
 
         void ApplyPreviewHeight()
         {
-            var selectedPosition = Enum.TryParse<NavPanelPosition>(position.Text, out var parsedPosition)
+            var selectedPosition = TryParsePosition(position.Text, out var parsedPosition)
                 ? parsedPosition
                 : NavPanelPosition.Left;
-            var selectedSize = Enum.TryParse<NavIconSize>(iconSize.Text, out var parsedSize)
+            var selectedSize = TryParseIconSize(iconSize.Text, out var parsedSize)
                 ? parsedSize
                 : NavIconSize.Normal;
             var itemSize = selectedSize switch
@@ -1751,14 +1929,14 @@ public sealed class MainForm : Form
                 : itemCount * itemSize + Math.Max(0, itemCount - 1) * 6 + 32;
 
             preview.Height = height;
-            panel.RowStyles[7].Height = height + 46;
+            panel.RowStyles[9].Height = height + 46;
             panel.PerformLayout();
         }
         ApplyPreviewHeight();
 
         var title = new Label
         {
-            Text = "Panel customization",
+            Text = T("custom.title"),
             Dock = DockStyle.Fill,
             ForeColor = TextColor,
             Font = new Font("Segoe UI", 13f, FontStyle.Bold),
@@ -1766,7 +1944,7 @@ public sealed class MainForm : Form
         };
         var hint = new Label
         {
-            Text = "Drag the tab icons inside the preview.",
+            Text = T("custom.hint"),
             Dock = DockStyle.Fill,
             ForeColor = Muted,
             Font = new Font("Segoe UI", 9f),
@@ -1775,14 +1953,14 @@ public sealed class MainForm : Form
 
         position.TextChanged += (_, _) =>
         {
-            preview.Position = Enum.TryParse<NavPanelPosition>(position.Text, out var next)
+            preview.Position = TryParsePosition(position.Text, out var next)
                 ? next
                 : NavPanelPosition.Left;
             ApplyPreviewHeight();
         };
         iconSize.TextChanged += (_, _) =>
         {
-            preview.IconSize = Enum.TryParse<NavIconSize>(iconSize.Text, out var next)
+            preview.IconSize = TryParseIconSize(iconSize.Text, out var next)
                 ? next
                 : NavIconSize.Normal;
             ApplyPreviewHeight();
@@ -1794,13 +1972,15 @@ public sealed class MainForm : Form
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = true,
             BackColor = Bg,
-            Margin = new Padding(0, 16, 0, 0),
-            Padding = new Padding(0, 0, 0, 12)
+            Margin = new Padding(0, 8, 0, 0),
+            Padding = Padding.Empty
         };
-        actions.Controls.Add(LightButton("Save", () =>
+        actions.Controls.Add(LightButton(T("settings.save"), () =>
         {
-            if (Enum.TryParse<AppTheme>(theme.Text, out var selectedTheme)) _state.Theme = selectedTheme;
-            if (Enum.TryParse<NavIconSize>(iconSize.Text, out var selectedSize)) _state.NavIconSize = selectedSize;
+            var previousLanguage = _state.Language;
+            if (TryParseTheme(theme.Text, out var selectedTheme)) _state.Theme = selectedTheme;
+            if (TryParseLanguage(language.Text, out var selectedLanguage)) _state.Language = selectedLanguage;
+            if (TryParseIconSize(iconSize.Text, out var selectedSize)) _state.NavIconSize = selectedSize;
             _state.AccentColorArgb = accentPreview.BackColor.ToArgb();
             _state.HiddenNavItems = visibilityBoxes
                 .Where(pair => !pair.Value.Checked)
@@ -1814,13 +1994,19 @@ public sealed class MainForm : Form
             ApplyAppearanceSettings();
             ApplyWindowBackdrop();
             SaveSettings();
-            RebuildShellLayout();
-        }, primary: true, width: 130));
-        actions.Controls.Add(LightButton("Reset", () =>
+            if (previousLanguage != _state.Language)
+            {
+                ResetCachedMainViews();
+            }
+            RebuildShellLayout(showCurrentView: false);
+            ShowSettingsWindow();
+        }, primary: true, width: 128));
+        actions.Controls.Add(LightButton(T("custom.reset"), () =>
         {
-            position.Text = NavPanelPosition.Left.ToString();
-            theme.Text = AppTheme.Dark.ToString();
-            iconSize.Text = NavIconSize.Normal.ToString();
+            position.Text = PositionDisplayName(NavPanelPosition.Left);
+            theme.Text = ThemeDisplayName(AppTheme.Dark);
+            language.Text = LanguageDisplayName(AppLanguage.Russian);
+            iconSize.Text = IconSizeDisplayName(NavIconSize.Normal);
             accentPreview.BackColor = Color.FromArgb(124, 105, 255);
             accentPreview.BorderColor = accentPreview.BackColor;
             foreach (var pair in visibilityBoxes) pair.Value.Checked = true;
@@ -1829,41 +2015,154 @@ public sealed class MainForm : Form
             useGlass.Checked = GlassSupported();
             preview.IconSize = NavIconSize.Normal;
             preview.Reset(DefaultNavItemOrder, NavPanelPosition.Left);
-        }, width: 120));
-        actions.Controls.Add(LightButton("Export", () => ExportLayoutSettings(), width: 120));
-        actions.Controls.Add(LightButton("Import", () =>
+        }, width: 112));
+        actions.Controls.Add(LightButton(T("custom.export"), () => ExportLayoutSettings(), width: 112));
+        actions.Controls.Add(LightButton(T("custom.import"), () =>
         {
+            var previousLanguage = _state.Language;
             if (ImportLayoutSettings())
             {
                 ApplyAppearanceSettings();
                 ApplyWindowBackdrop();
-                RebuildShellLayout();
+                if (previousLanguage != _state.Language)
+                {
+                    ResetCachedMainViews();
+                }
+                RebuildShellLayout(showCurrentView: false);
                 ShowSettingsWindow();
             }
-        }, width: 120));
+        }, width: 112));
 
-        panel.Controls.Add(FieldLabel("Position"), 0, 0);
+        panel.Controls.Add(FieldLabel(T("custom.position")), 0, 0);
         panel.Controls.Add(position, 1, 0);
-        panel.Controls.Add(FieldLabel("Theme"), 0, 1);
+        panel.Controls.Add(FieldLabel(T("custom.theme")), 0, 1);
         panel.Controls.Add(theme, 1, 1);
-        panel.Controls.Add(FieldLabel("Accent"), 0, 2);
-        panel.Controls.Add(accentRow, 1, 2);
-        panel.Controls.Add(FieldLabel("Icon size"), 0, 3);
-        panel.Controls.Add(iconSize, 1, 3);
-        panel.Controls.Add(FieldLabel("Visible tabs"), 0, 4);
-        panel.Controls.Add(visibility, 1, 4);
+        panel.Controls.Add(FieldLabel(T("custom.language")), 0, 2);
+        panel.Controls.Add(language, 1, 2);
+        panel.Controls.Add(FieldLabel(T("custom.accent")), 0, 3);
+        panel.Controls.Add(accentRow, 1, 3);
+        panel.Controls.Add(FieldLabel(T("custom.icon.size")), 0, 4);
+        panel.Controls.Add(iconSize, 1, 4);
+        panel.Controls.Add(FieldLabel(T("custom.visible.tabs")), 0, 5);
+        panel.Controls.Add(visibility, 1, 5);
         panel.SetColumnSpan(visibility, 2);
-        panel.Controls.Add(FieldLabel("Options"), 0, 5);
-        panel.Controls.Add(flags, 1, 5);
+        panel.Controls.Add(FieldLabel(T("custom.options")), 0, 6);
+        panel.Controls.Add(flags, 1, 6);
         panel.SetColumnSpan(flags, 2);
-        panel.Controls.Add(title, 1, 6);
-        panel.Controls.Add(hint, 2, 6);
-        panel.SetColumnSpan(hint, 1);
-        panel.Controls.Add(preview, 1, 7);
-        panel.SetColumnSpan(preview, 2);
-        panel.Controls.Add(actions, 1, 8);
+        panel.Controls.Add(actions, 1, 7);
         panel.SetColumnSpan(actions, 2);
+        panel.Controls.Add(title, 1, 8);
+        panel.Controls.Add(hint, 2, 8);
+        panel.SetColumnSpan(hint, 1);
+        panel.Controls.Add(preview, 1, 9);
+        panel.SetColumnSpan(preview, 2);
         return panel;
+    }
+
+    private static string LanguageDisplayName(AppLanguage language)
+    {
+        return language == AppLanguage.English ? "English" : "\u0420\u0443\u0441\u0441\u043a\u0438\u0439";
+    }
+
+    private static bool TryParseLanguage(string value, out AppLanguage language)
+    {
+        language = value.Trim().Equals("English", StringComparison.OrdinalIgnoreCase)
+            ? AppLanguage.English
+            : AppLanguage.Russian;
+        return true;
+    }
+
+    private string PositionDisplayName(NavPanelPosition position)
+    {
+        var ru = _state.Language == AppLanguage.Russian;
+        return position switch
+        {
+            NavPanelPosition.Top => ru ? "Сверху" : "Top",
+            _ => ru ? "Слева" : "Left"
+        };
+    }
+
+    private bool TryParsePosition(string value, out NavPanelPosition position)
+    {
+        if (value.Equals("Top", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("Сверху", StringComparison.OrdinalIgnoreCase))
+        {
+            position = NavPanelPosition.Top;
+            return true;
+        }
+
+        position = NavPanelPosition.Left;
+        return true;
+    }
+
+    private string ThemeDisplayName(AppTheme theme)
+    {
+        var ru = _state.Language == AppLanguage.Russian;
+        return theme switch
+        {
+            AppTheme.Darker => ru ? "Темнее" : "Darker",
+            AppTheme.Violet => ru ? "Фиолетовая" : "Violet",
+            AppTheme.Graphite => ru ? "Графитовая" : "Graphite",
+            _ => ru ? "Тёмная" : "Dark"
+        };
+    }
+
+    private bool TryParseTheme(string value, out AppTheme theme)
+    {
+        if (value.Equals("Darker", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("Темнее", StringComparison.OrdinalIgnoreCase))
+        {
+            theme = AppTheme.Darker;
+            return true;
+        }
+
+        if (value.Equals("Violet", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("Фиолетовая", StringComparison.OrdinalIgnoreCase))
+        {
+            theme = AppTheme.Violet;
+            return true;
+        }
+
+        if (value.Equals("Graphite", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("Графитовая", StringComparison.OrdinalIgnoreCase))
+        {
+            theme = AppTheme.Graphite;
+            return true;
+        }
+
+        theme = AppTheme.Dark;
+        return true;
+    }
+
+    private string IconSizeDisplayName(NavIconSize size)
+    {
+        var ru = _state.Language == AppLanguage.Russian;
+        return size switch
+        {
+            NavIconSize.Compact => ru ? "Компактный" : "Compact",
+            NavIconSize.Large => ru ? "Крупный" : "Large",
+            _ => ru ? "Обычный" : "Normal"
+        };
+    }
+
+    private bool TryParseIconSize(string value, out NavIconSize size)
+    {
+        if (value.Equals("Compact", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("Компактный", StringComparison.OrdinalIgnoreCase))
+        {
+            size = NavIconSize.Compact;
+            return true;
+        }
+
+        if (value.Equals("Large", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("Крупный", StringComparison.OrdinalIgnoreCase))
+        {
+            size = NavIconSize.Large;
+            return true;
+        }
+
+        size = NavIconSize.Normal;
+        return true;
     }
 
     private static SettingsSelect Combo(string[] values, string selected)
@@ -1897,7 +2196,7 @@ public sealed class MainForm : Form
         var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, BackColor = Bg };
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
         panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        panel.Controls.Add(LightButton("Write config file", WriteConfig), 0, 0);
+        panel.Controls.Add(LightButton(T("config.write"), WriteConfig), 0, 0);
         var configBox = new TextBox
         {
             Dock = DockStyle.Fill,
@@ -1965,7 +2264,7 @@ public sealed class MainForm : Form
 
         panel.Controls.Add(new Label
         {
-            Text = $"Текущая версия: {AppVersion}",
+            Text = $"{T("info.current.version")}: {AppVersion}",
             Dock = DockStyle.Fill,
             ForeColor = TextColor,
             BackColor = Bg,
@@ -1975,7 +2274,7 @@ public sealed class MainForm : Form
 
         var updateStatus = new Label
         {
-            Text = "Проверка обновлений...",
+            Text = T("update.checking"),
             Dock = DockStyle.Fill,
             ForeColor = Muted,
             BackColor = Bg,
@@ -1984,7 +2283,7 @@ public sealed class MainForm : Form
         };
         panel.Controls.Add(updateStatus, 0, 2);
 
-        var updateButton = LightButton("Обновить", () => { }, primary: true);
+        var updateButton = LightButton(T("update.button"), () => { }, primary: true);
         updateButton.Visible = false;
         panel.Controls.Add(updateButton, 0, 3);
 
@@ -1996,40 +2295,29 @@ public sealed class MainForm : Form
     {
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, GitHubLatestReleaseApiUrl);
-            request.Headers.UserAgent.ParseAdd($"ior/{AppVersion}");
-            using var response = await _httpClient.SendAsync(request);
-            if (!response.IsSuccessStatusCode)
+            var release = await GetLatestReleaseAsync();
+            if (release is null)
             {
-                statusLabel.Text = "Обновлений пока нет или релизы GitHub ещё не опубликованы.";
+                statusLabel.Text = T("update.none");
                 return;
             }
 
-            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-            var root = doc.RootElement;
-            var latestTag = root.TryGetProperty("tag_name", out var tag) ? tag.GetString() : null;
-            var releaseUrl = root.TryGetProperty("html_url", out var url) ? url.GetString() : GitHubRepositoryUrl + "/releases/latest";
-            if (string.IsNullOrWhiteSpace(latestTag))
-            {
-                statusLabel.Text = "Не удалось определить последнюю версию.";
-                return;
-            }
-
-            var latestVersion = NormalizeVersion(latestTag);
+            var latestVersion = NormalizeVersion(release.Tag);
             if (IsNewerVersion(latestVersion, AppVersion))
             {
-                statusLabel.Text = $"Доступна новая версия: {latestTag}";
+                statusLabel.Text = $"{T("update.available")}: {release.Tag}";
                 updateButton.Visible = true;
-                updateButton.Click += (_, _) => OpenExternalUrl(releaseUrl ?? GitHubRepositoryUrl + "/releases/latest");
+                updateButton.Click += async (_, _) => await ShowUpdateDialogAsync(release);
             }
             else
             {
-                statusLabel.Text = "Установлена последняя версия.";
+                statusLabel.Text = T("update.latest");
             }
         }
         catch (Exception ex)
         {
-            statusLabel.Text = $"Не удалось проверить обновления: {ex.Message}";
+            statusLabel.Text = GetUpdateCheckFailureMessage(ex);
+            Log($"Update check failed: {FormatExceptionChain(ex)}");
         }
     }
 
@@ -2049,8 +2337,57 @@ public sealed class MainForm : Form
         }
         catch (Exception ex)
         {
-            Log($"Startup update check failed: {ex.Message}");
+            Log($"Startup update check failed: {FormatExceptionChain(ex)}");
         }
+    }
+
+    private string GetUpdateCheckFailureMessage(Exception ex)
+    {
+        if (IsNetworkOrTlsFailure(ex))
+        {
+            return $"{T("update.check.failed")}: {T("update.check.network")}";
+        }
+
+        return $"{T("update.check.failed")}: {GetInnermostException(ex).Message}";
+    }
+
+    private static bool IsNetworkOrTlsFailure(Exception ex)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is HttpRequestException or SocketException or IOException or AuthenticationException)
+            {
+                return true;
+            }
+
+            if (current.Message.Contains("SSL", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static Exception GetInnermostException(Exception ex)
+    {
+        while (ex.InnerException is not null)
+        {
+            ex = ex.InnerException;
+        }
+
+        return ex;
+    }
+
+    private static string FormatExceptionChain(Exception ex)
+    {
+        var parts = new List<string>();
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            parts.Add($"{current.GetType().Name}: {current.Message}");
+        }
+
+        return string.Join(" -> ", parts);
     }
 
     private async Task<ReleaseInfo?> GetLatestReleaseAsync()
@@ -2103,7 +2440,7 @@ public sealed class MainForm : Form
 
     private Task ShowUpdateDialogAsync(ReleaseInfo release)
     {
-        using var dialog = new UpdateDialog(release.Tag, release.AssetName is not null);
+        using var dialog = new UpdateDialog(release.Tag, release.AssetName is not null, _state.Language);
         dialog.UpdateRequested += async (_, _) =>
         {
             if (string.IsNullOrWhiteSpace(release.AssetDownloadUrl))
@@ -2128,7 +2465,7 @@ public sealed class MainForm : Form
 
         try
         {
-            dialog.SetBusy("Скачивание обновления...");
+            dialog.SetBusy(T("update.downloading"));
             using var response = await _httpClient.GetAsync(release.AssetDownloadUrl, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
 
@@ -2146,17 +2483,17 @@ public sealed class MainForm : Form
                     readTotal += read;
                     if (total is > 0)
                     {
-                        dialog.SetBusy($"Скачивание обновления... {readTotal * 100 / total.Value}%");
+                        dialog.SetBusy($"{T("update.downloading")} {readTotal * 100 / total.Value}%");
                     }
                 }
             }
 
-            dialog.SetBusy("Подготовка файлов...");
+            dialog.SetBusy(T("update.preparing"));
             ZipFile.ExtractToDirectory(zipPath, extractPath, overwriteFiles: true);
             var sourcePath = ResolveExtractedUpdateRoot(extractPath);
             if (!File.Exists(Path.Combine(sourcePath, "ior.exe")))
             {
-                throw new InvalidOperationException("В архиве обновления не найден ior.exe.");
+                throw new InvalidOperationException(T("update.exe.missing"));
             }
 
             StartUpdateScript(sourcePath);
@@ -2164,7 +2501,7 @@ public sealed class MainForm : Form
         }
         catch (Exception ex)
         {
-            dialog.SetError($"Не удалось установить обновление: {ex.Message}");
+            dialog.SetError($"{T("update.install.failed")}: {ex.Message}");
             Log($"Update failed: {ex.Message}");
         }
     }
@@ -2173,11 +2510,20 @@ public sealed class MainForm : Form
     {
         if (File.Exists(Path.Combine(extractPath, "ior.exe"))) return extractPath;
 
+        var packageFolder = IsWindows10Package() ? "windows-10" : "windows-11";
+        var packagePath = Path.Combine(extractPath, packageFolder);
+        if (File.Exists(Path.Combine(packagePath, "ior.exe"))) return packagePath;
+
         var directories = Directory.GetDirectories(extractPath);
         if (directories.Length == 1 && File.Exists(Path.Combine(directories[0], "ior.exe")))
         {
             return directories[0];
         }
+
+        var nestedPackagePath = Directory
+            .GetDirectories(extractPath, packageFolder, SearchOption.AllDirectories)
+            .FirstOrDefault(path => File.Exists(Path.Combine(path, "ior.exe")));
+        if (nestedPackagePath is not null) return nestedPackagePath;
 
         var nestedExe = Directory.GetFiles(extractPath, "ior.exe", SearchOption.AllDirectories).FirstOrDefault();
         return nestedExe is null ? extractPath : Path.GetDirectoryName(nestedExe) ?? extractPath;
@@ -2245,7 +2591,7 @@ del "%~f0"
 
     private TabPage SettingsTab()
     {
-        var page = new TabPage("Settings") { BackColor = Bg, Padding = new Padding(18) };
+        var page = new TabPage(T("settings.title")) { BackColor = Bg, Padding = new Padding(18) };
         var panel = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
@@ -2261,7 +2607,7 @@ del "%~f0"
 
         var singBoxPath = new TextBox { Text = _state.SingBoxPath };
         var tunEnabled = new CheckBox { Text = "TUN", AutoSize = true, Checked = _state.TunEnabled };
-        var mixedEnabled = new CheckBox { Text = "Proxy", AutoSize = true, Checked = _state.MixedProxyEnabled };
+        var mixedEnabled = new CheckBox { Text = T("settings.proxy"), AutoSize = true, Checked = _state.MixedProxyEnabled };
         var mixedPort = new SettingsNumberInput { Minimum = 1, Maximum = 65535, Width = 110, Value = Math.Clamp(_state.MixedProxyPort, 1, 65535) };
         var dnsServer = new TextBox { Width = 150, Text = _state.DnsServer };
 
@@ -2269,9 +2615,9 @@ del "%~f0"
         StyleInput(singBoxPath);
         singBoxPath.Dock = DockStyle.Fill;
         panel.Controls.Add(SettingsTextInput(singBoxPath), 1, 0);
-        panel.Controls.Add(LightButton("Browse", () => BrowseSingBox(singBoxPath)), 2, 0);
+        panel.Controls.Add(LightButton(T("settings.browse"), () => BrowseSingBox(singBoxPath)), 2, 0);
 
-        panel.Controls.Add(FieldLabel("Mode"), 0, 1);
+        panel.Controls.Add(FieldLabel(T("settings.mode")), 0, 1);
         var modes = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, BackColor = Bg };
         StyleCheck(tunEnabled);
         StyleCheck(mixedEnabled);
@@ -2279,14 +2625,14 @@ del "%~f0"
         modes.Controls.Add(mixedEnabled);
         panel.Controls.Add(modes, 1, 1);
 
-        panel.Controls.Add(FieldLabel("Proxy port"), 0, 2);
+        panel.Controls.Add(FieldLabel(T("settings.proxy.port")), 0, 2);
         panel.Controls.Add(mixedPort, 1, 2);
 
         panel.Controls.Add(FieldLabel("DNS"), 0, 3);
         StyleInput(dnsServer);
         panel.Controls.Add(SettingsTextInput(dnsServer, 150), 1, 3);
 
-        panel.Controls.Add(LightButton("Save settings", () =>
+        panel.Controls.Add(LightButton(T("settings.save"), () =>
         {
             _state.SingBoxPath = singBoxPath.Text.Trim();
             _state.TunEnabled = tunEnabled.Checked;
@@ -2301,11 +2647,11 @@ del "%~f0"
 
     private TabPage ConfigTab()
     {
-        var page = new TabPage("Generated config") { BackColor = Bg, Padding = new Padding(14) };
+        var page = new TabPage(T("config.title")) { BackColor = Bg, Padding = new Padding(14) };
         var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, BackColor = Bg };
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
         panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        panel.Controls.Add(LightButton("Write config file", WriteConfig), 0, 0);
+        panel.Controls.Add(LightButton(T("config.write"), WriteConfig), 0, 0);
         var configBox = new TextBox
         {
             Dock = DockStyle.Fill,
@@ -2325,7 +2671,7 @@ del "%~f0"
 
     private TabPage LogTab()
     {
-        var page = new TabPage("Logs") { BackColor = Bg, Padding = new Padding(14) };
+        var page = new TabPage(T("logs.title")) { BackColor = Bg, Padding = new Padding(14) };
         var logBox = new TextBox
         {
             Dock = DockStyle.Fill,
@@ -2549,8 +2895,8 @@ del "%~f0"
             Padding = new Padding(6),
             Renderer = new DarkMenuRenderer()
         };
-        menu.Items.Add("\u041f\u0435\u0440\u0435\u0438\u043c\u0435\u043d\u043e\u0432\u0430\u0442\u044c", null, (_, _) => RenameProfile(profile));
-        menu.Items.Add("\u0423\u0434\u0430\u043b\u0438\u0442\u044c", null, (_, _) => DeleteProfile(profile));
+        menu.Items.Add(T("servers.rename"), null, (_, _) => RenameProfile(profile));
+        menu.Items.Add(T("servers.delete"), null, (_, _) => DeleteProfile(profile));
         menu.Closed += (_, _) => BeginInvoke(new Action(menu.Dispose));
         menu.Show(_profiles, location);
     }
@@ -2565,7 +2911,7 @@ del "%~f0"
             Padding = new Padding(6),
             Renderer = new DarkMenuRenderer()
         };
-        menu.Items.Add("Удалить все сервера", null, (_, _) => DeleteAllProfiles());
+        menu.Items.Add(T("servers.delete.all"), null, (_, _) => DeleteAllProfiles());
         menu.Closed += (_, _) => BeginInvoke(new Action(menu.Dispose));
         menu.Show(anchor, new Point(anchor.Width - menu.Width, anchor.Height - 2));
     }
@@ -2584,8 +2930,8 @@ del "%~f0"
     private void DeleteProfile(ProxyProfile profile)
     {
         var result = MessageBox.Show(
-            "\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u044d\u0442\u043e\u0442 \u0441\u0435\u0440\u0432\u0435\u0440 \u0438\u0437 \u0441\u043f\u0438\u0441\u043a\u0430?",
-            "\u0421\u0435\u0440\u0432\u0435\u0440",
+            T("servers.delete.confirm"),
+            T("servers.server"),
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Question);
         if (result != DialogResult.Yes) return;
@@ -2610,7 +2956,7 @@ del "%~f0"
     {
         using var dialog = new Form
         {
-            Text = "\u0418\u043c\u044f \u0441\u0435\u0440\u0432\u0435\u0440\u0430",
+            Text = T("servers.name"),
             Width = 420,
             Height = 168,
             StartPosition = FormStartPosition.CenterParent,
@@ -2634,7 +2980,7 @@ del "%~f0"
         var ok = LightButton("OK", () => dialog.DialogResult = DialogResult.OK, true);
         ok.Left = 108;
         ok.Top = 74;
-        var cancel = LightButton("\u041e\u0442\u043c\u0435\u043d\u0430", () => dialog.DialogResult = DialogResult.Cancel);
+        var cancel = LightButton(T("common.cancel"), () => dialog.DialogResult = DialogResult.Cancel);
         cancel.Left = 246;
         cancel.Top = 74;
         dialog.Controls.Add(input);
@@ -2665,6 +3011,14 @@ del "%~f0"
                 {
                     g.FillRectangle(yellow, bounds.Left + 8, bounds.Top, 4, bounds.Height);
                     g.FillRectangle(yellow, bounds.Left, bounds.Top + 7, bounds.Width, 4);
+                }
+                break;
+            case "FI":
+                g.FillRectangle(Brushes.White, bounds);
+                using (var blue = new SolidBrush(Color.FromArgb(0, 47, 108)))
+                {
+                    g.FillRectangle(blue, bounds.Left + 8, bounds.Top, 5, bounds.Height);
+                    g.FillRectangle(blue, bounds.Left, bounds.Top + 7, bounds.Width, 5);
                 }
                 break;
             case "DE":
@@ -2801,6 +3155,7 @@ del "%~f0"
         if (source.Contains("united kingdom") || source.Contains("london")) return "GB";
         if (source.Contains("usa") || source.Contains("united states") || source.Contains("new york")) return "US";
         if (source.Contains("russia") || source.Contains("moscow")) return "RU";
+        if (source.Contains("finland") || source.Contains("helsinki")) return "FI";
         if (source.Contains("malaysia") || source.Contains("kuala lumpur")) return "MY";
         return "UN";
     }
@@ -2817,7 +3172,7 @@ del "%~f0"
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message, "Cannot download subscription", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(ex.Message, T("import.download.failed"), MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Log($"Subscription download failed: {ex.Message}");
                 return false;
             }
@@ -2826,7 +3181,7 @@ del "%~f0"
         var parsed = ProfileParser.ParseMany(importText);
         if (parsed.Count == 0)
         {
-            MessageBox.Show("No supported profiles found.", "Import", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(T("import.none"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
             return false;
         }
 
@@ -2868,13 +3223,25 @@ del "%~f0"
 
     private void ToggleConnection()
     {
-        var hasTrackedProcess = TryGetTrackedSingBoxProcess(out var trackedProcess);
-        trackedProcess?.Dispose();
-        if (_process is { HasExited: false } || hasTrackedProcess)
+        if (_connectionTransitionInProgress) return;
+
+        _connectionTransitionInProgress = true;
+        _powerButton.Enabled = false;
+        try
         {
-            StopSingBox();
+            var hasTrackedProcess = TryGetTrackedSingBoxProcess(out var trackedProcess);
+            trackedProcess?.Dispose();
+            if (_process is { HasExited: false } || hasTrackedProcess)
+            {
+                StopSingBox();
+            }
+            else StartSingBox();
         }
-        else StartSingBox();
+        finally
+        {
+            _connectionTransitionInProgress = false;
+            _powerButton.Enabled = true;
+        }
     }
 
     private static void ApplyPackageCompatibilityDefaults(AppState state)
@@ -3025,6 +3392,11 @@ del "%~f0"
 
     private void StartSingBox()
     {
+        StartSingBoxCore(allowStartupRetry: true);
+    }
+
+    private void StartSingBoxCore(bool allowStartupRetry)
+    {
         if (_process is { HasExited: false })
         {
             Log("sing-box is already running.");
@@ -3034,7 +3406,7 @@ del "%~f0"
         var profile = SelectedProfile();
         if (profile is null)
         {
-            MessageBox.Show("Import and select a profile first.", "Start", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(T("start.select.profile"), T("start.title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -3057,10 +3429,13 @@ del "%~f0"
             _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             _process.OutputDataReceived += (_, e) => LogFromProcess(e.Data);
             _process.ErrorDataReceived += (_, e) => LogFromProcess(e.Data);
+            var startedProcess = _process;
             _process.Exited += (_, _) => BeginInvoke(new Action(() =>
             {
+                if (!ReferenceEquals(_process, startedProcess)) return;
+                var exitCode = TryGetExitCode(startedProcess);
                 SetDisconnected();
-                Log($"sing-box exited with code {_process?.ExitCode}.");
+                Log($"sing-box exited with code {exitCode}.");
             }));
             _process.Start();
             _state.ActiveProcessId = _process.Id;
@@ -3068,19 +3443,78 @@ del "%~f0"
             SaveState();
             _process.BeginOutputReadLine();
             _process.BeginErrorReadLine();
-            if (_process.WaitForExit(900))
+
+            var ready = WaitForSingBoxStartup(_process, SingBoxStartupTimeoutMs);
+            if (!ready)
             {
+                var exited = _process.HasExited;
+                var exitCode = exited ? TryGetExitCode(_process) : "still running";
+                if (!exited)
+                {
+                    _process.Kill(entireProcessTree: true);
+                    _process.WaitForExit(3000);
+                }
                 SetDisconnected();
-                MessageBox.Show("sing-box exited immediately. Check logs for details.", "Connection failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Log($"sing-box startup did not become ready ({exitCode}).");
+
+                if (allowStartupRetry && _state.TunEnabled)
+                {
+                    Log("Retrying TUN startup once.");
+                    Thread.Sleep(SingBoxStartupRetryDelayMs);
+                    StartSingBoxCore(allowStartupRetry: false);
+                    return;
+                }
+
+                MessageBox.Show(T("connection.not.ready"), T("connection.failed"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+
             ApplySystemProxyIfNeeded();
             SetConnected();
             Log("sing-box started.");
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.Message, "Cannot start sing-box", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private bool WaitForSingBoxStartup(Process process, int timeoutMs)
+    {
+        var deadline = Environment.TickCount64 + timeoutMs;
+        while (Environment.TickCount64 < deadline)
+        {
+            if (process.WaitForExit(120)) return false;
+            if (!_state.MixedProxyEnabled) return true;
+            if (CanConnectToLocalPort(_state.MixedProxyPort)) return true;
+        }
+
+        return false;
+    }
+
+    private static bool CanConnectToLocalPort(int port)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            var connectTask = client.ConnectAsync("127.0.0.1", port);
+            return connectTask.Wait(100) && client.Connected;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string TryGetExitCode(Process process)
+    {
+        try
+        {
+            return process.HasExited ? process.ExitCode.ToString() : "still running";
+        }
+        catch
+        {
+            return "unknown";
         }
     }
 
@@ -3241,7 +3675,7 @@ del "%~f0"
             ? startedUtc.ToLocalTime()
             : DateTime.Now;
         _connectTimer.Start();
-        _statusLabel.Text = "ПОДКЛЮЧЁН";
+        _statusLabel.Text = T("status.connected");
         _statusLabel.ForeColor = Color.FromArgb(218, 218, 224);
         _timerLabel.Visible = true;
         _powerButton.IsOn = true;
@@ -3256,7 +3690,7 @@ del "%~f0"
         _state.ActiveConnectionStartedUtc = null;
         SaveState();
         _connectTimer.Stop();
-        _statusLabel.Text = "НЕ ПОДКЛЮЧЕН";
+        _statusLabel.Text = T("status.disconnected");
         _statusLabel.ForeColor = Color.FromArgb(188, 188, 196);
         _timerLabel.Text = "00:00:00";
         _timerLabel.Visible = false;
@@ -3275,8 +3709,8 @@ del "%~f0"
     {
         using var dialog = new OpenFileDialog
         {
-            Filter = "sing-box.exe|sing-box.exe|Executable files|*.exe|All files|*.*",
-            Title = "Select sing-box.exe"
+            Filter = $"sing-box.exe|sing-box.exe|{T("dialog.exe.files")}|*.exe|{T("dialog.all.files")}|*.*",
+            Title = T("dialog.singbox.title")
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
@@ -3321,7 +3755,7 @@ del "%~f0"
         var profile = SelectedProfile();
         if (profile is null)
         {
-            MessageBox.Show("Import and select a profile first.", "Config", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(T("config.select.profile"), T("nav.config"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
         TryWriteConfig(profile);
@@ -3355,7 +3789,7 @@ del "%~f0"
             if (!process.WaitForExit(10000))
             {
                 process.Kill(entireProcessTree: true);
-                MessageBox.Show("sing-box check timed out.", "Config check failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(T("config.check.timeout"), T("config.check.failed"), MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Log("sing-box check timed out.");
                 return false;
             }
@@ -3367,12 +3801,12 @@ del "%~f0"
 
             if (process.ExitCode == 0) return true;
 
-            MessageBox.Show("sing-box rejected the generated config. Check logs for details.", "Config check failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(T("config.rejected"), T("config.check.failed"), MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.Message, "Cannot run sing-box check", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(ex.Message, T("config.check.cannot.run"), MessageBoxButtons.OK, MessageBoxIcon.Error);
             Log($"sing-box check failed: {ex.Message}");
             return false;
         }
@@ -3383,7 +3817,7 @@ del "%~f0"
         var profile = SelectedProfile();
         if (profile is null)
         {
-            MessageBox.Show("Import and select a profile first.", "Ping", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(T("start.select.profile"), T("ping.title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -3397,7 +3831,7 @@ del "%~f0"
         catch (Exception ex)
         {
             Log($"Ping failed: {ex.Message}");
-            MessageBox.Show(ex.Message, "Ping failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(ex.Message, T("ping.failed"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -3470,7 +3904,7 @@ del "%~f0"
             await UpdateServiceStatusAsync("Discord", "https://discord.com");
             await UpdateServiceStatusAsync("YouTube", "https://www.youtube.com");
             await UpdateServiceStatusAsync("Telegram", "https://telegram.org");
-            UpdateConnectionQuality();
+            UpdateConnectionQuality(profile);
         }
         finally
         {
@@ -3480,6 +3914,11 @@ del "%~f0"
 
     private static async Task<long?> MeasureServerLatencyAsync(ProxyProfile profile)
     {
+        if (profile.Protocol == ProxyProtocol.WireGuard)
+        {
+            return await MeasureIcmpLatencyAsync(profile.Server);
+        }
+
         try
         {
             using var client = new System.Net.Sockets.TcpClient();
@@ -3490,18 +3929,23 @@ del "%~f0"
         }
         catch
         {
-            try
-            {
-                using var ping = new System.Net.NetworkInformation.Ping();
-                var reply = await ping.SendPingAsync(profile.Server, 2500);
-                return reply.Status == System.Net.NetworkInformation.IPStatus.Success
-                    ? Math.Max(1, reply.RoundtripTime)
-                    : null;
-            }
-            catch
-            {
-                return null;
-            }
+            return await MeasureIcmpLatencyAsync(profile.Server);
+        }
+    }
+
+    private static async Task<long?> MeasureIcmpLatencyAsync(string host)
+    {
+        try
+        {
+            using var ping = new System.Net.NetworkInformation.Ping();
+            var reply = await ping.SendPingAsync(host, 2500);
+            return reply.Status == System.Net.NetworkInformation.IPStatus.Success
+                ? Math.Max(1, reply.RoundtripTime)
+                : null;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -3511,10 +3955,7 @@ del "%~f0"
 
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Head, url);
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
-            using var response = await _httpClient.SendAsync(request, cts.Token);
-            var ok = (int)response.StatusCode < 500;
+            var ok = await ProbeServiceAsync(url);
             label.Text = ok ? "OK" : "!";
             label.ForeColor = ok ? Color.FromArgb(92, 220, 148) : Color.FromArgb(255, 190, 92);
             _checkedServiceCount++;
@@ -3528,8 +3969,41 @@ del "%~f0"
         }
     }
 
-    private void UpdateConnectionQuality()
+    private async Task<bool> ProbeServiceAsync(string url)
     {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+        if (await TryProbeServiceAsync(HttpMethod.Head, url, cts.Token) is { } headResult)
+        {
+            if (headResult) return true;
+        }
+
+        return await TryProbeServiceAsync(HttpMethod.Get, url, cts.Token) ?? false;
+    }
+
+    private async Task<bool?> TryProbeServiceAsync(HttpMethod method, string url, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(method, url);
+            request.Headers.TryAddWithoutValidation("User-Agent", $"ior/{AppVersion}");
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            return (int)response.StatusCode < 500;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void UpdateConnectionQuality(ProxyProfile? profile = null)
+    {
+        if (profile?.Protocol == ProxyProtocol.WireGuard && IsSingBoxRunning())
+        {
+            _qualityValue.Text = T("quality.good");
+            _qualityValue.ForeColor = Color.FromArgb(92, 220, 148);
+            return;
+        }
+
         var latencyScore = _lastLatencyMs switch
         {
             null => 0,
@@ -3545,19 +4019,31 @@ del "%~f0"
 
         if (score >= 4)
         {
-            _qualityValue.Text = "Good";
+            _qualityValue.Text = T("quality.good");
             _qualityValue.ForeColor = Color.FromArgb(92, 220, 148);
         }
         else if (score >= 2)
         {
-            _qualityValue.Text = "Fair";
+            _qualityValue.Text = T("quality.fair");
             _qualityValue.ForeColor = Color.FromArgb(255, 190, 92);
         }
         else
         {
-            _qualityValue.Text = "Poor";
+            _qualityValue.Text = T("quality.poor");
             _qualityValue.ForeColor = Color.FromArgb(255, 116, 116);
         }
+    }
+
+    private bool IsSingBoxRunning()
+    {
+        if (_process is { HasExited: false }) return true;
+        if (TryGetTrackedSingBoxProcess(out var process))
+        {
+            process.Dispose();
+            return true;
+        }
+
+        return false;
     }
 
     private void RefreshProfiles()
@@ -3641,8 +4127,8 @@ del "%~f0"
     private void RefreshMainPreview()
     {
         var profile = SelectedProfile();
-        _selectedName.Text = profile?.Name ?? "Нет выбранного сервера";
-        _selectedProtocol.Text = profile is null ? "Добавьте подписку или ссылку" : ProtocolLabel(profile);
+        _selectedName.Text = profile?.Name ?? T("servers.none");
+        _selectedProtocol.Text = profile is null ? T("servers.add.subscription") : ProtocolLabel(profile);
         _selectedServer.Text = profile is null ? "" : $"{profile.Server}:{profile.Port}";
         Invalidate(true);
     }
@@ -3675,7 +4161,7 @@ del "%~f0"
             var text = Clipboard.ContainsText() ? Clipboard.GetText() : "";
             if (string.IsNullOrWhiteSpace(text))
             {
-                MessageBox.Show("Буфер обмена пуст.", "Import", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(T("import.clipboard.empty"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
@@ -3683,7 +4169,7 @@ del "%~f0"
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.Message, "Clipboard", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(ex.Message, T("import.clipboard"), MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -3749,7 +4235,7 @@ del "%~f0"
     {
         var dialog = new Form
         {
-            Text = "Добавить сервер",
+            Text = T("import.title"),
             FormBorderStyle = FormBorderStyle.None,
             StartPosition = FormStartPosition.Manual,
             Width = 560,
@@ -3799,19 +4285,19 @@ del "%~f0"
 
         layout.Controls.Add(new Label
         {
-            Text = "Добавить сервер",
+            Text = T("import.title"),
             Dock = DockStyle.Fill,
             ForeColor = TextColor,
             Font = new Font("Segoe UI", 17f, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft
         }, 0, 0);
 
-        layout.Controls.Add(ImportFieldLabel("Ссылки или подписки"), 0, 1);
+        layout.Controls.Add(ImportFieldLabel(T("import.links")), 0, 1);
         var linksInput = new TextBox
         {
             Multiline = false,
             WordWrap = false,
-            PlaceholderText = "vless://, vmess://, ss://, hysteria2:// или ссылка подписки"
+            PlaceholderText = T("import.placeholder")
         };
         linksBox = linksInput;
         StyleInput(linksBox);
@@ -3839,9 +4325,9 @@ del "%~f0"
             BackColor = CardBg2,
             Padding = new Padding(0, 6, 0, 0)
         };
-        var add = LightButton("Добавить", () => { }, primary: true);
+        var add = LightButton(T("servers.add"), () => { }, primary: true);
         add.Name = "AddImportButton";
-        var cancel = LightButton("Отмена", () => dialog.Close());
+        var cancel = LightButton(T("common.cancel"), () => dialog.Close());
         actions.Controls.Add(add);
         actions.Controls.Add(cancel);
         layout.Controls.Add(actions, 0, 6);
@@ -4029,8 +4515,8 @@ del "%~f0"
     {
         using var dialog = new SaveFileDialog
         {
-            Title = "Export layout settings",
-            Filter = "Layout settings (*.json)|*.json|All files (*.*)|*.*",
+            Title = T("layout.export.title"),
+            Filter = T("layout.filter"),
             FileName = "ior-layout.json"
         };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
@@ -4043,8 +4529,8 @@ del "%~f0"
     {
         using var dialog = new OpenFileDialog
         {
-            Title = "Import layout settings",
-            Filter = "Layout settings (*.json)|*.json|All files (*.*)|*.*"
+            Title = T("layout.import.title"),
+            Filter = T("layout.filter")
         };
         if (dialog.ShowDialog(this) != DialogResult.OK) return false;
 
@@ -4068,7 +4554,7 @@ del "%~f0"
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.Message, "Import layout", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(ex.Message, T("layout.import.error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
     }
@@ -4153,8 +4639,9 @@ del "%~f0"
 
         public event EventHandler? UpdateRequested;
 
-        public UpdateDialog(string version, bool canInstall)
+        public UpdateDialog(string version, bool canInstall, AppLanguage language)
         {
+            var ru = language == AppLanguage.Russian;
             Text = "ior update";
             Width = 456;
             Height = 246;
@@ -4180,7 +4667,7 @@ del "%~f0"
 
             var title = new Label
             {
-                Text = "Доступно обновление",
+                Text = ru ? "Доступно обновление" : "Update available",
                 Dock = DockStyle.Top,
                 Height = 34,
                 ForeColor = Color.White,
@@ -4192,8 +4679,12 @@ del "%~f0"
             var text = new Label
             {
                 Text = canInstall
-                    ? $"Новая версия {version} готова к установке. Приложение скачает нужную сборку и перезапустится."
-                    : $"Новая версия {version} доступна, но подходящий ZIP-архив не найден в GitHub Release.",
+                    ? ru
+                        ? $"Новая версия {version} готова к установке. Приложение скачает нужную сборку и перезапустится."
+                        : $"Version {version} is ready to install. The app will download the correct build and restart."
+                    : ru
+                        ? $"Новая версия {version} доступна, но подходящий ZIP-архив не найден в GitHub Release."
+                        : $"Version {version} is available, but a matching ZIP archive was not found in the GitHub Release.",
                 Dock = DockStyle.Top,
                 Height = 58,
                 ForeColor = Color.FromArgb(218, 218, 224),
@@ -4202,7 +4693,9 @@ del "%~f0"
                 TextAlign = ContentAlignment.MiddleLeft
             };
 
-            _statusLabel.Text = canInstall ? "Можно обновиться сейчас или напомнить позже." : "Откроется страница релиза.";
+            _statusLabel.Text = canInstall
+                ? ru ? "Можно обновиться сейчас или напомнить позже." : "You can update now or be reminded later."
+                : ru ? "Откроется страница релиза." : "The release page will open.";
             _statusLabel.Dock = DockStyle.Top;
             _statusLabel.Height = 32;
             _statusLabel.ForeColor = Muted;
@@ -4219,8 +4712,12 @@ del "%~f0"
             buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
 
-            _laterButton = DialogButton("Напомнить позже", primary: false);
-            _updateButton = DialogButton(canInstall ? "Обновить сейчас" : "Открыть релиз", primary: true);
+            _laterButton = DialogButton(ru ? "Напомнить позже" : "Remind me later", primary: false);
+            _updateButton = DialogButton(
+                canInstall
+                    ? ru ? "Обновить сейчас" : "Update now"
+                    : ru ? "Открыть релиз" : "Open release",
+                primary: true);
             _laterButton.Click += (_, _) =>
             {
                 DialogResult = DialogResult.Cancel;
@@ -6075,6 +6572,8 @@ del "%~f0"
         private bool _isTun;
 
         public event EventHandler<bool>? ModeChanged;
+        public string ProxyText { get; set; } = "Proxy";
+        public string TunText { get; set; } = "TUN";
 
         public bool IsTun
         {
@@ -6165,8 +6664,8 @@ del "%~f0"
 
             var proxyRect = new Rectangle(0, 0, Width / 2, Height);
             var tunRect = new Rectangle(Width / 2, 0, Width - Width / 2, Height);
-            DrawLabel(g, "Proxy", proxyRect, !_isTun, _hoverProxy);
-            DrawLabel(g, "TUN", tunRect, _isTun, _hoverTun);
+            DrawLabel(g, ProxyText, proxyRect, !_isTun, _hoverProxy);
+            DrawLabel(g, TunText, tunRect, _isTun, _hoverTun);
         }
 
         private void Animate()
@@ -6208,10 +6707,28 @@ del "%~f0"
 
     private sealed class ToggleButton : Control
     {
+        private readonly System.Windows.Forms.Timer _animationTimer = new() { Interval = 15 };
         private bool _hover;
         private bool _pressed;
+        private bool _isOn;
+        private float _thumbPosition;
+        private float _targetPosition;
 
-        public bool IsOn { get; set; }
+        public bool IsOn
+        {
+            get => _isOn;
+            set
+            {
+                if (_isOn == value && Math.Abs(_targetPosition - (value ? 1f : 0f)) < 0.001f) return;
+                _isOn = value;
+                _targetPosition = value ? 1f : 0f;
+                if (Math.Abs(_thumbPosition - _targetPosition) > 0.001f)
+                {
+                    _animationTimer.Start();
+                }
+                Invalidate();
+            }
+        }
 
         public ToggleButton()
         {
@@ -6221,6 +6738,7 @@ del "%~f0"
                      ControlStyles.UserPaint |
                      ControlStyles.SupportsTransparentBackColor, true);
             BackColor = Color.Transparent;
+            _animationTimer.Tick += (_, _) => Animate();
         }
 
         protected override void OnMouseEnter(EventArgs e)
@@ -6258,7 +6776,7 @@ del "%~f0"
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
             var rect = new Rectangle(3, 5, Math.Max(1, Width - 6), Math.Max(1, Height - 10));
-            var active = IsOn;
+            var active = _isOn;
             using var path = RoundedRect(rect, rect.Height / 2);
             using var shadow = new SolidBrush(Color.FromArgb(55, Color.Black));
             e.Graphics.FillPath(shadow, RoundedRect(new Rectangle(rect.X, rect.Y + 3, rect.Width, rect.Height), rect.Height / 2));
@@ -6277,7 +6795,9 @@ del "%~f0"
             e.Graphics.DrawPath(border, path);
 
             var knobSize = rect.Height - 10;
-            var knobX = active ? rect.Right - knobSize - 6 : rect.Left + 6;
+            var leftX = rect.Left + 6;
+            var rightX = rect.Right - knobSize - 6;
+            var knobX = (int)Math.Round(leftX + (rightX - leftX) * _thumbPosition);
             if (_pressed) knobX += active ? -2 : 2;
             var knob = new Rectangle(knobX, rect.Top + 5, knobSize, knobSize);
             using var knobBrush = new SolidBrush(Color.White);
@@ -6291,6 +6811,17 @@ del "%~f0"
                 ? new Rectangle(rect.Left + 18, rect.Top, rect.Width - knobSize - 26, rect.Height)
                 : new Rectangle(rect.Left + knobSize + 16, rect.Top, rect.Width - knobSize - 24, rect.Height);
             TextRenderer.DrawText(e.Graphics, text, font, textRect, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        }
+
+        private void Animate()
+        {
+            _thumbPosition += (_targetPosition - _thumbPosition) * 0.26f;
+            if (Math.Abs(_targetPosition - _thumbPosition) < 0.01f)
+            {
+                _thumbPosition = _targetPosition;
+                _animationTimer.Stop();
+            }
+            Invalidate();
         }
 
         private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
