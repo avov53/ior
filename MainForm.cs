@@ -3337,6 +3337,12 @@ del "%~f0"
 
     private static List<string> ParseRoutingLinks(string value)
     {
+        var trimmed = value.Trim();
+        if (trimmed.StartsWith('{') && trimmed.EndsWith('}'))
+        {
+            return [trimmed];
+        }
+
         return value
             .Split(['\r', '\n', ',', ';', ' '], StringSplitOptions.RemoveEmptyEntries)
             .Select(NormalizeRoutingLink)
@@ -3350,6 +3356,9 @@ del "%~f0"
     {
         var link = value.Trim().Trim('"', '\'');
         if (link.Length == 0) return null;
+        if (link.StartsWith('{') && link.EndsWith('}')) return link;
+        if (link.StartsWith("happ://routing/", StringComparison.OrdinalIgnoreCase)) return link;
+        if (LooksLikeBase64Json(link)) return link;
         if (!link.Contains("://", StringComparison.Ordinal) && link.Contains('.', StringComparison.Ordinal))
         {
             link = "https://" + link;
@@ -3359,6 +3368,13 @@ del "%~f0"
                (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
             ? link
             : null;
+    }
+
+    private static bool LooksLikeBase64Json(string value)
+    {
+        var text = value.Trim();
+        if (text.Length < 12) return false;
+        return text.All(c => char.IsLetterOrDigit(c) || c is '+' or '/' or '-' or '_' or '=');
     }
 
     private static void StyleCheck(CheckBox box)

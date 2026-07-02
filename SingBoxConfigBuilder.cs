@@ -155,9 +155,9 @@ public static class SingBoxConfigBuilder
 
     private static string RouteFinal(AppState state, string proxyTag)
     {
-        if (ProxyRoutingEnabled(state) && ActiveHappRoutingLinks(state).Count > 0)
+        if (ProxyRoutingEnabled(state) && ActiveHappRoutingItems(state).Count > 0)
         {
-            return "direct";
+            return ActiveHappRoutingConfigs(state).Any(HappConfigGlobalProxy) ? proxyTag : "direct";
         }
 
         return proxyTag;
@@ -172,7 +172,7 @@ public static class SingBoxConfigBuilder
     {
         var ruleSets = new JsonArray();
         var index = 1;
-        foreach (var link in ActiveHappRoutingLinks(state))
+        foreach (var link in ActiveHappRoutingItems(state).Where(IsHttpRuleSetLink))
         {
             ruleSets.Add(new JsonObject
             {
@@ -190,18 +190,25 @@ public static class SingBoxConfigBuilder
     private static void AddHappRoutingRules(JsonArray rules, AppState state)
     {
         var tags = new JsonArray();
-        for (var i = 0; i < ActiveHappRoutingLinks(state).Count; i++)
+        var remoteLinks = ActiveHappRoutingItems(state).Where(IsHttpRuleSetLink).ToList();
+        for (var i = 0; i < remoteLinks.Count; i++)
         {
             tags.Add(HappRuleSetTag(i + 1));
         }
-        if (tags.Count == 0) return;
-
-        rules.Add(new JsonObject
+        if (tags.Count > 0)
         {
-            ["rule_set"] = tags,
-            ["action"] = "route",
-            ["outbound"] = "proxy"
-        });
+            rules.Add(new JsonObject
+            {
+                ["rule_set"] = tags,
+                ["action"] = "route",
+                ["outbound"] = "proxy"
+            });
+        }
+
+        foreach (var config in ActiveHappRoutingConfigs(state))
+        {
+            AddHappConfigRules(rules, config);
+        }
     }
 
     private static string HappRuleSetTag(int index)
@@ -209,13 +216,22 @@ public static class SingBoxConfigBuilder
         return $"happ-routing-{index}";
     }
 
-    private static List<string> ActiveHappRoutingLinks(AppState state)
+    private static List<string> ActiveHappRoutingItems(AppState state)
     {
         var selected = state.HappRoutingProfiles.FirstOrDefault(x => x.Id == state.SelectedHappRoutingProfileId) ??
                        state.HappRoutingProfiles.FirstOrDefault();
         return selected is null
-            ? CleanRoutingLinks(state.HappRoutingLinks)
-            : CleanRoutingLinks(selected.Links);
+            ? CleanRoutingItems(state.HappRoutingLinks)
+            : CleanRoutingItems(selected.Links);
+    }
+
+    private static List<JsonElement> ActiveHappRoutingConfigs(AppState state)
+    {
+        return ActiveHappRoutingItems(state)
+            .Select(TryParseHappRoutingConfig)
+            .Where(config => config.HasValue)
+            .Select(config => config!.Value)
+            .ToList();
     }
 
     private static string RuleSetFormat(string url)
@@ -223,17 +239,181 @@ public static class SingBoxConfigBuilder
         return url.EndsWith(".srs", StringComparison.OrdinalIgnoreCase) ? "binary" : "source";
     }
 
-    private static List<string> CleanRoutingLinks(IEnumerable<string>? links)
+    private static List<string> CleanRoutingItems(IEnumerable<string>? links)
     {
         if (links is null) return [];
 
         return links
-            .SelectMany(link => link.Split(['\r', '\n', ',', ';', ' '], StringSplitOptions.RemoveEmptyEntries))
             .Select(link => link.Trim())
-            .Where(link => Uri.TryCreate(link, UriKind.Absolute, out var uri) &&
-                           (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+            .Where(link => !string.IsNullOrWhiteSpace(link))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private static bool IsHttpRuleSetLink(string link)
+    {
+        return Uri.TryCreate(link, UriKind.Absolute, out var uri) &&
+               (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps) &&
+               !uri.Host.Equals("routing.happ.su", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static JsonElement? TryParseHappRoutingConfig(string value)
+    {
+        var payload = ExtractHappPayload(value.Trim());
+        foreach (var candidate in DecodeHappPayloadCandidates(payload))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(candidate);
+                return doc.RootElement.Clone();
+            }
+            catch
+            {
+            }
+        }
+
+        return null;
+    }
+
+    private static string ExtractHappPayload(string value)
+    {
+        if (!value.StartsWith("happ://routing/", StringComparison.OrdinalIgnoreCase)) return value;
+
+        var marker = value.Contains("/onadd/", StringComparison.OrdinalIgnoreCase) ? "/onadd/" : "/add/";
+        var index = value.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        return index < 0 ? value : Uri.UnescapeDataString(value[(index + marker.Length)..]);
+    }
+
+    private static IEnumerable<string> DecodeHappPayloadCandidates(string payload)
+    {
+        yield return payload;
+
+        var normalized = payload.Replace('-', '+').Replace('_', '/');
+        var padding = normalized.Length % 4;
+        if (padding > 0) normalized = normalized.PadRight(normalized.Length + 4 - padding, '=');
+
+        byte[] bytes;
+        try
+        {
+            bytes = Convert.FromBase64String(normalized);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        yield return System.Text.Encoding.UTF8.GetString(bytes);
+    }
+
+    private static bool HappConfigGlobalProxy(JsonElement config)
+    {
+        return TryGetProperty(config, "GlobalProxy", out var value) &&
+               value.ValueKind is JsonValueKind.True;
+    }
+
+    private static void AddHappConfigRules(JsonArray rules, JsonElement config)
+    {
+        foreach (var action in HappRouteOrder(config))
+        {
+            switch (action)
+            {
+                case "block":
+                    AddHappDomainRule(rules, config, "BlockSites", "reject", null);
+                    AddHappIpRule(rules, config, "BlockIp", "reject", null);
+                    break;
+                case "proxy":
+                    AddHappDomainRule(rules, config, "ProxySites", "route", "proxy");
+                    AddHappIpRule(rules, config, "ProxyIp", "route", "proxy");
+                    break;
+                case "direct":
+                    AddHappDomainRule(rules, config, "DirectSites", "route", "direct");
+                    AddHappIpRule(rules, config, "DirectIp", "route", "direct");
+                    break;
+            }
+        }
+    }
+
+    private static IEnumerable<string> HappRouteOrder(JsonElement config)
+    {
+        var value = TryGetString(config, "RouteOrder");
+        var parts = string.IsNullOrWhiteSpace(value)
+            ? ["block", "proxy", "direct"]
+            : value.Split('-', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        foreach (var part in parts)
+        {
+            var normalized = part.Trim().ToLowerInvariant();
+            if (normalized is "block" or "proxy" or "direct") yield return normalized;
+        }
+    }
+
+    private static void AddHappDomainRule(JsonArray rules, JsonElement config, string property, string action, string? outbound)
+    {
+        var values = GetStringArray(config, property);
+        if (values.Count == 0) return;
+
+        var domains = new JsonArray();
+        foreach (var value in values) domains.Add(value);
+
+        var rule = new JsonObject
+        {
+            ["domain_suffix"] = domains,
+            ["action"] = action
+        };
+        if (!string.IsNullOrWhiteSpace(outbound)) rule["outbound"] = outbound;
+        rules.Add(rule);
+    }
+
+    private static void AddHappIpRule(JsonArray rules, JsonElement config, string property, string action, string? outbound)
+    {
+        var values = GetStringArray(config, property);
+        if (values.Count == 0) return;
+
+        var cidrs = new JsonArray();
+        foreach (var value in values) cidrs.Add(value);
+
+        var rule = new JsonObject
+        {
+            ["ip_cidr"] = cidrs,
+            ["action"] = action
+        };
+        if (!string.IsNullOrWhiteSpace(outbound)) rule["outbound"] = outbound;
+        rules.Add(rule);
+    }
+
+    private static List<string> GetStringArray(JsonElement config, string property)
+    {
+        if (!TryGetProperty(config, property, out var value) || value.ValueKind != JsonValueKind.Array) return [];
+
+        return value.EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.String)
+            .Select(item => item.GetString()?.Trim())
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Select(item => item!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string? TryGetString(JsonElement config, string property)
+    {
+        return TryGetProperty(config, property, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+    }
+
+    private static bool TryGetProperty(JsonElement config, string property, out JsonElement value)
+    {
+        foreach (var item in config.EnumerateObject())
+        {
+            if (item.Name.Equals(property, StringComparison.OrdinalIgnoreCase))
+            {
+                value = item.Value;
+                return true;
+            }
+        }
+
+        value = default;
+        return false;
     }
 
     private static string DnsStrategyForProfile(AppState state, ProxyProfile selected)
