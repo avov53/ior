@@ -26,6 +26,20 @@ public static class SingBoxConfigBuilder
 
         outbounds.Add(BuildDirectOutbound());
 
+        var route = new JsonObject
+        {
+            ["auto_detect_interface"] = true,
+            ["default_domain_resolver"] = new JsonObject
+            {
+                ["server"] = "remote",
+                ["strategy"] = dnsStrategy
+            },
+            ["rules"] = BuildRouteRules(state, selected),
+            ["final"] = RouteFinal(state, proxyTag)
+        };
+        var happRuleSets = BuildHappRouteRuleSets(state);
+        if (happRuleSets.Count > 0) route["rule_set"] = happRuleSets;
+
         var root = new JsonObject
         {
             ["log"] = new JsonObject { ["level"] = state.LogLevel, ["timestamp"] = true },
@@ -42,17 +56,7 @@ public static class SingBoxConfigBuilder
             },
             ["inbounds"] = BuildInbounds(state, selected),
             ["outbounds"] = outbounds,
-            ["route"] = new JsonObject
-            {
-                ["auto_detect_interface"] = true,
-                ["default_domain_resolver"] = new JsonObject
-                {
-                    ["server"] = "remote",
-                    ["strategy"] = dnsStrategy
-                },
-                ["rules"] = BuildRouteRules(state, selected),
-                ["final"] = RouteFinal(state, proxyTag)
-            }
+            ["route"] = route
         };
 
         if (endpoints.Count > 0) root["endpoints"] = endpoints;
@@ -95,11 +99,7 @@ public static class SingBoxConfigBuilder
             }
         }
 
-        if (ProxyRoutingEnabled(state))
-        {
-            AddDomainRouteRule(rules, state.RoutingBypassSites, "direct");
-            AddDomainRouteRule(rules, state.RoutingProxySites, "proxy");
-        }
+        if (ProxyRoutingEnabled(state)) AddHappRoutingRules(rules, state);
 
         return rules;
     }
@@ -155,7 +155,7 @@ public static class SingBoxConfigBuilder
 
     private static string RouteFinal(AppState state, string proxyTag)
     {
-        if (ProxyRoutingEnabled(state) && CleanSites(state.RoutingProxySites).Count > 0)
+        if (ProxyRoutingEnabled(state) && ActiveHappRoutingLinks(state).Count > 0)
         {
             return "direct";
         }
@@ -168,35 +168,70 @@ public static class SingBoxConfigBuilder
         return state.MixedProxyEnabled && !state.TunEnabled;
     }
 
-    private static void AddDomainRouteRule(JsonArray rules, IEnumerable<string> sites, string outbound)
+    private static JsonArray BuildHappRouteRuleSets(AppState state)
     {
-        var domains = CleanSites(sites);
-        if (domains.Count == 0) return;
-
-        var values = new JsonArray();
-        foreach (var domain in domains)
+        var ruleSets = new JsonArray();
+        var index = 1;
+        foreach (var link in ActiveHappRoutingLinks(state))
         {
-            values.Add(domain);
+            ruleSets.Add(new JsonObject
+            {
+                ["type"] = "remote",
+                ["tag"] = HappRuleSetTag(index++),
+                ["format"] = RuleSetFormat(link),
+                ["url"] = link,
+                ["download_detour"] = "direct"
+            });
         }
+
+        return ruleSets;
+    }
+
+    private static void AddHappRoutingRules(JsonArray rules, AppState state)
+    {
+        var tags = new JsonArray();
+        for (var i = 0; i < ActiveHappRoutingLinks(state).Count; i++)
+        {
+            tags.Add(HappRuleSetTag(i + 1));
+        }
+        if (tags.Count == 0) return;
 
         rules.Add(new JsonObject
         {
-            ["domain_suffix"] = values,
+            ["rule_set"] = tags,
             ["action"] = "route",
-            ["outbound"] = outbound
+            ["outbound"] = "proxy"
         });
     }
 
-    private static List<string> CleanSites(IEnumerable<string>? sites)
+    private static string HappRuleSetTag(int index)
     {
-        if (sites is null) return [];
+        return $"happ-routing-{index}";
+    }
 
-        return sites
-            .SelectMany(site => site.Split(['\r', '\n', ',', ';', ' '], StringSplitOptions.RemoveEmptyEntries))
-            .Select(site => site.Trim().TrimEnd('/'))
-            .Select(site => site.StartsWith("*.") ? site[2..] : site)
-            .Select(site => site.StartsWith(".") ? site[1..] : site)
-            .Where(site => !string.IsNullOrWhiteSpace(site))
+    private static List<string> ActiveHappRoutingLinks(AppState state)
+    {
+        var selected = state.HappRoutingProfiles.FirstOrDefault(x => x.Id == state.SelectedHappRoutingProfileId) ??
+                       state.HappRoutingProfiles.FirstOrDefault();
+        return selected is null
+            ? CleanRoutingLinks(state.HappRoutingLinks)
+            : CleanRoutingLinks(selected.Links);
+    }
+
+    private static string RuleSetFormat(string url)
+    {
+        return url.EndsWith(".srs", StringComparison.OrdinalIgnoreCase) ? "binary" : "source";
+    }
+
+    private static List<string> CleanRoutingLinks(IEnumerable<string>? links)
+    {
+        if (links is null) return [];
+
+        return links
+            .SelectMany(link => link.Split(['\r', '\n', ',', ';', ' '], StringSplitOptions.RemoveEmptyEntries))
+            .Select(link => link.Trim())
+            .Where(link => Uri.TryCreate(link, UriKind.Absolute, out var uri) &&
+                           (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }

@@ -30,6 +30,9 @@ public sealed class AppState
         "www.wildberries.ru"
     ];
     public List<string> RoutingProxySites { get; set; } = [];
+    public List<string> HappRoutingLinks { get; set; } = [];
+    public List<HappRoutingProfile> HappRoutingProfiles { get; set; } = [];
+    public string? SelectedHappRoutingProfileId { get; set; }
     public string? SelectedProfileId { get; set; }
     public int? ActiveProcessId { get; set; }
     public DateTime? ActiveConnectionStartedUtc { get; set; }
@@ -47,6 +50,7 @@ public sealed class AppState
     public bool ShowNavTooltips { get; set; } = true;
     public bool ShowNavSeparators { get; set; } = true;
     public bool UsePanelGlass { get; set; } = true;
+    public bool MinimizeToTray { get; set; } = true;
     public List<ProxyProfile> Profiles { get; set; } = [];
 
     [JsonIgnore]
@@ -89,9 +93,23 @@ public sealed class ProxyProfile
     public string? CountryCode { get; set; }
     public string? CountryName { get; set; }
     public DateTime? CountryLookupUtc { get; set; }
+    public long? SubscriptionUploadBytes { get; set; }
+    public long? SubscriptionDownloadBytes { get; set; }
+    public long? SubscriptionTotalBytes { get; set; }
+    public DateTime? SubscriptionExpireUtc { get; set; }
 
     [JsonIgnore]
     public string DisplayName => $"{Name}  [{Protocol}]";
+}
+
+public sealed class HappRoutingProfile
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Name { get; set; } = "Happ routing";
+    public List<string> Links { get; set; } = [];
+
+    [JsonIgnore]
+    public string DisplayName => Name;
 }
 
 public enum ProxyProtocol

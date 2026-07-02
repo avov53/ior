@@ -13,7 +13,7 @@ namespace HappBox;
 
 public sealed class MainForm : Form
 {
-    private const string AppVersion = "0.1.1";
+    private const string AppVersion = "1.2";
     private const string GitHubRepositoryUrl = "https://github.com/avov53/ior";
     private const string GitHubLatestReleaseApiUrl = "https://api.github.com/repos/avov53/ior/releases/latest";
     private const int SingBoxStartupTimeoutMs = 6000;
@@ -49,7 +49,7 @@ public sealed class MainForm : Form
     private readonly AppState _state;
     private readonly List<string> _logs = [];
 
-    private readonly ListBox _profiles = new();
+    private readonly BufferedListBox _profiles = new();
     private readonly Panel _serverContentHost = new();
     private readonly Panel _emptyStatePanel = new();
     private readonly Panel _inlineImportPanel = new();
@@ -58,6 +58,7 @@ public sealed class MainForm : Form
     private readonly Label _selectedName = new();
     private readonly Label _selectedProtocol = new();
     private readonly Label _selectedServer = new();
+    private readonly SubscriptionUsageBar _subscriptionUsageBar = new();
     private readonly Label _statusLabel = new();
     private readonly Label _timerLabel = new();
     private readonly ToggleButton _powerButton = new();
@@ -69,9 +70,12 @@ public sealed class MainForm : Form
     private readonly Dictionary<string, Label> _serviceStatusLabels = [];
     private readonly HashSet<string> _countryLookupsInFlight = [];
     private readonly System.Windows.Forms.Timer _connectTimer = new() { Interval = 1000 };
-    private readonly System.Windows.Forms.Timer _trafficTimer = new() { Interval = 1000 };
+    private readonly System.Windows.Forms.Timer _trafficTimer = new() { Interval = 750 };
     private readonly List<SideNavButton> _navButtons = [];
     private readonly ToolTip _navToolTip = CreateNavToolTip();
+    private readonly System.Windows.Forms.Timer _profileDragHoldTimer = new() { Interval = 220 };
+    private readonly System.Windows.Forms.Timer _navResponsiveTimer = new() { Interval = 120 };
+    private readonly NotifyIcon _trayIcon = new();
 
     private DateTime? _connectedAt;
     private bool _startupUpdatePromptShown;
@@ -79,7 +83,22 @@ public sealed class MainForm : Form
     private long _lastSentBytes;
     private bool _serviceCheckRunning;
     private bool _connectionTransitionInProgress;
+    private bool _allowExit;
+    private bool _profileDragPending;
+    private bool _profileDragging;
+    private bool _profileDragSelectionChanging;
+    private string? _profileSelectedBeforeDragId;
+    private int _profileDragIndex = -1;
+    private int _profileDropIndex = -1;
+    private int _profileDragGrabOffsetY;
+    private int _profileDragPreviewTargetTop;
+    private Point _profileDragStart;
+    private Point _profileDragPoint;
+    private ProxyProfile? _profileDragItem;
+    private ProfileDragPreview? _profileDragPreview;
     private DateTime _lastServiceCheckUtc = DateTime.MinValue;
+    private CancellationTokenSource? _statusProbeCts;
+    private int _statusProbeVersion;
     private Process? _process;
     private bool? _previousProxyEnabled;
     private string? _previousProxyServer;
@@ -102,6 +121,7 @@ public sealed class MainForm : Form
     private AppView _currentView = AppView.Servers;
     private AppView _previousView = AppView.Servers;
     private bool _serversExpanded = true;
+    private bool _lastTopNavLabelsVisible;
     private long? _lastLatencyMs;
     private int _healthyServiceCount;
     private int _checkedServiceCount;
@@ -122,6 +142,8 @@ public sealed class MainForm : Form
         }
 
         Text = "ior";
+        AutoScaleMode = AutoScaleMode.Dpi;
+        AutoScaleDimensions = new SizeF(96f, 96f);
         var workingArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1220, 810);
         Width = Math.Min(1120, Math.Max(920, workingArea.Width - 80));
         Height = Math.Min(810, Math.Max(620, workingArea.Height - 80));
@@ -138,18 +160,40 @@ public sealed class MainForm : Form
             UpdateTrafficStats();
             await UpdatePingAndServicesAsync();
         };
+        _profileDragHoldTimer.Tick += (_, _) => BeginProfileDrag();
+        _navResponsiveTimer.Tick += (_, _) =>
+        {
+            _navResponsiveTimer.Stop();
+            RefreshResponsiveNav();
+        };
+        Resize += (_, _) =>
+        {
+            _navResponsiveTimer.Start();
+            UpdateServerListColumnWidth();
+        };
         BuildUi();
+        ConfigureTrayIcon();
         RefreshProfiles();
         RefreshMainPreview();
         ResetTrafficCounters();
         RecoverConnectionState();
         QueueCountryLookups(_state.Profiles);
         _trafficTimer.Start();
+        _ = UpdatePingAndServicesAsync(force: true);
         Shown += async (_, _) => await CheckForStartupUpdateAsync();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (!_allowExit && _state.MinimizeToTray && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            HideToTray();
+            return;
+        }
+
+        _trayIcon.Visible = false;
+        _trayIcon.Dispose();
         StopSingBox();
         SaveState();
         base.OnFormClosing(e);
@@ -159,6 +203,67 @@ public sealed class MainForm : Form
     {
         base.OnHandleCreated(e);
         ApplyWindowBackdrop();
+    }
+
+    private void ConfigureTrayIcon()
+    {
+        _trayIcon.Text = "ior";
+        _trayIcon.Icon = Icon ?? SystemIcons.Application;
+        _trayIcon.Visible = _state.MinimizeToTray;
+        _trayIcon.MouseDoubleClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left) RestoreFromTray();
+        };
+        _trayIcon.MouseClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Right) ShowTrayMenu();
+        };
+    }
+
+    private void ShowTrayMenu()
+    {
+        var menu = new ContextMenuStrip
+        {
+            BackColor = CardBg2,
+            ForeColor = TextColor,
+            Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors())
+        };
+        var connected = IsConnectionActive();
+        menu.Items.Add(connected ? T("tray.disconnect") : T("tray.connect"), null, (_, _) => ToggleConnection());
+        menu.Items.Add(T("tray.close"), null, (_, _) =>
+        {
+            _allowExit = true;
+            _trayIcon.Visible = false;
+            Close();
+        });
+        menu.Closed += (_, _) => BeginInvoke(new Action(menu.Dispose));
+        menu.Show(Cursor.Position);
+    }
+
+    private void HideToTray()
+    {
+        _trayIcon.Visible = true;
+        Hide();
+    }
+
+    private void RestoreFromTray()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    private bool IsConnectionActive()
+    {
+        var hasTrackedProcess = TryGetTrackedSingBoxProcess(out var trackedProcess);
+        trackedProcess?.Dispose();
+        return _process is { HasExited: false } || hasTrackedProcess;
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        RebuildShellLayout();
     }
 
     private void BuildUi()
@@ -201,6 +306,7 @@ public sealed class MainForm : Form
         };
         if (isTop)
         {
+            _lastTopNavLabelsVisible = ShouldShowTopNavLabels();
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, NavRailThickness()));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -224,6 +330,16 @@ public sealed class MainForm : Form
         root.Controls.Add(_contentHost, isTop ? 0 : 1, isTop ? 1 : 0);
         _shellRoot.ResumeLayout(true);
         if (showCurrentView) ShowCurrentView();
+    }
+
+    private void RefreshResponsiveNav()
+    {
+        if (_state.NavPanelPosition != NavPanelPosition.Top || _shellRoot is null) return;
+
+        var showLabels = ShouldShowTopNavLabels();
+        if (showLabels == _lastTopNavLabelsVisible) return;
+
+        RebuildShellLayout();
     }
 
     private void ResetCachedMainViews()
@@ -460,6 +576,7 @@ public sealed class MainForm : Form
         NormalizeNavCustomization();
         var isTop = _state.NavPanelPosition == NavPanelPosition.Top;
         var itemSize = NavItemSize();
+        var showLabels = isTop && ShouldShowTopNavLabels();
         var visibleItems = _state.NavItemOrder
             .Where(id => !_state.HiddenNavItems.Contains(id, StringComparer.OrdinalIgnoreCase))
             .ToList();
@@ -478,10 +595,7 @@ public sealed class MainForm : Form
         if (isTop)
         {
             nav.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            for (var i = 0; i < slotCount; i++)
-            {
-                nav.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, itemSize + 2));
-            }
+            AddTopNavColumnStyles(nav, visibleItems, showLabels);
             nav.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         }
         else
@@ -495,8 +609,8 @@ public sealed class MainForm : Form
         }
 
         var index = 0;
-        AddNavButton(nav, SideButton("→", NavigateBack, T("nav.back"), selectOnClick: false), index++, isTop);
-        AddNavButton(nav, SideButton("+", () => { NavigateTo(AppView.Servers); ShowInlineImport(); }, T("nav.import"), selectOnClick: false), index++, isTop);
+        AddNavButton(nav, SideButton("→", T("nav.back"), NavigateBack, T("nav.back"), selectOnClick: false), index++, isTop);
+        AddNavButton(nav, SideButton("+", T("nav.import"), () => { NavigateTo(AppView.Servers); ShowInlineImport(); }, T("nav.import"), selectOnClick: false), index++, isTop);
         if (_state.ShowNavSeparators) AddNavButton(nav, new NavSeparator { PanelPosition = _state.NavPanelPosition }, index++, isTop);
         foreach (var id in visibleItems)
         {
@@ -507,6 +621,19 @@ public sealed class MainForm : Form
             AddNavButton(nav, BuildNavItemButton(id), index++, isTop);
         }
         return nav;
+    }
+
+    private void AddTopNavColumnStyles(TableLayoutPanel nav, List<string> visibleItems, bool showLabels)
+    {
+        nav.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, TopNavSlotWidth(T("nav.back"), showLabels)));
+        nav.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, TopNavSlotWidth(T("nav.import"), showLabels)));
+        if (_state.ShowNavSeparators) nav.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 18));
+
+        foreach (var id in visibleItems)
+        {
+            if (_state.ShowNavSeparators && id == "info") nav.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 18));
+            nav.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, TopNavSlotWidth(NavItemTitle(id), showLabels)));
+        }
     }
 
     private int NavItemSize()
@@ -521,12 +648,55 @@ public sealed class MainForm : Form
 
     private int NavRailThickness()
     {
+        if (_state.NavPanelPosition == NavPanelPosition.Left)
+        {
+            return _state.NavIconSize switch
+            {
+                NavIconSize.Compact => 66,
+                NavIconSize.Large => 92,
+                _ => 78
+            };
+        }
+
         return _state.NavIconSize switch
         {
             NavIconSize.Compact => 66,
             NavIconSize.Large => 92,
             _ => 78
         };
+    }
+
+    private int TopNavSlotWidth(string label, bool showLabel)
+    {
+        var itemSize = NavItemSize();
+        if (!showLabel) return itemSize + 2;
+
+        var textWidth = TextRenderer.MeasureText(label, Font).Width;
+        return Math.Clamp(itemSize + textWidth + 20, itemSize + 42, 148);
+    }
+
+    private bool ShouldShowTopNavLabels()
+    {
+        if (_state.NavPanelPosition != NavPanelPosition.Top) return false;
+        if (ClientSize.Width <= 0) return false;
+
+        NormalizeNavCustomization();
+        var visibleItems = _state.NavItemOrder
+            .Where(id => !_state.HiddenNavItems.Contains(id, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+
+        var required = 36;
+        required += TopNavSlotWidth(T("nav.back"), showLabel: true);
+        required += TopNavSlotWidth(T("nav.import"), showLabel: true);
+        if (_state.ShowNavSeparators) required += 18;
+
+        foreach (var id in visibleItems)
+        {
+            if (_state.ShowNavSeparators && id == "info") required += 18;
+            required += TopNavSlotWidth(NavItemTitle(id), showLabel: true);
+        }
+
+        return ClientSize.Width >= required;
     }
 
     private static bool GlassSupported()
@@ -557,7 +727,7 @@ public sealed class MainForm : Form
     private SideNavButton BuildNavItemButton(string id)
     {
         var (icon, tooltip, view) = NavItemInfo(id);
-        var button = (SideNavButton)SideButton(icon, () => NavigateTo(view), NavItemTitle(id), active: _currentView == view);
+        var button = (SideNavButton)SideButton(icon, NavItemTitle(id), () => NavigateTo(view), NavItemTitle(id), active: _currentView == view);
         switch (id)
         {
             case "servers":
@@ -651,6 +821,12 @@ public sealed class MainForm : Form
             "settings.proxy.mode.only" => ru ? "Только для режима прокси" : "Proxy mode only",
             "settings.excluded.sites" => ru ? "Исключённые сайты" : "Excluded sites",
             "settings.proxied.sites" => ru ? "Проксируемые сайты" : "Proxied sites",
+            "settings.happ.routing.links" => ru ? "Ссылки Happ" : "Happ links",
+            "settings.happ.routing.hint" => ru ? "Ссылки с routing.happ.su. В Proxy-режиме совпадения пойдут через VPN, остальное напрямую." : "Links from routing.happ.su. In Proxy mode matches go through VPN, the rest goes direct.",
+            "settings.happ.routing.site" => ru ? "Открыть routing.happ.su/ru" : "Open routing.happ.su/ru",
+            "settings.happ.routing.profiles" => ru ? "Профили" : "Profiles",
+            "settings.happ.routing.profile.name" => ru ? "Имя профиля" : "Profile name",
+            "settings.happ.routing.empty" => ru ? "Профилей пока нет" : "No profiles yet",
             "settings.route" => ru ? "Маршрут" : "Route",
             "settings.log.level" => ru ? "Уровень логов" : "Log level",
             "settings.sniff" => ru ? "Анализировать трафик" : "Sniff traffic",
@@ -669,6 +845,7 @@ public sealed class MainForm : Form
             "custom.tooltips" => ru ? "Подсказки" : "Tooltips",
             "custom.separators" => ru ? "Разделители" : "Separators",
             "custom.glass" => ru ? "Стеклянная панель" : "Glass panel",
+            "custom.tray" => ru ? "Сворачивать в трей" : "Minimize to tray",
             "custom.pick" => ru ? "Выбрать" : "Pick",
             "custom.reset" => ru ? "Сброс" : "Reset",
             "custom.export" => ru ? "Экспорт" : "Export",
@@ -702,6 +879,10 @@ public sealed class MainForm : Form
             "import.title.short" => ru ? "Импорт" : "Import",
             "common.cancel" => ru ? "Отмена" : "Cancel",
             "common.ok" => "OK",
+            "common.file" => ru ? "Файл" : "File",
+            "tray.connect" => ru ? "Включить" : "Connect",
+            "tray.disconnect" => ru ? "Выключить" : "Disconnect",
+            "tray.close" => ru ? "Закрыть" : "Close",
             "start.title" => ru ? "Запуск" : "Start",
             "start.select.profile" => ru ? "Сначала импортируйте и выберите профиль." : "Import and select a profile first.",
             "connection.failed" => ru ? "Ошибка подключения" : "Connection failed",
@@ -924,14 +1105,20 @@ public sealed class MainForm : Form
         _profiles.BackColor = CardBg2;
         _profiles.ForeColor = TextColor;
         _profiles.DrawMode = DrawMode.OwnerDrawFixed;
-        _profiles.ItemHeight = 72;
+        _profiles.ItemHeight = 86;
         _profiles.DrawItem += DrawProfileItem;
         _profiles.MouseDown += ProfilesMouseDown;
+        _profiles.MouseMove += ProfilesMouseMove;
+        _profiles.MouseUp += ProfilesMouseUp;
+        _profiles.MouseLeave += (_, _) =>
+        {
+            if (!_profileDragging && (Control.MouseButtons & MouseButtons.Left) != MouseButtons.Left) CancelProfileDrag();
+        };
         _profiles.SelectedIndexChanged += (_, _) =>
         {
-            if (_profiles.SelectedItem is ProxyProfile profile) _state.SelectedProfileId = profile.Id;
-            RefreshMainPreview();
-            SaveState();
+            if (_profileDragPending || _profileDragging) return;
+            if (_profileDragSelectionChanging) return;
+            SelectProfile(_profiles.SelectedItem as ProxyProfile, save: true);
         };
         _serverContentHost.Dock = DockStyle.Fill;
         _serverContentHost.BackColor = CardBg2;
@@ -1101,6 +1288,11 @@ public sealed class MainForm : Form
         _selectedServer.Width = 360;
         _selectedServer.Height = 28;
 
+        _subscriptionUsageBar.Width = 360;
+        _subscriptionUsageBar.Height = 18;
+        _subscriptionUsageBar.BackColor = Color.Transparent;
+        _subscriptionUsageBar.Visible = false;
+
         var modeSwitch = new ModeSwitchControl
         {
             Width = 210,
@@ -1123,6 +1315,7 @@ public sealed class MainForm : Form
         area.Controls.Add(_selectedName);
         area.Controls.Add(_selectedProtocol);
         area.Controls.Add(_selectedServer);
+        area.Controls.Add(_subscriptionUsageBar);
         area.Controls.Add(_networkStatsPanel);
         area.Controls.Add(modeSwitch);
         LayoutConnectionPanel(area, modeSwitch);
@@ -1142,9 +1335,10 @@ public sealed class MainForm : Form
         _powerButton.Location = new Point(cx - _powerButton.Width / 2, h / 2 - 120);
         _statusLabel.Location = new Point(cx - _statusLabel.Width / 2, h / 2 - 40);
         _timerLabel.Location = new Point(cx - _timerLabel.Width / 2, h / 2 - 15);
-        _selectedName.Location = new Point(cx - _selectedName.Width / 2, h - 258);
-        _selectedProtocol.Location = new Point(cx - _selectedProtocol.Width / 2, h - 226);
-        _selectedServer.Location = new Point(cx - _selectedServer.Width / 2, h - 202);
+        _selectedName.Location = new Point(cx - _selectedName.Width / 2, h - 282);
+        _selectedProtocol.Location = new Point(cx - _selectedProtocol.Width / 2, h - 250);
+        _selectedServer.Location = new Point(cx - _selectedServer.Width / 2, h - 226);
+        _subscriptionUsageBar.Location = new Point(cx - _subscriptionUsageBar.Width / 2, h - 190);
         _networkStatsPanel.Location = new Point(cx - _networkStatsPanel.Width / 2, h - 168);
         modeSwitch.Location = new Point(cx - modeSwitch.Width / 2, h - 60);
     }
@@ -1262,12 +1456,15 @@ public sealed class MainForm : Form
         return card;
     }
 
-    private Control SideButton(string text, Action action, string tooltip, bool active = false, bool selectOnClick = true)
+    private Control SideButton(string text, string label, Action action, string tooltip, bool active = false, bool selectOnClick = true)
     {
+        var showLabel = _state.NavPanelPosition == NavPanelPosition.Top && ShouldShowTopNavLabels();
         var button = new SideNavButton
         {
             Dock = DockStyle.Fill,
             IconText = text,
+            LabelText = label,
+            ShowLabel = showLabel,
             Active = active,
             PanelPosition = _state.NavPanelPosition,
             IconScale = _state.NavIconSize switch
@@ -1451,7 +1648,8 @@ public sealed class MainForm : Form
         _contentHost.RowStyles.Clear();
         _contentHost.ColumnCount = 2;
         _contentHost.RowCount = 1;
-        _contentHost.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 583));
+        var serverListWidth = ServerListColumnWidth();
+        _contentHost.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, serverListWidth));
         _contentHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
         _serverListView ??= BuildServerList();
@@ -1463,6 +1661,35 @@ public sealed class MainForm : Form
         if (closeInlineImport) HideInlineImport();
         RefreshProfiles();
         RefreshMainPreview();
+    }
+
+    private int ServerListColumnWidth()
+    {
+        var width = _contentHost?.ClientSize.Width ?? ClientSize.Width - NavRailThickness();
+        if (width <= 0) return 583;
+
+        var desired = ScaleLogical(583);
+        var minConnectionWidth = ScaleLogical(430);
+        var minServerListWidth = ScaleLogical(430);
+        var maxServerListWidth = Math.Max(minServerListWidth, width - minConnectionWidth);
+        return Math.Clamp(desired, minServerListWidth, maxServerListWidth);
+    }
+
+    private void UpdateServerListColumnWidth()
+    {
+        if (_currentView != AppView.Servers || _contentHost is null || _contentHost.ColumnStyles.Count < 2) return;
+
+        var width = ServerListColumnWidth();
+        if (Math.Abs(_contentHost.ColumnStyles[0].Width - width) < 1) return;
+
+        _contentHost.ColumnStyles[0].Width = width;
+        _contentHost.PerformLayout();
+    }
+
+    private int ScaleLogical(int value)
+    {
+        var dpi = DeviceDpi > 0 ? DeviceDpi : 96;
+        return (int)Math.Round(value * dpi / 96d);
     }
 
     private void ShowSettingsWindow()
@@ -1713,45 +1940,285 @@ public sealed class MainForm : Form
 
     private Control BuildRoutingSettingsSection()
     {
+        NormalizeHappRoutingProfiles(_state);
         var panel = SettingsCard();
-        panel.RowCount = 4;
+        panel.RowCount = 5;
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 150));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 150));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
-        var bypassSites = new TextBox
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 116));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 230));
+        var happLinks = new TextBox
         {
-            Text = string.Join(Environment.NewLine, _state.RoutingBypassSites),
+            Text = "",
             Multiline = true,
             AcceptsReturn = true,
             WordWrap = false,
             ScrollBars = ScrollBars.None
         };
-        var proxySites = new TextBox
-        {
-            Text = string.Join(Environment.NewLine, _state.RoutingProxySites),
-            Multiline = true,
-            AcceptsReturn = true,
-            WordWrap = false,
-            ScrollBars = ScrollBars.None
-        };
-        StyleInput(bypassSites);
-        StyleInput(proxySites);
-
+        StyleInput(happLinks);
         var modeHint = FieldLabel(T("settings.proxy.mode.only"));
         modeHint.Margin = new Padding(8, 6, 8, 8);
         panel.Controls.Add(modeHint, 1, 0);
-        panel.Controls.Add(FieldLabel(T("settings.excluded.sites")), 0, 1);
-        panel.Controls.Add(SettingsTextInput(bypassSites, height: 142), 1, 1);
-        panel.Controls.Add(FieldLabel(T("settings.proxied.sites")), 0, 2);
-        panel.Controls.Add(SettingsTextInput(proxySites, height: 142), 1, 2);
-        panel.Controls.Add(LightButton(T("settings.save"), () =>
+        var hint = new Label
         {
-            _state.RoutingBypassSites = ParseSiteList(bypassSites.Text);
-            _state.RoutingProxySites = ParseSiteList(proxySites.Text);
-            SaveSettings();
-        }, primary: true), 1, 3);
+            Text = T("settings.happ.routing.hint"),
+            Dock = DockStyle.Fill,
+            ForeColor = Muted,
+            BackColor = Bg,
+            Font = new Font("Segoe UI", 9f),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(4, 0, 10, 0)
+        };
+        panel.Controls.Add(hint, 1, 1);
+        panel.Controls.Add(LightButton(T("settings.happ.routing.site"), () => OpenExternalUrl("https://routing.happ.su/ru"), width: 190), 2, 1);
+        panel.Controls.Add(FieldLabel(T("settings.happ.routing.links")), 0, 2);
+        var happLinksInput = SettingsTextInput(happLinks, height: 108);
+        panel.Controls.Add(happLinksInput, 1, 2);
+        panel.SetColumnSpan(happLinksInput, 2);
+
+        var addActions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Bg,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, 0)
+        };
+        addActions.Controls.Add(LightButton(T("servers.add"), () =>
+        {
+            AddHappRoutingProfile(happLinks.Text);
+            ShowSettingsWindow();
+        }, primary: true, width: 128));
+        panel.Controls.Add(addActions, 1, 3);
+        panel.SetColumnSpan(addActions, 2);
+
+        panel.Controls.Add(FieldLabel(T("settings.happ.routing.profiles")), 0, 4);
+        var profilesList = BuildHappRoutingProfilesList();
+        panel.Controls.Add(profilesList, 1, 4);
+        panel.SetColumnSpan(profilesList, 2);
         return panel;
+    }
+
+    private RoundedPanel BuildHappRoutingProfilesList()
+    {
+        var wrap = new RoundedPanel
+        {
+            Dock = DockStyle.Fill,
+            Height = 222,
+            BackColor = CardBg2,
+            BorderColor = Color.FromArgb(82, 84, 92),
+            Radius = 6,
+            Margin = new Padding(4, 8, 10, 8),
+            Padding = new Padding(8)
+        };
+
+        var list = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = CardBg2,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            AutoScroll = true,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        list.Resize += (_, _) =>
+        {
+            foreach (Control child in list.Controls)
+            {
+                child.Width = Math.Max(120, list.ClientSize.Width - 8);
+            }
+        };
+
+        if (_state.HappRoutingProfiles.Count == 0)
+        {
+            list.Controls.Add(new Label
+            {
+                Text = T("settings.happ.routing.empty"),
+                Width = Math.Max(120, list.ClientSize.Width - 8),
+                Height = 42,
+                ForeColor = Muted,
+                BackColor = CardBg2,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(10, 0, 0, 0)
+            });
+        }
+        else
+        {
+            foreach (var profile in _state.HappRoutingProfiles)
+            {
+                list.Controls.Add(BuildHappRoutingProfileRow(profile));
+            }
+        }
+
+        wrap.Controls.Add(list);
+        return wrap;
+    }
+
+    private Control BuildHappRoutingProfileRow(HappRoutingProfile profile)
+    {
+        var selected = profile.Id == _state.SelectedHappRoutingProfileId;
+        var row = new TableLayoutPanel
+        {
+            Width = 420,
+            Height = 42,
+            ColumnCount = 4,
+            RowCount = 1,
+            BackColor = selected ? Color.FromArgb(62, 64, 72) : CardBg2,
+            Margin = new Padding(0, 0, 0, 6),
+            Padding = new Padding(10, 0, 8, 0),
+            Cursor = Cursors.Hand
+        };
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 32));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 32));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 32));
+
+        var name = new Label
+        {
+            Text = profile.Name,
+            Dock = DockStyle.Fill,
+            ForeColor = selected ? Color.White : TextColor,
+            BackColor = Color.Transparent,
+            Font = new Font("Segoe UI", 10f, selected ? FontStyle.Bold : FontStyle.Regular),
+            TextAlign = ContentAlignment.MiddleLeft,
+            AutoEllipsis = true,
+            Cursor = Cursors.Hand
+        };
+        var rename = new HappProfileActionButton(HappProfileActionKind.Rename, () => RenameHappRoutingProfile(profile)) { Dock = DockStyle.Fill };
+        var delete = new HappProfileActionButton(HappProfileActionKind.Delete, () => DeleteHappRoutingProfile(profile)) { Dock = DockStyle.Fill };
+        var export = new HappProfileActionButton(HappProfileActionKind.Export, () => ExportHappRoutingProfile(profile)) { Dock = DockStyle.Fill };
+        foreach (var icon in new[] { rename, delete, export }) icon.Visible = false;
+
+        row.Controls.Add(name, 0, 0);
+        row.Controls.Add(rename, 1, 0);
+        row.Controls.Add(delete, 2, 0);
+        row.Controls.Add(export, 3, 0);
+
+        void SelectProfile()
+        {
+            _state.SelectedHappRoutingProfileId = profile.Id;
+            SaveSettings();
+            ShowSettingsWindow();
+        }
+
+        void SetHover(bool hover)
+        {
+            row.BackColor = selected
+                ? hover ? Color.FromArgb(72, 74, 84) : Color.FromArgb(62, 64, 72)
+                : hover ? Color.FromArgb(48, 50, 56) : CardBg2;
+            foreach (var icon in new[] { rename, delete, export }) icon.Visible = hover;
+        }
+
+        row.Click += (_, _) => SelectProfile();
+        name.Click += (_, _) => SelectProfile();
+        void WireHover(Control control)
+        {
+            control.MouseEnter += (_, _) => SetHover(true);
+            control.MouseLeave += (_, _) =>
+            {
+                if (!row.ClientRectangle.Contains(row.PointToClient(Cursor.Position)))
+                {
+                    SetHover(false);
+                }
+            };
+        }
+
+        WireHover(row);
+        WireHover(name);
+        foreach (var icon in new[] { rename, delete, export }) WireHover(icon);
+        return row;
+    }
+
+    private void AddHappRoutingProfile(string value)
+    {
+        var links = ParseRoutingLinks(value);
+        if (links.Count == 0) return;
+
+        var name = DefaultHappRoutingProfileName(links);
+        var profile = new HappRoutingProfile
+        {
+            Name = name,
+            Links = links
+        };
+        _state.HappRoutingProfiles.Add(profile);
+        _state.SelectedHappRoutingProfileId = profile.Id;
+        _state.HappRoutingLinks = [];
+        _state.RoutingBypassSites = [];
+        _state.RoutingProxySites = [];
+        SaveSettings();
+    }
+
+    private void RenameHappRoutingProfile(HappRoutingProfile profile)
+    {
+        var name = PromptForRoutingProfileName(profile.Name);
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        profile.Name = name.Trim();
+        SaveSettings();
+        ShowSettingsWindow();
+    }
+
+    private void DeleteHappRoutingProfile(HappRoutingProfile profile)
+    {
+        _state.HappRoutingProfiles.RemoveAll(x => x.Id == profile.Id);
+        _state.SelectedHappRoutingProfileId = _state.HappRoutingProfiles.FirstOrDefault()?.Id;
+        SaveSettings();
+        ShowSettingsWindow();
+    }
+
+    private static void ExportHappRoutingProfile(HappRoutingProfile profile)
+    {
+        Clipboard.SetText(string.Join(Environment.NewLine, profile.Links));
+    }
+
+    private string? PromptForRoutingProfileName(string currentName)
+    {
+        using var dialog = new Form
+        {
+            Width = 360,
+            Height = 150,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.None,
+            BackColor = Bg,
+            Padding = new Padding(16),
+            Font = Font,
+            Text = T("settings.happ.routing.profile.name")
+        };
+
+        var input = new TextBox
+        {
+            Text = currentName,
+            BorderStyle = BorderStyle.None,
+            BackColor = CardBg2,
+            ForeColor = TextColor,
+            Location = new Point(18, 22),
+            Width = 310,
+            Height = 28
+        };
+        var ok = LightButton("OK", () => dialog.DialogResult = DialogResult.OK, true);
+        var cancel = LightButton(T("common.cancel"), () => dialog.DialogResult = DialogResult.Cancel);
+        ok.Location = new Point(72, 82);
+        cancel.Location = new Point(204, 82);
+        dialog.Controls.Add(input);
+        dialog.Controls.Add(ok);
+        dialog.Controls.Add(cancel);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+        return dialog.ShowDialog(this) == DialogResult.OK ? input.Text.Trim() : null;
+    }
+
+    private static string DefaultHappRoutingProfileName(List<string> links)
+    {
+        if (links.Count == 1 && Uri.TryCreate(links[0], UriKind.Absolute, out var uri))
+        {
+            var file = Path.GetFileNameWithoutExtension(uri.AbsolutePath.TrimEnd('/'));
+            if (!string.IsNullOrWhiteSpace(file)) return file;
+            return uri.Host;
+        }
+
+        return $"Happ routing {DateTime.Now:HHmm}";
     }
 
     private Control BuildAdvancedSettingsSection()
@@ -1805,7 +2272,8 @@ public sealed class MainForm : Form
         var showTooltips = new CheckBox { Text = T("custom.tooltips"), AutoSize = true, Checked = _state.ShowNavTooltips };
         var showSeparators = new CheckBox { Text = T("custom.separators"), AutoSize = true, Checked = _state.ShowNavSeparators };
         var useGlass = new CheckBox { Text = T("custom.glass"), AutoSize = true, Checked = _state.UsePanelGlass && GlassSupported(), Enabled = GlassSupported() };
-        foreach (var box in new[] { showTooltips, showSeparators, useGlass })
+        var minimizeToTray = new CheckBox { Text = T("custom.tray"), AutoSize = true, Checked = _state.MinimizeToTray };
+        foreach (var box in new[] { showTooltips, showSeparators, useGlass, minimizeToTray })
         {
             StyleCheck(box);
         }
@@ -1879,6 +2347,16 @@ public sealed class MainForm : Form
         flags.Controls.Add(showTooltips);
         flags.Controls.Add(showSeparators);
         flags.Controls.Add(useGlass);
+        var trayOption = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            BackColor = Bg,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(4, 2, 10, 4)
+        };
+        trayOption.Controls.Add(minimizeToTray);
         var preview = new NavCustomizationPreview(order, _state.NavPanelPosition, _state.NavIconSize)
         {
             Dock = DockStyle.Top,
@@ -1891,7 +2369,7 @@ public sealed class MainForm : Form
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 3,
-            RowCount = 10,
+            RowCount = 11,
             BackColor = Bg,
             Padding = new Padding(0, 6, 0, 22)
         };
@@ -1905,6 +2383,7 @@ public sealed class MainForm : Form
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 104));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 320));
@@ -1929,7 +2408,7 @@ public sealed class MainForm : Form
                 : itemCount * itemSize + Math.Max(0, itemCount - 1) * 6 + 32;
 
             preview.Height = height;
-            panel.RowStyles[9].Height = height + 46;
+            panel.RowStyles[10].Height = height + 46;
             panel.PerformLayout();
         }
         ApplyPreviewHeight();
@@ -1989,6 +2468,8 @@ public sealed class MainForm : Form
             _state.ShowNavTooltips = showTooltips.Checked;
             _state.ShowNavSeparators = showSeparators.Checked;
             _state.UsePanelGlass = useGlass.Checked;
+            _state.MinimizeToTray = minimizeToTray.Checked;
+            _trayIcon.Visible = _state.MinimizeToTray;
             _state.NavPanelPosition = preview.Position;
             _state.NavItemOrder = NormalizeNavItemOrder(preview.Order);
             ApplyAppearanceSettings();
@@ -2013,6 +2494,7 @@ public sealed class MainForm : Form
             showTooltips.Checked = true;
             showSeparators.Checked = true;
             useGlass.Checked = GlassSupported();
+            minimizeToTray.Checked = true;
             preview.IconSize = NavIconSize.Normal;
             preview.Reset(DefaultNavItemOrder, NavPanelPosition.Left);
         }, width: 112));
@@ -2049,12 +2531,15 @@ public sealed class MainForm : Form
         panel.Controls.Add(FieldLabel(T("custom.options")), 0, 6);
         panel.Controls.Add(flags, 1, 6);
         panel.SetColumnSpan(flags, 2);
-        panel.Controls.Add(actions, 1, 7);
+        panel.Controls.Add(FieldLabel(T("custom.tray")), 0, 7);
+        panel.Controls.Add(trayOption, 1, 7);
+        panel.SetColumnSpan(trayOption, 2);
+        panel.Controls.Add(actions, 1, 8);
         panel.SetColumnSpan(actions, 2);
-        panel.Controls.Add(title, 1, 8);
-        panel.Controls.Add(hint, 2, 8);
+        panel.Controls.Add(title, 1, 9);
+        panel.Controls.Add(hint, 2, 9);
         panel.SetColumnSpan(hint, 1);
-        panel.Controls.Add(preview, 1, 9);
+        panel.Controls.Add(preview, 1, 10);
         panel.SetColumnSpan(preview, 2);
         return panel;
     }
@@ -2745,6 +3230,8 @@ del "%~f0"
                 Dock = DockStyle.Fill,
                 Margin = new Padding(2, 1, 0, 1)
             };
+            var smoothScrollTimer = new System.Windows.Forms.Timer { Interval = 15 };
+            var targetLine = 0;
 
             void UpdateScroll()
             {
@@ -2752,24 +3239,50 @@ del "%~f0"
                 var visibleLines = Math.Max(1, box.ClientSize.Height / lineHeight);
                 scroll.Maximum = Math.Max(0, box.Lines.Length - visibleLines);
                 scroll.LargeChange = visibleLines;
+                targetLine = Math.Clamp(targetLine, 0, scroll.Maximum);
                 scroll.Value = Math.Min(scroll.Maximum, GetFirstVisibleLine(box));
                 scroll.Visible = true;
             }
 
-            void ScrollTo(int value)
+            void SetScrollLine(int value, bool animate)
             {
+                targetLine = Math.Clamp(value, 0, scroll.Maximum);
+                if (animate)
+                {
+                    smoothScrollTimer.Start();
+                    return;
+                }
+
+                smoothScrollTimer.Stop();
                 var current = GetFirstVisibleLine(box);
-                var next = Math.Clamp(value, 0, scroll.Maximum);
-                if (next == current) return;
-                SendMessage(box.Handle, EmLineScroll, IntPtr.Zero, next - current);
-                scroll.Value = next;
+                if (targetLine == current) return;
+                SendMessage(box.Handle, EmLineScroll, IntPtr.Zero, targetLine - current);
+                scroll.Value = targetLine;
                 box.Invalidate();
             }
 
-            scroll.ScrollRequested += (_, value) => ScrollTo(value);
+            void AnimateScroll()
+            {
+                var current = GetFirstVisibleLine(box);
+                if (current == targetLine)
+                {
+                    smoothScrollTimer.Stop();
+                    return;
+                }
+
+                var delta = targetLine - current;
+                var step = Math.Sign(delta) * Math.Max(1, (int)Math.Ceiling(Math.Abs(delta) * 0.34));
+                SendMessage(box.Handle, EmLineScroll, IntPtr.Zero, step);
+                scroll.Value = Math.Clamp(GetFirstVisibleLine(box), 0, scroll.Maximum);
+                box.Invalidate();
+            }
+
+            smoothScrollTimer.Tick += (_, _) => AnimateScroll();
+            box.Disposed += (_, _) => smoothScrollTimer.Dispose();
+            scroll.ScrollRequested += (_, value) => SetScrollLine(value, animate: false);
             box.MouseWheel += (_, e) =>
             {
-                ScrollTo(GetFirstVisibleLine(box) - Math.Sign(e.Delta) * 3);
+                SetScrollLine(targetLine - Math.Sign(e.Delta) * 7, animate: true);
                 UpdateScroll();
             };
             box.TextChanged += (_, _) => UpdateScroll();
@@ -2803,6 +3316,17 @@ del "%~f0"
             .Split(['\r', '\n', ',', ';', ' '], StringSplitOptions.RemoveEmptyEntries)
             .Select(site => site.Trim())
             .Where(site => site.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static List<string> ParseRoutingLinks(string value)
+    {
+        return value
+            .Split(['\r', '\n', ',', ';', ' '], StringSplitOptions.RemoveEmptyEntries)
+            .Select(link => link.Trim())
+            .Where(link => Uri.TryCreate(link, UriKind.Absolute, out var uri) &&
+                           (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
@@ -2846,7 +3370,17 @@ del "%~f0"
         g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
         var rect = new Rectangle(e.Bounds.Left + 8, e.Bounds.Top + 6, e.Bounds.Width - 16, e.Bounds.Height - 10);
-        using var bg = new SolidBrush(selected ? Color.FromArgb(72, 73, 74) : CardBg2);
+        var dragged = _profileDragging && ReferenceEquals(profile, _profileDragItem);
+        if (dragged)
+        {
+            using var draggedBackground = new SolidBrush(CardBg2);
+            g.FillRectangle(draggedBackground, e.Bounds);
+            DrawProfileDropIndicator(g, e.Index);
+            return;
+        }
+
+        var bgColor = selected ? Color.FromArgb(72, 73, 74) : CardBg2;
+        using var bg = new SolidBrush(bgColor);
         using var title = new SolidBrush(TextColor);
         using var subtitle = new SolidBrush(Muted);
         using var accent = new SolidBrush(Accent);
@@ -2865,7 +3399,105 @@ del "%~f0"
         DrawCountryFlag(g, profile, new Rectangle(rect.Left + 18, rect.Top + 22, 28, 18));
         g.DrawString(profile.Name, titleFont, title, rect.Left + 62, rect.Top + 14);
         g.DrawString($"{ProtocolLabel(profile)} / {profile.Server}:{profile.Port}", subtitleFont, subtitle, rect.Left + 62, rect.Top + 39);
+        if (HasSubscriptionUsage(profile))
+        {
+            DrawSubscriptionUsage(g, new Rectangle(rect.Left + 62, rect.Top + 62, rect.Width - 112, 8), profile, showText: false);
+        }
+        DrawProfileDropIndicator(g, e.Index);
         g.DrawString("›", arrowFont, subtitle, rect.Right - 30, rect.Top + 12);
+    }
+
+    private void DrawProfileDropIndicator(Graphics g, int itemIndex)
+    {
+        if (!_profileDragging || _profileDropIndex < 0) return;
+        if (itemIndex != _profileDropIndex &&
+            !(itemIndex == _profiles.Items.Count - 1 && _profileDropIndex == _profiles.Items.Count))
+        {
+            return;
+        }
+
+        var itemBounds = _profiles.GetItemRectangle(itemIndex);
+        var y = _profileDropIndex == itemIndex
+            ? itemBounds.Top + 3
+            : itemBounds.Bottom - 3;
+        var line = new Rectangle(itemBounds.Left + 18, y, Math.Max(1, itemBounds.Width - 36), 3);
+        using var glow = new SolidBrush(Color.FromArgb(70, Accent));
+        using var accent = new SolidBrush(Accent);
+        using var glowPath = RoundedRectPath(new Rectangle(line.Left - 4, line.Top - 3, line.Width + 8, line.Height + 6), 5);
+        using var linePath = RoundedRectPath(line, 2);
+        g.FillPath(glow, glowPath);
+        g.FillPath(accent, linePath);
+    }
+
+    private static bool HasSubscriptionUsage(ProxyProfile? profile)
+    {
+        return profile?.SubscriptionTotalBytes is > 0;
+    }
+
+    private static long SubscriptionUsedBytes(ProxyProfile profile)
+    {
+        return Math.Max(0, profile.SubscriptionUploadBytes.GetValueOrDefault()) +
+               Math.Max(0, profile.SubscriptionDownloadBytes.GetValueOrDefault());
+    }
+
+    private static float SubscriptionRatio(ProxyProfile profile)
+    {
+        var total = profile.SubscriptionTotalBytes.GetValueOrDefault();
+        if (total <= 0) return 0f;
+        return (float)Math.Clamp(SubscriptionUsedBytes(profile) / (double)total, 0d, 1d);
+    }
+
+    private static string SubscriptionUsageText(ProxyProfile profile)
+    {
+        return $"{FormatTrafficBytes(SubscriptionUsedBytes(profile))} / {FormatTrafficBytes(profile.SubscriptionTotalBytes.GetValueOrDefault())}";
+    }
+
+    private static string FormatTrafficBytes(long bytes)
+    {
+        const double gb = 1024d * 1024d * 1024d;
+        const double mb = 1024d * 1024d;
+
+        if (bytes >= 100L * 1024L * 1024L)
+        {
+            return $"{bytes / gb:0.#} GB";
+        }
+
+        return $"{bytes / mb:0} MB";
+    }
+
+    private static void DrawSubscriptionUsage(Graphics g, Rectangle bounds, ProxyProfile profile, bool showText)
+    {
+        var ratio = SubscriptionRatio(profile);
+        using var trackPath = RoundedRectPath(bounds, Math.Max(3, bounds.Height / 2));
+        using var track = new SolidBrush(Color.FromArgb(54, 56, 66));
+        g.FillPath(track, trackPath);
+
+        var fillWidth = (int)Math.Round(bounds.Width * ratio);
+        if (fillWidth > 0)
+        {
+            var fillBounds = new Rectangle(bounds.Left, bounds.Top, Math.Min(bounds.Width, fillWidth), bounds.Height);
+            using var fillPath = RoundedRectPath(fillBounds, Math.Max(3, bounds.Height / 2));
+            using var fill = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(96, 205, 150),
+                Color.FromArgb(116, 142, 255),
+                LinearGradientMode.Horizontal);
+            g.FillPath(fill, fillPath);
+        }
+
+        using var border = new Pen(Color.FromArgb(92, 96, 112), 1f) { Alignment = PenAlignment.Inset };
+        g.DrawPath(border, trackPath);
+
+        if (!showText) return;
+
+        using var font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+        TextRenderer.DrawText(
+            g,
+            SubscriptionUsageText(profile),
+            font,
+            bounds,
+            Color.White,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
     }
 
     private void ProfilesMouseDown(object? sender, MouseEventArgs e)
@@ -2876,13 +3508,276 @@ del "%~f0"
         var itemBounds = _profiles.GetItemRectangle(index);
         var cardBounds = new Rectangle(itemBounds.Left + 8, itemBounds.Top + 6, itemBounds.Width - 16, itemBounds.Height - 10);
         var arrowBounds = new Rectangle(cardBounds.Right - 46, cardBounds.Top, 46, cardBounds.Height);
-        if (!arrowBounds.Contains(e.Location) && e.Button != MouseButtons.Right) return;
 
-        _profiles.SelectedIndex = index;
-        if (_profiles.Items[index] is ProxyProfile profile)
+        if ((e.Button == MouseButtons.Right || arrowBounds.Contains(e.Location)) &&
+            _profiles.Items[index] is ProxyProfile profile)
         {
+            SelectProfile(profile, save: true);
             ShowServerMenu(profile, new Point(arrowBounds.Left, arrowBounds.Bottom - 4));
+            return;
         }
+
+        if (e.Button == MouseButtons.Left && cardBounds.Contains(e.Location) &&
+            _profiles.Items[index] is ProxyProfile dragProfile)
+        {
+            ArmProfileDrag(index, dragProfile, e.Location);
+        }
+    }
+
+    private void ProfilesMouseMove(object? sender, MouseEventArgs e)
+    {
+        if (_profileDragPending && !_profileDragging)
+        {
+            _profileDragPoint = e.Location;
+            return;
+        }
+
+        if (!_profileDragging) return;
+
+        _profileDragPoint = e.Location;
+        var nextDropIndex = ProfileDropIndex(e.Location);
+        MoveProfileDragPreview(e.Location);
+        ScrollProfilesDuringDrag(e.Location);
+        if (nextDropIndex != _profileDropIndex)
+        {
+            _profileDropIndex = nextDropIndex;
+        }
+        _profiles.Invalidate();
+        _profileDragPreview?.BringToFront();
+    }
+
+    private void ProfilesMouseUp(object? sender, MouseEventArgs e)
+    {
+        if (_profileDragging)
+        {
+            CommitProfileDrag();
+            return;
+        }
+
+        if (_profileDragPending &&
+            _profileDragIndex >= 0 &&
+            _profileDragIndex < _profiles.Items.Count &&
+            _profiles.Items[_profileDragIndex] is ProxyProfile profile)
+        {
+            CancelProfileDrag();
+            SelectProfile(profile, save: true);
+            return;
+        }
+
+        CancelProfileDrag();
+    }
+
+    private void ArmProfileDrag(int index, ProxyProfile profile, Point location)
+    {
+        if (_profiles.Items.Count <= 1) return;
+
+        CancelProfileDrag();
+        _profileDragPending = true;
+        _profileDragIndex = index;
+        _profileDropIndex = index;
+        _profileDragStart = location;
+        _profileDragPoint = location;
+        _profileDragItem = profile;
+        _profileSelectedBeforeDragId = _state.SelectedProfileId;
+        var itemBounds = _profiles.GetItemRectangle(index);
+        _profileDragGrabOffsetY = Math.Clamp(location.Y - itemBounds.Top, 0, Math.Max(0, itemBounds.Height - 1));
+        _profileDragHoldTimer.Start();
+    }
+
+    private void BeginProfileDrag()
+    {
+        _profileDragHoldTimer.Stop();
+        if (!_profileDragPending ||
+            _profileDragItem is null ||
+            (Control.MouseButtons & MouseButtons.Left) != MouseButtons.Left)
+        {
+            CancelProfileDrag();
+            return;
+        }
+
+        _profileDragPending = false;
+        _profileDragging = true;
+        _profiles.Cursor = Cursors.SizeNS;
+        _profiles.Capture = true;
+        _profileDropIndex = ProfileDropIndex(_profileDragPoint);
+        ShowProfileDragPreview();
+        MoveProfileDragPreview(_profileDragPoint);
+        _profiles.Invalidate();
+    }
+
+    private int ProfileDropIndex(Point location)
+    {
+        if (_profiles.Items.Count == 0) return -1;
+
+        for (var i = 0; i < _profiles.Items.Count; i++)
+        {
+            var bounds = _profiles.GetItemRectangle(i);
+            if (location.Y < bounds.Top + bounds.Height / 2) return i;
+        }
+
+        return _profiles.Items.Count;
+    }
+
+    private void ScrollProfilesDuringDrag(Point location)
+    {
+        if (_profiles.Items.Count == 0) return;
+
+        try
+        {
+            if (location.Y < 24 && _profiles.TopIndex > 0)
+            {
+                _profiles.TopIndex--;
+            }
+            else if (location.Y > _profiles.ClientSize.Height - 24 &&
+                     _profiles.TopIndex < _profiles.Items.Count - 1)
+            {
+                _profiles.TopIndex++;
+            }
+        }
+        catch
+        {
+            // Ignore transient ListBox bounds changes while dragging.
+        }
+    }
+
+    private void ShowProfileDragPreview()
+    {
+        if (_profileDragItem is null) return;
+
+        _profileDragPreview?.Dispose();
+        _profileDragPreview = new ProfileDragPreview(_profileDragItem, DrawProfileDragPreviewCard)
+        {
+            Width = Math.Max(1, _profiles.ClientSize.Width),
+            Height = _profiles.ItemHeight,
+            BackColor = CardBg2,
+            Visible = true
+        };
+        _profiles.BringToFront();
+        _serverContentHost.Controls.Add(_profileDragPreview);
+        _profileDragPreview.BringToFront();
+    }
+
+    private void MoveProfileDragPreview(Point listLocation)
+    {
+        if (_profileDragPreview is null) return;
+
+        var listTopInHost = _profiles.Top;
+        var topInList = listLocation.Y - _profileDragGrabOffsetY;
+        var maxTopInList = Math.Max(0, _profiles.ClientSize.Height - _profileDragPreview.Height);
+        var clampedTopInList = Math.Clamp(topInList, 0, maxTopInList);
+
+        _profileDragPreviewTargetTop = listTopInHost + clampedTopInList;
+        _profileDragPreview.Left = _profiles.Left;
+        _profileDragPreview.Width = Math.Max(1, _profiles.ClientSize.Width);
+        _profileDragPreview.SetTopImmediate(_profileDragPreviewTargetTop);
+        _profileDragPreview.Invalidate();
+        _profileDragPoint = new Point(listLocation.X, clampedTopInList + _profileDragGrabOffsetY);
+    }
+
+    private void DrawProfileDragPreviewCard(Graphics g, Rectangle bounds, ProxyProfile profile)
+    {
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+        var rect = new Rectangle(bounds.Left + 8, bounds.Top + 6, bounds.Width - 16, bounds.Height - 10);
+        using var shadow = new SolidBrush(Color.FromArgb(70, Color.Black));
+        using var shadowPath = RoundedRectPath(new Rectangle(rect.Left, rect.Top + 4, rect.Width, rect.Height), 8);
+        g.FillPath(shadow, shadowPath);
+
+        using var bg = new LinearGradientBrush(
+            rect,
+            Color.FromArgb(84, 86, 96),
+            Color.FromArgb(58, 60, 70),
+            LinearGradientMode.Vertical);
+        using var border = new Pen(Color.FromArgb(145, 134, 255), 1.4f) { Alignment = PenAlignment.Inset };
+        using var cardPath = RoundedRectPath(rect, 8);
+        g.FillPath(bg, cardPath);
+        g.DrawPath(border, cardPath);
+
+        using var accent = new SolidBrush(Accent);
+        using var accentPath = RoundedRectPath(new Rectangle(rect.Left, rect.Top + 2, 4, rect.Height - 4), 3);
+        g.FillPath(accent, accentPath);
+
+        using var titleFont = new Font("Segoe UI", 11f, FontStyle.Bold);
+        using var subtitleFont = new Font("Segoe UI", 8.8f);
+        using var title = new SolidBrush(TextColor);
+        using var subtitle = new SolidBrush(Color.FromArgb(212, 214, 224));
+        DrawCountryFlag(g, profile, new Rectangle(rect.Left + 18, rect.Top + 22, 28, 18));
+        g.DrawString(profile.Name, titleFont, title, rect.Left + 62, rect.Top + 14);
+        g.DrawString($"{ProtocolLabel(profile)} / {profile.Server}:{profile.Port}", subtitleFont, subtitle, rect.Left + 62, rect.Top + 39);
+
+        if (HasSubscriptionUsage(profile))
+        {
+            DrawSubscriptionUsage(g, new Rectangle(rect.Left + 62, rect.Top + 62, rect.Width - 112, 8), profile, showText: false);
+        }
+    }
+
+    private void CommitProfileDrag()
+    {
+        var profile = _profileDragItem;
+        var sourceIndex = _profileDragIndex;
+        var dropIndex = _profileDropIndex;
+        var selectedBeforeDragId = _profileSelectedBeforeDragId;
+        CancelProfileDrag();
+
+        if (profile is null ||
+            sourceIndex < 0 ||
+            sourceIndex >= _state.Profiles.Count ||
+            dropIndex < 0)
+        {
+            return;
+        }
+
+        dropIndex = Math.Clamp(dropIndex, 0, _state.Profiles.Count);
+        if (dropIndex == sourceIndex || dropIndex == sourceIndex + 1)
+        {
+            _profiles.Invalidate();
+            return;
+        }
+
+        _state.Profiles.RemoveAt(sourceIndex);
+        if (dropIndex > sourceIndex) dropIndex--;
+        dropIndex = Math.Clamp(dropIndex, 0, _state.Profiles.Count);
+        _state.Profiles.Insert(dropIndex, profile);
+        if (!string.IsNullOrWhiteSpace(selectedBeforeDragId) &&
+            _state.Profiles.Any(x => x.Id == selectedBeforeDragId))
+        {
+            _state.SelectedProfileId = selectedBeforeDragId;
+        }
+
+        _profileDragSelectionChanging = true;
+        try
+        {
+            RefreshProfiles();
+            var selectedIndex = _state.Profiles.FindIndex(x => x.Id == _state.SelectedProfileId);
+            if (selectedIndex >= 0) _profiles.SelectedIndex = selectedIndex;
+        }
+        finally
+        {
+            _profileDragSelectionChanging = false;
+        }
+
+        RefreshMainPreview();
+        SaveState();
+    }
+
+    private void CancelProfileDrag()
+    {
+        _profileDragHoldTimer.Stop();
+        _profileDragPending = false;
+        _profileDragging = false;
+        _profileDragSelectionChanging = false;
+        _profileDragIndex = -1;
+        _profileDropIndex = -1;
+        _profileDragItem = null;
+        _profileSelectedBeforeDragId = null;
+        _profileDragPreviewTargetTop = 0;
+        _profiles.Cursor = Cursors.Default;
+        _profiles.Capture = false;
+        _profileDragPreview?.Dispose();
+        _profileDragPreview = null;
+        if (!_profiles.IsDisposed) _profiles.Invalidate();
     }
 
     private void ShowServerMenu(ProxyProfile profile, Point location)
@@ -3163,12 +4058,16 @@ del "%~f0"
     private async Task<bool> ImportProfilesFromTextAsync(string text)
     {
         var importText = text.Trim();
+        SubscriptionInfo? subscriptionInfo = null;
         if (LooksLikeSubscriptionUrl(importText))
         {
             try
             {
                 Log($"Downloading subscription: {importText}");
-                importText = await _httpClient.GetStringAsync(importText);
+                using var response = await _httpClient.GetAsync(importText);
+                response.EnsureSuccessStatusCode();
+                subscriptionInfo = ParseSubscriptionInfo(response);
+                importText = await response.Content.ReadAsStringAsync();
             }
             catch (Exception ex)
             {
@@ -3187,13 +4086,33 @@ del "%~f0"
 
         foreach (var profile in parsed)
         {
+            if (subscriptionInfo is not null)
+            {
+                ApplySubscriptionInfo(profile, subscriptionInfo);
+            }
+
             var existing = _state.Profiles.FindIndex(x =>
                 x.Protocol == profile.Protocol &&
                 x.Server.Equals(profile.Server, StringComparison.OrdinalIgnoreCase) &&
                 x.Port == profile.Port &&
                 (x.UserId ?? x.Password ?? x.PrivateKey) == (profile.UserId ?? profile.Password ?? profile.PrivateKey));
 
-            if (existing >= 0) _state.Profiles[existing] = profile;
+            if (existing >= 0)
+            {
+                var current = _state.Profiles[existing];
+                profile.Id = current.Id;
+                profile.CountryCode = current.CountryCode;
+                profile.CountryName = current.CountryName;
+                profile.CountryLookupUtc = current.CountryLookupUtc;
+                if (subscriptionInfo is null)
+                {
+                    profile.SubscriptionUploadBytes = current.SubscriptionUploadBytes;
+                    profile.SubscriptionDownloadBytes = current.SubscriptionDownloadBytes;
+                    profile.SubscriptionTotalBytes = current.SubscriptionTotalBytes;
+                    profile.SubscriptionExpireUtc = current.SubscriptionExpireUtc;
+                }
+                _state.Profiles[existing] = profile;
+            }
             else _state.Profiles.Add(profile);
         }
 
@@ -3209,6 +4128,58 @@ del "%~f0"
     {
         return Uri.TryCreate(text, UriKind.Absolute, out var uri) &&
                (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+    }
+
+    private static SubscriptionInfo? ParseSubscriptionInfo(HttpResponseMessage response)
+    {
+        if (!response.Headers.TryGetValues("subscription-userinfo", out var values) &&
+            !response.Content.Headers.TryGetValues("subscription-userinfo", out values))
+        {
+            return null;
+        }
+
+        long upload = 0;
+        long download = 0;
+        long total = 0;
+        DateTime? expireUtc = null;
+
+        foreach (var part in string.Join(";", values).Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var pair = part.Split('=', 2, StringSplitOptions.TrimEntries);
+            if (pair.Length != 2) continue;
+
+            if (pair[0].Equals("upload", StringComparison.OrdinalIgnoreCase) &&
+                long.TryParse(pair[1], out var uploadBytes))
+            {
+                upload = Math.Max(0, uploadBytes);
+            }
+            else if (pair[0].Equals("download", StringComparison.OrdinalIgnoreCase) &&
+                     long.TryParse(pair[1], out var downloadBytes))
+            {
+                download = Math.Max(0, downloadBytes);
+            }
+            else if (pair[0].Equals("total", StringComparison.OrdinalIgnoreCase) &&
+                     long.TryParse(pair[1], out var totalBytes))
+            {
+                total = Math.Max(0, totalBytes);
+            }
+            else if (pair[0].Equals("expire", StringComparison.OrdinalIgnoreCase) &&
+                     long.TryParse(pair[1], out var expireSeconds) &&
+                     expireSeconds > 0)
+            {
+                expireUtc = DateTimeOffset.FromUnixTimeSeconds(expireSeconds).UtcDateTime;
+            }
+        }
+
+        return total > 0 ? new SubscriptionInfo(upload, download, total, expireUtc) : null;
+    }
+
+    private static void ApplySubscriptionInfo(ProxyProfile profile, SubscriptionInfo info)
+    {
+        profile.SubscriptionUploadBytes = info.UploadBytes;
+        profile.SubscriptionDownloadBytes = info.DownloadBytes;
+        profile.SubscriptionTotalBytes = info.TotalBytes;
+        profile.SubscriptionExpireUtc = info.ExpireUtc;
     }
 
     private void RemoveSelected()
@@ -3718,6 +4689,20 @@ del "%~f0"
         }
     }
 
+    private void LoadWireGuardConfigFile(TextBox target)
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Filter = $"WireGuard config (*.conf;*.txt)|*.conf;*.txt|{T("dialog.all.files")}|*.*",
+            Title = "WireGuard config"
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+
+        target.Text = File.ReadAllText(dialog.FileName);
+        target.Select(target.TextLength, 0);
+        target.Focus();
+    }
+
     private void SaveSettings()
     {
         SaveState();
@@ -3874,12 +4859,21 @@ del "%~f0"
         return $"{bytes / 1024d:0} KB/s";
     }
 
-    private async Task UpdatePingAndServicesAsync()
+    private async Task UpdatePingAndServicesAsync(bool force = false)
     {
-        if (_serviceCheckRunning) return;
-        if ((DateTime.UtcNow - _lastServiceCheckUtc).TotalSeconds < 15) return;
+        if (_serviceCheckRunning)
+        {
+            if (!force) return;
+            _statusProbeCts?.Cancel();
+        }
+
+        if (!force && (DateTime.UtcNow - _lastServiceCheckUtc).TotalSeconds < 4) return;
         _serviceCheckRunning = true;
         _lastServiceCheckUtc = DateTime.UtcNow;
+        var version = Interlocked.Increment(ref _statusProbeVersion);
+        _statusProbeCts?.Dispose();
+        _statusProbeCts = new CancellationTokenSource();
+        var token = _statusProbeCts.Token;
 
         try
         {
@@ -3888,12 +4882,18 @@ del "%~f0"
             {
                 try
                 {
-                    var latency = await MeasureServerLatencyAsync(profile);
+                    var latency = await MeasureServerLatencyAsync(profile, token);
+                    if (token.IsCancellationRequested || version != _statusProbeVersion) return;
                     _lastLatencyMs = latency;
                     _pingValue.Text = latency is null ? "-" : $"{latency.Value} ms";
                 }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
                 catch
                 {
+                    if (token.IsCancellationRequested || version != _statusProbeVersion) return;
                     _lastLatencyMs = null;
                     _pingValue.Text = "-";
                 }
@@ -3901,44 +4901,47 @@ del "%~f0"
 
             _healthyServiceCount = 0;
             _checkedServiceCount = 0;
-            await UpdateServiceStatusAsync("Discord", "https://discord.com");
-            await UpdateServiceStatusAsync("YouTube", "https://www.youtube.com");
-            await UpdateServiceStatusAsync("Telegram", "https://telegram.org");
+            await Task.WhenAll(
+                UpdateServiceStatusAsync("Discord", "https://discord.com", token),
+                UpdateServiceStatusAsync("YouTube", "https://www.youtube.com", token),
+                UpdateServiceStatusAsync("Telegram", "https://telegram.org", token));
+            if (token.IsCancellationRequested || version != _statusProbeVersion) return;
             UpdateConnectionQuality(profile);
         }
         finally
         {
-            _serviceCheckRunning = false;
+            if (version == _statusProbeVersion) _serviceCheckRunning = false;
         }
     }
 
-    private static async Task<long?> MeasureServerLatencyAsync(ProxyProfile profile)
+    private static async Task<long?> MeasureServerLatencyAsync(ProxyProfile profile, CancellationToken cancellationToken = default)
     {
         if (profile.Protocol == ProxyProtocol.WireGuard)
         {
-            return await MeasureIcmpLatencyAsync(profile.Server);
+            return await MeasureIcmpLatencyAsync(profile.Server, cancellationToken);
         }
 
         try
         {
             using var client = new System.Net.Sockets.TcpClient();
             var sw = Stopwatch.StartNew();
-            await client.ConnectAsync(profile.Server, profile.Port).WaitAsync(TimeSpan.FromSeconds(3));
+            await client.ConnectAsync(profile.Server, profile.Port).WaitAsync(TimeSpan.FromMilliseconds(1200), cancellationToken);
             sw.Stop();
             return Math.Max(1, sw.ElapsedMilliseconds);
         }
         catch
         {
-            return await MeasureIcmpLatencyAsync(profile.Server);
+            if (cancellationToken.IsCancellationRequested) throw;
+            return await MeasureIcmpLatencyAsync(profile.Server, cancellationToken);
         }
     }
 
-    private static async Task<long?> MeasureIcmpLatencyAsync(string host)
+    private static async Task<long?> MeasureIcmpLatencyAsync(string host, CancellationToken cancellationToken = default)
     {
         try
         {
             using var ping = new System.Net.NetworkInformation.Ping();
-            var reply = await ping.SendPingAsync(host, 2500);
+            var reply = await ping.SendPingAsync(host, 1200).WaitAsync(TimeSpan.FromMilliseconds(1300), cancellationToken);
             return reply.Status == System.Net.NetworkInformation.IPStatus.Success
                 ? Math.Max(1, reply.RoundtripTime)
                 : null;
@@ -3949,35 +4952,41 @@ del "%~f0"
         }
     }
 
-    private async Task UpdateServiceStatusAsync(string serviceName, string url)
+    private async Task UpdateServiceStatusAsync(string serviceName, string url, CancellationToken cancellationToken)
     {
         if (!_serviceStatusLabels.TryGetValue(serviceName, out var label)) return;
 
         try
         {
-            var ok = await ProbeServiceAsync(url);
+            var ok = await ProbeServiceAsync(url, cancellationToken);
+            if (cancellationToken.IsCancellationRequested) return;
             label.Text = ok ? "OK" : "!";
             label.ForeColor = ok ? Color.FromArgb(92, 220, 148) : Color.FromArgb(255, 190, 92);
             _checkedServiceCount++;
             if (ok) _healthyServiceCount++;
         }
+        catch (OperationCanceledException)
+        {
+        }
         catch
         {
+            if (cancellationToken.IsCancellationRequested) return;
             label.Text = "!";
             label.ForeColor = Color.FromArgb(255, 116, 116);
             _checkedServiceCount++;
         }
     }
 
-    private async Task<bool> ProbeServiceAsync(string url)
+    private async Task<bool> ProbeServiceAsync(string url, CancellationToken cancellationToken)
     {
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
-        if (await TryProbeServiceAsync(HttpMethod.Head, url, cts.Token) is { } headResult)
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(2200));
+        if (await TryProbeServiceAsync(HttpMethod.Head, url, timeoutCts.Token) is { } headResult)
         {
             if (headResult) return true;
         }
 
-        return await TryProbeServiceAsync(HttpMethod.Get, url, cts.Token) ?? false;
+        return await TryProbeServiceAsync(HttpMethod.Get, url, timeoutCts.Token) ?? false;
     }
 
     private async Task<bool?> TryProbeServiceAsync(HttpMethod method, string url, CancellationToken cancellationToken)
@@ -4130,7 +5139,35 @@ del "%~f0"
         _selectedName.Text = profile?.Name ?? T("servers.none");
         _selectedProtocol.Text = profile is null ? T("servers.add.subscription") : ProtocolLabel(profile);
         _selectedServer.Text = profile is null ? "" : $"{profile.Server}:{profile.Port}";
+        _subscriptionUsageBar.SetProfile(profile);
         Invalidate(true);
+    }
+
+    private void SelectProfile(ProxyProfile? profile, bool save)
+    {
+        if (profile is null) return;
+
+        _state.SelectedProfileId = profile.Id;
+        var selectedIndex = _state.Profiles.FindIndex(x => x.Id == profile.Id);
+        if (selectedIndex >= 0 && _profiles.SelectedIndex != selectedIndex)
+        {
+            _profileDragSelectionChanging = true;
+            try
+            {
+                _profiles.SelectedIndex = selectedIndex;
+            }
+            finally
+            {
+                _profileDragSelectionChanging = false;
+            }
+        }
+
+        RefreshMainPreview();
+        _lastLatencyMs = null;
+        _pingValue.Text = "...";
+        _qualityValue.Text = "-";
+        _ = UpdatePingAndServicesAsync(force: true);
+        if (save) SaveState();
     }
 
     private ProxyProfile? SelectedProfile()
@@ -4259,28 +5296,39 @@ del "%~f0"
         };
         dialog.Controls.Add(shell);
 
+        var shellLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = CardBg2,
+            ColumnCount = 1,
+            RowCount = 2,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        shellLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        shellLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
+        shell.Controls.Add(shellLayout);
+
         var viewport = new ImportScrollPanel
         {
             Dock = DockStyle.Fill,
             BackColor = CardBg2
         };
-        shell.Controls.Add(viewport);
+        shellLayout.Controls.Add(viewport, 0, 0);
 
         var layout = new TableLayoutPanel
         {
             Width = 486,
-            Height = 470,
+            Height = 392,
             BackColor = CardBg2,
             ColumnCount = 1,
-            RowCount = 7
+            RowCount = 5
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 12));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 212));
         viewport.Content = layout;
 
         layout.Controls.Add(new Label
@@ -4303,7 +5351,19 @@ del "%~f0"
         StyleInput(linksBox);
         layout.Controls.Add(ImportLinkTextInput(linksBox), 0, 2);
 
-        layout.Controls.Add(ImportFieldLabel("WireGuard config"), 0, 3);
+        var wireGuardHeader = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = CardBg2,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        wireGuardHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        wireGuardHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+        wireGuardHeader.Controls.Add(ImportFieldLabel("WireGuard config"), 0, 0);
+        layout.Controls.Add(wireGuardHeader, 0, 3);
         var wireGuardInput = new TextBox
         {
             Multiline = true,
@@ -4314,8 +5374,11 @@ del "%~f0"
         };
         wireGuardBox = wireGuardInput;
         StyleInput(wireGuardBox);
+        wireGuardHeader.Controls.Add(LightButton(T("common.file"), () => LoadWireGuardConfigFile(wireGuardInput), width: 86), 1, 0);
         EnableWireGuardConfigDrop(wireGuardBox);
-        layout.Controls.Add(ImportTextInput(wireGuardBox, height: 158), 0, 4);
+        var wireGuardWrap = ImportTextInput(wireGuardBox, height: 202);
+        EnableWireGuardConfigDrop(wireGuardWrap, wireGuardBox);
+        layout.Controls.Add(wireGuardWrap, 0, 4);
 
         var actions = new FlowLayoutPanel
         {
@@ -4330,7 +5393,7 @@ del "%~f0"
         var cancel = LightButton(T("common.cancel"), () => dialog.Close());
         actions.Controls.Add(add);
         actions.Controls.Add(cancel);
-        layout.Controls.Add(actions, 0, 6);
+        shellLayout.Controls.Add(actions, 0, 1);
 
         dialog.Shown += (_, _) => linksInput.Focus();
         return dialog;
@@ -4447,34 +5510,74 @@ del "%~f0"
 
     private static void EnableWireGuardConfigDrop(TextBox target)
     {
-        target.AllowDrop = true;
-        target.DragEnter += (_, e) =>
+        EnableWireGuardConfigDrop(target, target);
+    }
+
+    private static void EnableWireGuardConfigDrop(Control surface, TextBox target)
+    {
+        AttachDrop(surface);
+        surface.ControlAdded += (_, e) =>
         {
-            e.Effect = e.Data?.GetDataPresent(DataFormats.FileDrop) == true ||
-                       e.Data?.GetDataPresent(DataFormats.Text) == true
-                ? DragDropEffects.Copy
-                : DragDropEffects.None;
+            if (e.Control is not null) AttachDrop(e.Control);
         };
-        target.DragDrop += (_, e) =>
+
+        void AttachDrop(Control control)
+        {
+            control.AllowDrop = true;
+            control.DragEnter += HandleDrag;
+            control.DragOver += HandleDrag;
+            control.DragDrop += HandleDrop;
+            foreach (Control child in control.Controls)
+            {
+                AttachDrop(child);
+            }
+        }
+
+        static void HandleDrag(object? sender, DragEventArgs e)
+        {
+            e.Effect = HasDroppedWireGuardData(e) ? DragDropEffects.Copy : DragDropEffects.None;
+        }
+
+        void HandleDrop(object? sender, DragEventArgs e)
         {
             try
             {
-                if (e.Data?.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
-                {
-                    target.Text = File.ReadAllText(files[0]);
-                    return;
-                }
-
-                if (e.Data?.GetData(DataFormats.Text) is string text)
+                var text = ReadDroppedWireGuardData(e);
+                if (!string.IsNullOrWhiteSpace(text))
                 {
                     target.Text = text;
+                    target.Select(target.TextLength, 0);
+                    target.Focus();
                 }
             }
             catch (Exception ex)
             {
                 MessageBox.Show(ex.Message, "WireGuard config", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-        };
+        }
+    }
+
+    private static bool HasDroppedWireGuardData(DragEventArgs e)
+    {
+        return e.Data?.GetDataPresent(DataFormats.FileDrop) == true ||
+               e.Data?.GetDataPresent(DataFormats.UnicodeText) == true ||
+               e.Data?.GetDataPresent(DataFormats.Text) == true;
+    }
+
+    private static string? ReadDroppedWireGuardData(DragEventArgs e)
+    {
+        if (e.Data?.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
+        {
+            var file = files.FirstOrDefault(File.Exists);
+            return file is null ? null : File.ReadAllText(file);
+        }
+
+        if (e.Data?.GetData(DataFormats.UnicodeText) is string unicodeText)
+        {
+            return unicodeText;
+        }
+
+        return e.Data?.GetData(DataFormats.Text) as string;
     }
 
     private static AppState LoadState(string path)
@@ -4485,12 +5588,14 @@ del "%~f0"
                 ? JsonSerializer.Deserialize<AppState>(File.ReadAllText(path), JsonOptions()) ?? new AppState()
                 : new AppState();
             SeedDefaultRoutingSites(state);
+            NormalizeHappRoutingProfiles(state);
             return state;
         }
         catch
         {
             var state = new AppState();
             SeedDefaultRoutingSites(state);
+            NormalizeHappRoutingProfiles(state);
             return state;
         }
     }
@@ -4506,8 +5611,36 @@ del "%~f0"
         state.RoutingDefaultsSeeded = true;
     }
 
+    private static void NormalizeHappRoutingProfiles(AppState state)
+    {
+        state.HappRoutingProfiles ??= [];
+        foreach (var profile in state.HappRoutingProfiles)
+        {
+            if (string.IsNullOrWhiteSpace(profile.Id)) profile.Id = Guid.NewGuid().ToString("N");
+            if (string.IsNullOrWhiteSpace(profile.Name)) profile.Name = "Happ routing";
+            profile.Links = ParseRoutingLinks(string.Join(Environment.NewLine, profile.Links ?? []));
+        }
+
+        if (state.HappRoutingProfiles.Count == 0 && state.HappRoutingLinks.Count > 0)
+        {
+            state.HappRoutingProfiles.Add(new HappRoutingProfile
+            {
+                Name = "Happ routing",
+                Links = ParseRoutingLinks(string.Join(Environment.NewLine, state.HappRoutingLinks))
+            });
+            state.SelectedHappRoutingProfileId = state.HappRoutingProfiles[0].Id;
+        }
+
+        if (state.SelectedHappRoutingProfileId is null ||
+            state.HappRoutingProfiles.All(x => x.Id != state.SelectedHappRoutingProfileId))
+        {
+            state.SelectedHappRoutingProfileId = state.HappRoutingProfiles.FirstOrDefault()?.Id;
+        }
+    }
+
     private void SaveState()
     {
+        NormalizeHappRoutingProfiles(_state);
         File.WriteAllText(_statePath, JsonSerializer.Serialize(_state, JsonOptions()));
     }
 
@@ -4628,7 +5761,101 @@ del "%~f0"
         Info
     }
 
+    private sealed record SubscriptionInfo(long UploadBytes, long DownloadBytes, long TotalBytes, DateTime? ExpireUtc);
+
     private sealed record ReleaseInfo(string Tag, string ReleaseUrl, string? AssetName, string? AssetDownloadUrl);
+
+    private enum HappProfileActionKind
+    {
+        Rename,
+        Delete,
+        Export
+    }
+
+    private sealed class HappProfileActionButton : Control
+    {
+        private readonly HappProfileActionKind _kind;
+        private readonly Action _action;
+        private bool _hover;
+
+        public HappProfileActionButton(HappProfileActionKind kind, Action action)
+        {
+            _kind = kind;
+            _action = action;
+            Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw |
+                     ControlStyles.UserPaint |
+                     ControlStyles.SupportsTransparentBackColor, true);
+            BackColor = Color.Transparent;
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            _hover = true;
+            Invalidate();
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            _hover = false;
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnClick(EventArgs e)
+        {
+            _action();
+            base.OnClick(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            var color = _hover ? Color.White : Color.FromArgb(196, 198, 206);
+            using var pen = new Pen(color, 1.8f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
+            using var brush = new SolidBrush(color);
+            var cx = Width / 2f;
+            var cy = Height / 2f;
+
+            switch (_kind)
+            {
+                case HappProfileActionKind.Rename:
+                    e.Graphics.DrawLine(pen, cx - 6, cy + 5, cx + 5, cy - 6);
+                    e.Graphics.DrawLine(pen, cx + 3, cy - 8, cx + 7, cy - 4);
+                    e.Graphics.DrawLine(pen, cx - 7, cy + 7, cx - 2, cy + 6);
+                    break;
+                case HappProfileActionKind.Delete:
+                    e.Graphics.DrawLine(pen, cx - 7, cy - 6, cx + 7, cy - 6);
+                    e.Graphics.DrawLine(pen, cx - 4, cy - 9, cx + 4, cy - 9);
+                    e.Graphics.DrawRectangle(pen, cx - 6, cy - 3, 12, 12);
+                    e.Graphics.DrawLine(pen, cx - 2, cy, cx - 2, cy + 6);
+                    e.Graphics.DrawLine(pen, cx + 2, cy, cx + 2, cy + 6);
+                    break;
+                case HappProfileActionKind.Export:
+                    e.Graphics.DrawRectangle(pen, cx - 7, cy - 2, 14, 10);
+                    e.Graphics.DrawLine(pen, cx, cy - 9, cx, cy + 3);
+                    e.Graphics.DrawLine(pen, cx, cy - 9, cx - 4, cy - 5);
+                    e.Graphics.DrawLine(pen, cx, cy - 9, cx + 4, cy - 5);
+                    break;
+            }
+        }
+    }
+
+    private sealed class DarkMenuColors : ProfessionalColorTable
+    {
+        public override Color ToolStripDropDownBackground => CardBg2;
+        public override Color ImageMarginGradientBegin => CardBg2;
+        public override Color ImageMarginGradientMiddle => CardBg2;
+        public override Color ImageMarginGradientEnd => CardBg2;
+        public override Color MenuItemSelected => Color.FromArgb(62, 64, 72);
+        public override Color MenuItemBorder => Color.FromArgb(82, 84, 92);
+        public override Color MenuBorder => Color.FromArgb(82, 84, 92);
+    }
 
     private sealed class UpdateDialog : Form
     {
@@ -4946,6 +6173,8 @@ del "%~f0"
         private bool _active;
 
         public string IconText { get; set; } = "";
+        public string LabelText { get; set; } = "";
+        public bool ShowLabel { get; set; }
         public bool Active
         {
             get => _active;
@@ -5015,10 +6244,11 @@ del "%~f0"
                 g.FillPath(brush, path);
             }
 
+            var iconBounds = NavIconBounds(rect);
             if (hoverAmount > 0.01f)
             {
                 using var glowBrush = new SolidBrush(Color.FromArgb((int)(34 * hoverAmount), Accent));
-                g.FillEllipse(glowBrush, Width / 2 - 16, Height / 2 - 16, 32, 32);
+                g.FillEllipse(glowBrush, iconBounds.Left + iconBounds.Width / 2 - 16, iconBounds.Top + iconBounds.Height / 2 - 16, 32, 32);
             }
 
             if (activeAmount > 0.01f)
@@ -5039,11 +6269,33 @@ del "%~f0"
             var iconColor = Active ? Color.White : Blend(Muted, Color.White, hoverAmount);
             var state = g.Save();
             var scale = IconScale * (1f + 0.055f * hoverAmount + 0.03f * activeAmount);
-            g.TranslateTransform(Width / 2f, Height / 2f - 2.5f * hoverAmount);
+            g.TranslateTransform(iconBounds.Left + iconBounds.Width / 2f, iconBounds.Top + iconBounds.Height / 2f - 2.5f * hoverAmount);
             g.ScaleTransform(scale, scale);
-            g.TranslateTransform(-Width / 2f, -Height / 2f);
-            DrawNavIcon(g, IconText, rect, iconColor);
+            g.TranslateTransform(-(iconBounds.Left + iconBounds.Width / 2f), -(iconBounds.Top + iconBounds.Height / 2f));
+            DrawNavIcon(g, IconText, iconBounds, iconColor);
             g.Restore(state);
+
+            if (ShowLabel)
+            {
+                var textColor = Active ? Color.White : Blend(Color.FromArgb(196, 198, 206), Color.White, hoverAmount);
+                var textBounds = new Rectangle(iconBounds.Right + 8, rect.Top, Math.Max(1, rect.Right - iconBounds.Right - 14), rect.Height);
+                TextRenderer.DrawText(
+                    g,
+                    LabelText,
+                    Font,
+                    textBounds,
+                    textColor,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+            }
+        }
+
+        private Rectangle NavIconBounds(Rectangle bounds)
+        {
+            if (!ShowLabel) return bounds;
+
+            var size = Math.Min(bounds.Height, 52);
+            var left = PanelPosition == NavPanelPosition.Top ? bounds.Left + 10 : bounds.Left + 16;
+            return new Rectangle(left, bounds.Top + (bounds.Height - size) / 2, size, size);
         }
 
         private void AnimateHover()
@@ -5764,9 +7016,11 @@ del "%~f0"
     private sealed class SettingsScrollPanel : Panel
     {
         private Control? _content;
+        private readonly System.Windows.Forms.Timer _scrollTimer = new() { Interval = 15 };
         private bool _dragging;
         private int _dragOffset;
         private int _scrollY;
+        private int _targetScrollY;
 
         public Control? Content
         {
@@ -5780,6 +7034,7 @@ del "%~f0"
 
                 _content = value;
                 _scrollY = 0;
+                _targetScrollY = 0;
                 if (_content is not null)
                 {
                     _content.Dock = DockStyle.None;
@@ -5799,6 +7054,7 @@ del "%~f0"
                      ControlStyles.UserPaint, true);
             TabStop = true;
             BackColor = Bg;
+            _scrollTimer.Tick += (_, _) => AnimateScroll();
         }
 
         protected override void OnResize(EventArgs e)
@@ -5809,7 +7065,7 @@ del "%~f0"
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            ScrollBy(-Math.Sign(e.Delta) * 48);
+            ScrollBy(-Math.Sign(e.Delta) * 120);
             base.OnMouseWheel(e);
         }
 
@@ -5836,7 +7092,7 @@ del "%~f0"
             var thumb = ThumbBounds();
             var usable = Math.Max(1, track.Height - thumb.Height);
             var y = Math.Clamp(e.Y - _dragOffset - track.Top, 0, usable);
-            SetScroll((int)Math.Round(y / (double)usable * max));
+            SetScroll((int)Math.Round(y / (double)usable * max), animate: false);
             base.OnMouseMove(e);
         }
 
@@ -5869,7 +7125,7 @@ del "%~f0"
 
         private void HookMouseWheel(Control control)
         {
-            control.MouseWheel += (_, e) => ScrollBy(-Math.Sign(e.Delta) * 48);
+            control.MouseWheel += (_, e) => ScrollBy(-Math.Sign(e.Delta) * 120);
             foreach (Control child in control.Controls)
             {
                 HookMouseWheel(child);
@@ -5889,18 +7145,49 @@ del "%~f0"
             _content.Width = contentWidth;
             var preferred = _content.GetPreferredSize(new Size(contentWidth, 0));
             _content.Height = Math.Max(ClientSize.Height, preferred.Height);
-            SetScroll(_scrollY);
+            SetScroll(_scrollY, animate: false);
         }
 
         private void ScrollBy(int delta)
         {
-            SetScroll(_scrollY + delta);
+            SetScroll(_targetScrollY + delta, animate: true);
         }
 
-        private void SetScroll(int value)
+        private void SetScroll(int value, bool animate)
         {
             if (_content is null) return;
-            _scrollY = Math.Clamp(value, 0, MaxScroll());
+            _targetScrollY = Math.Clamp(value, 0, MaxScroll());
+            if (animate)
+            {
+                _scrollTimer.Start();
+                return;
+            }
+
+            _scrollTimer.Stop();
+            _scrollY = _targetScrollY;
+            _content.Location = new Point(0, -_scrollY);
+            Invalidate();
+        }
+
+        private void AnimateScroll()
+        {
+            if (_content is null)
+            {
+                _scrollTimer.Stop();
+                return;
+            }
+
+            var delta = _targetScrollY - _scrollY;
+            if (Math.Abs(delta) <= 1)
+            {
+                _scrollY = _targetScrollY;
+                _scrollTimer.Stop();
+            }
+            else
+            {
+                _scrollY += (int)Math.Round(delta * 0.28);
+            }
+
             _content.Location = new Point(0, -_scrollY);
             Invalidate();
         }
@@ -5943,9 +7230,11 @@ del "%~f0"
     private sealed class ImportScrollPanel : Panel
     {
         private Control? _content;
+        private readonly System.Windows.Forms.Timer _scrollTimer = new() { Interval = 15 };
         private bool _dragging;
         private int _dragOffset;
         private int _scrollY;
+        private int _targetScrollY;
 
         public Control? Content
         {
@@ -5958,7 +7247,7 @@ del "%~f0"
                 {
                     _content.Location = Point.Empty;
                     Controls.Add(_content);
-                    _content.MouseWheel += (_, e) => ScrollBy(-Math.Sign(e.Delta) * 36);
+                    HookMouseWheel(_content);
                 }
                 UpdateContentLayout();
             }
@@ -5970,6 +7259,7 @@ del "%~f0"
                      ControlStyles.OptimizedDoubleBuffer |
                      ControlStyles.ResizeRedraw, true);
             TabStop = true;
+            _scrollTimer.Tick += (_, _) => AnimateScroll();
         }
 
         protected override void OnResize(EventArgs e)
@@ -5980,7 +7270,7 @@ del "%~f0"
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            ScrollBy(-Math.Sign(e.Delta) * 36);
+            ScrollBy(-Math.Sign(e.Delta) * 112);
             base.OnMouseWheel(e);
         }
 
@@ -6007,7 +7297,7 @@ del "%~f0"
             var thumb = ThumbBounds();
             var usable = Math.Max(1, track.Height - thumb.Height);
             var y = Math.Clamp(e.Y - _dragOffset - track.Top, 0, usable);
-            SetScroll((int)Math.Round(y / (double)usable * max));
+            SetScroll((int)Math.Round(y / (double)usable * max), animate: false);
             base.OnMouseMove(e);
         }
 
@@ -6041,20 +7331,64 @@ del "%~f0"
         {
             if (_content is null) return;
             _content.Width = Math.Max(1, ClientSize.Width - (MaxScroll() > 0 ? 14 : 0));
-            SetScroll(_scrollY);
+            SetScroll(_scrollY, animate: false);
         }
 
         private void ScrollBy(int delta)
         {
-            SetScroll(_scrollY + delta);
+            SetScroll(_targetScrollY + delta, animate: true);
         }
 
-        private void SetScroll(int value)
+        private void SetScroll(int value, bool animate)
         {
             if (_content is null) return;
-            _scrollY = Math.Clamp(value, 0, MaxScroll());
+            _targetScrollY = Math.Clamp(value, 0, MaxScroll());
+            if (animate)
+            {
+                _scrollTimer.Start();
+                return;
+            }
+
+            _scrollTimer.Stop();
+            _scrollY = _targetScrollY;
             _content.Location = new Point(0, -_scrollY);
             Invalidate();
+        }
+
+        private void AnimateScroll()
+        {
+            if (_content is null)
+            {
+                _scrollTimer.Stop();
+                return;
+            }
+
+            var delta = _targetScrollY - _scrollY;
+            if (Math.Abs(delta) <= 1)
+            {
+                _scrollY = _targetScrollY;
+                _scrollTimer.Stop();
+            }
+            else
+            {
+                _scrollY += (int)Math.Round(delta * 0.30);
+            }
+
+            _content.Location = new Point(0, -_scrollY);
+            Invalidate();
+        }
+
+        private void HookMouseWheel(Control control)
+        {
+            control.MouseWheel += (_, e) => ScrollBy(-Math.Sign(e.Delta) * 112);
+            foreach (Control child in control.Controls)
+            {
+                HookMouseWheel(child);
+            }
+            control.ControlAdded += (_, e) =>
+            {
+                if (e.Control is not null) HookMouseWheel(e.Control);
+            };
         }
 
         private int MaxScroll()
@@ -6559,6 +7893,185 @@ del "%~f0"
                 e.Graphics.DrawLine(pen, cx - 4, cy - 2, cx, cy + 2);
                 e.Graphics.DrawLine(pen, cx, cy + 2, cx + 4, cy - 2);
             }
+        }
+    }
+
+    private sealed class BufferedListBox : ListBox
+    {
+        private readonly System.Windows.Forms.Timer _scrollTimer = new() { Interval = 16 };
+        private int _targetTopIndex;
+
+        public BufferedListBox()
+        {
+            SetStyle(ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.ResizeRedraw, true);
+            _scrollTimer.Tick += (_, _) => AnimateScroll();
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            if (Items.Count == 0)
+            {
+                base.OnMouseWheel(e);
+                return;
+            }
+
+            var visibleItems = Math.Max(1, ClientSize.Height / Math.Max(1, ItemHeight));
+            var maxTop = Math.Max(0, Items.Count - visibleItems);
+            var current = Math.Clamp(TopIndex, 0, maxTop);
+            var direction = e.Delta > 0 ? -1 : 1;
+            _targetTopIndex = Math.Clamp(_scrollTimer.Enabled ? _targetTopIndex + direction * 3 : current + direction * 3, 0, maxTop);
+            _scrollTimer.Start();
+        }
+
+        private void AnimateScroll()
+        {
+            if (Items.Count == 0)
+            {
+                _scrollTimer.Stop();
+                return;
+            }
+
+            var visibleItems = Math.Max(1, ClientSize.Height / Math.Max(1, ItemHeight));
+            var maxTop = Math.Max(0, Items.Count - visibleItems);
+            _targetTopIndex = Math.Clamp(_targetTopIndex, 0, maxTop);
+            var current = Math.Clamp(TopIndex, 0, maxTop);
+            if (current == _targetTopIndex)
+            {
+                _scrollTimer.Stop();
+                return;
+            }
+
+            var delta = _targetTopIndex - current;
+            TopIndex = current + Math.Sign(delta);
+        }
+    }
+
+    private sealed class ProfileDragPreview : Control
+    {
+        private readonly ProxyProfile _profile;
+        private readonly Action<Graphics, Rectangle, ProxyProfile> _paintCard;
+
+        public void SetTopImmediate(int value)
+        {
+            Top = value;
+        }
+
+        public ProfileDragPreview(ProxyProfile profile, Action<Graphics, Rectangle, ProxyProfile> paintCard)
+        {
+            _profile = profile;
+            _paintCard = paintCard;
+            Enabled = false;
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw |
+                     ControlStyles.UserPaint, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.Clear(BackColor);
+            _paintCard(e.Graphics, ClientRectangle, _profile);
+        }
+
+    }
+
+    private sealed class SubscriptionUsageBar : Control
+    {
+        private readonly System.Windows.Forms.Timer _animationTimer = new() { Interval = 15 };
+        private ProxyProfile? _profile;
+        private float _displayRatio;
+        private float _targetRatio;
+
+        public SubscriptionUsageBar()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw |
+                     ControlStyles.UserPaint |
+                     ControlStyles.SupportsTransparentBackColor, true);
+            BackColor = Color.Transparent;
+            _animationTimer.Tick += (_, _) => Animate();
+        }
+
+        public void SetProfile(ProxyProfile? profile)
+        {
+            _profile = HasSubscriptionUsage(profile) ? profile : null;
+            Visible = _profile is not null;
+            _targetRatio = _profile is null ? 0f : SubscriptionRatio(_profile);
+            if (Math.Abs(_displayRatio - _targetRatio) > 0.001f)
+            {
+                _animationTimer.Start();
+            }
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            if (_profile is null) return;
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            e.Graphics.Clear(Parent?.BackColor ?? Color.Transparent);
+
+            var rect = new Rectangle(1, 2, Math.Max(1, Width - 3), Math.Max(1, Height - 5));
+            using var trackPath = RoundedRect(rect, rect.Height / 2);
+            using var track = new SolidBrush(Color.FromArgb(48, 50, 60));
+            e.Graphics.FillPath(track, trackPath);
+
+            var fillWidth = (int)Math.Round(rect.Width * _displayRatio);
+            if (fillWidth > 0)
+            {
+                var fillRect = new Rectangle(rect.Left, rect.Top, Math.Min(rect.Width, fillWidth), rect.Height);
+                using var fillPath = RoundedRect(fillRect, fillRect.Height / 2);
+                using var fill = new LinearGradientBrush(
+                    rect,
+                    Color.FromArgb(92, 220, 148),
+                    Color.FromArgb(124, 105, 255),
+                    LinearGradientMode.Horizontal);
+                e.Graphics.FillPath(fill, fillPath);
+            }
+
+            using var gloss = new SolidBrush(Color.FromArgb(34, Color.White));
+            e.Graphics.FillPath(gloss, RoundedRect(new Rectangle(rect.Left + 2, rect.Top + 2, Math.Max(1, rect.Width - 4), Math.Max(1, rect.Height / 3)), rect.Height / 3));
+
+            using var border = new Pen(Color.FromArgb(94, 98, 116), 1f) { Alignment = PenAlignment.Inset };
+            e.Graphics.DrawPath(border, trackPath);
+
+            using var font = new Font("Segoe UI", 8.6f, FontStyle.Bold);
+            TextRenderer.DrawText(
+                e.Graphics,
+                SubscriptionUsageText(_profile),
+                font,
+                rect,
+                Color.White,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+        }
+
+        private void Animate()
+        {
+            _displayRatio += (_targetRatio - _displayRatio) * 0.22f;
+            if (Math.Abs(_targetRatio - _displayRatio) < 0.003f)
+            {
+                _displayRatio = _targetRatio;
+                _animationTimer.Stop();
+            }
+            Invalidate();
+        }
+
+        private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
+        {
+            var path = new GraphicsPath();
+            var d = radius * 2;
+            path.AddArc(bounds.Left, bounds.Top, d, d, 180, 90);
+            path.AddArc(bounds.Right - d, bounds.Top, d, d, 270, 90);
+            path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
+            path.AddArc(bounds.Left, bounds.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
         }
     }
 
