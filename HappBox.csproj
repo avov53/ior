@@ -10,7 +10,7 @@
     <RootNamespace>HappBox</RootNamespace>
     <Product>ior</Product>
     <Title>ior</Title>
-    <Version>1.2</Version>
+    <Version>1.2.1</Version>
     <ApplicationIcon />
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>

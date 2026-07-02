@@ -13,7 +13,7 @@ namespace HappBox;
 
 public sealed class MainForm : Form
 {
-    private const string AppVersion = "1.2";
+    private const string AppVersion = "1.2.1";
     private const string GitHubRepositoryUrl = "https://github.com/avov53/ior";
     private const string GitHubLatestReleaseApiUrl = "https://api.github.com/repos/avov53/ior/releases/latest";
     private const int SingBoxStartupTimeoutMs = 6000;
@@ -120,6 +120,7 @@ public sealed class MainForm : Form
     private SideNavButton? _infoNavButton;
     private AppView _currentView = AppView.Servers;
     private AppView _previousView = AppView.Servers;
+    private SettingsSection _selectedSettingsSection = SettingsSection.General;
     private bool _serversExpanded = true;
     private bool _lastTopNavLabelsVisible;
     private long? _lastLatencyMs;
@@ -827,6 +828,7 @@ public sealed class MainForm : Form
             "settings.happ.routing.profiles" => ru ? "Профили" : "Profiles",
             "settings.happ.routing.profile.name" => ru ? "Имя профиля" : "Profile name",
             "settings.happ.routing.empty" => ru ? "Профилей пока нет" : "No profiles yet",
+            "settings.happ.routing.empty.input" => ru ? "Вставьте ссылку маршрутизации Happ." : "Paste a Happ routing link.",
             "settings.route" => ru ? "Маршрут" : "Route",
             "settings.log.level" => ru ? "Уровень логов" : "Log level",
             "settings.sniff" => ru ? "Анализировать трафик" : "Sniff traffic",
@@ -1692,8 +1694,9 @@ public sealed class MainForm : Form
         return (int)Math.Round(value * dpi / 96d);
     }
 
-    private void ShowSettingsWindow()
+    private void ShowSettingsWindow(SettingsSection? section = null)
     {
+        if (section is not null) _selectedSettingsSection = section.Value;
         ShowEmbeddedPage(BuildSettingsView());
     }
 
@@ -1812,8 +1815,9 @@ public sealed class MainForm : Form
         };
 
         var buttons = new List<RoundedButton>();
-        void SelectSection(RoundedButton selected, Control content)
+        void SelectSection(SettingsSection section, RoundedButton selected, Control content)
         {
+            _selectedSettingsSection = section;
             foreach (var button in buttons)
             {
                 button.BackColor = CardBg2;
@@ -1827,7 +1831,7 @@ public sealed class MainForm : Form
             contentHost.Content = content;
         }
 
-        RoundedButton AddSection(string title, Func<Control> build)
+        RoundedButton AddSection(SettingsSection section, string title, Func<Control> build)
         {
             var button = new RoundedButton
             {
@@ -1842,26 +1846,33 @@ public sealed class MainForm : Form
                 Margin = new Padding(0, 0, 0, 10),
                 Cursor = Cursors.Hand
             };
-            button.Click += (_, _) => SelectSection(button, build());
+            button.Click += (_, _) => SelectSection(section, button, build());
             buttons.Add(button);
             sections.Controls.Add(button);
             return button;
         }
 
-        var general = AddSection(T("settings.core"), BuildGeneralSettingsSection);
-        AddSection(T("settings.connection"), BuildConnectionSettingsSection);
-        AddSection(T("settings.dns"), BuildDnsSettingsSection);
-        AddSection(T("settings.routing"), BuildRoutingSettingsSection);
-        AddSection(T("settings.advanced"), BuildAdvancedSettingsSection);
-        AddSection(T("settings.customization"), BuildCustomizationSettingsSection);
-        AddSection(T("nav.config"), BuildConfigSection);
-        AddSection(T("nav.logs"), BuildLogSection);
+        var sectionButtons = new Dictionary<SettingsSection, (RoundedButton Button, Func<Control> Build)>
+        {
+            [SettingsSection.General] = (AddSection(SettingsSection.General, T("settings.core"), BuildGeneralSettingsSection), BuildGeneralSettingsSection),
+            [SettingsSection.Connection] = (AddSection(SettingsSection.Connection, T("settings.connection"), BuildConnectionSettingsSection), BuildConnectionSettingsSection),
+            [SettingsSection.Dns] = (AddSection(SettingsSection.Dns, T("settings.dns"), BuildDnsSettingsSection), BuildDnsSettingsSection),
+            [SettingsSection.Routing] = (AddSection(SettingsSection.Routing, T("settings.routing"), BuildRoutingSettingsSection), BuildRoutingSettingsSection),
+            [SettingsSection.Advanced] = (AddSection(SettingsSection.Advanced, T("settings.advanced"), BuildAdvancedSettingsSection), BuildAdvancedSettingsSection),
+            [SettingsSection.Customization] = (AddSection(SettingsSection.Customization, T("settings.customization"), BuildCustomizationSettingsSection), BuildCustomizationSettingsSection),
+            [SettingsSection.Config] = (AddSection(SettingsSection.Config, T("nav.config"), BuildConfigSection), BuildConfigSection),
+            [SettingsSection.Logs] = (AddSection(SettingsSection.Logs, T("nav.logs"), BuildLogSection), BuildLogSection)
+        };
 
         body.Controls.Add(sections, 0, 0);
         body.Controls.Add(contentHost, 1, 0);
         page.Controls.Add(body, 0, 1);
 
-        SelectSection(general, BuildGeneralSettingsSection());
+        if (!sectionButtons.TryGetValue(_selectedSettingsSection, out var selected))
+        {
+            selected = sectionButtons[SettingsSection.General];
+        }
+        SelectSection(_selectedSettingsSection, selected.Button, selected.Build());
         return page;
     }
 
@@ -1987,8 +1998,7 @@ public sealed class MainForm : Form
         };
         addActions.Controls.Add(LightButton(T("servers.add"), () =>
         {
-            AddHappRoutingProfile(happLinks.Text);
-            ShowSettingsWindow();
+            if (AddHappRoutingProfile(happLinks.Text)) ShowSettingsWindow(SettingsSection.Routing);
         }, primary: true, width: 128));
         panel.Controls.Add(addActions, 1, 3);
         panel.SetColumnSpan(addActions, 2);
@@ -2100,7 +2110,7 @@ public sealed class MainForm : Form
         {
             _state.SelectedHappRoutingProfileId = profile.Id;
             SaveSettings();
-            ShowSettingsWindow();
+            ShowSettingsWindow(SettingsSection.Routing);
         }
 
         void SetHover(bool hover)
@@ -2131,10 +2141,14 @@ public sealed class MainForm : Form
         return row;
     }
 
-    private void AddHappRoutingProfile(string value)
+    private bool AddHappRoutingProfile(string value)
     {
         var links = ParseRoutingLinks(value);
-        if (links.Count == 0) return;
+        if (links.Count == 0)
+        {
+            MessageBox.Show(T("settings.happ.routing.empty.input"), T("settings.routing"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
 
         var name = DefaultHappRoutingProfileName(links);
         var profile = new HappRoutingProfile
@@ -2148,6 +2162,7 @@ public sealed class MainForm : Form
         _state.RoutingBypassSites = [];
         _state.RoutingProxySites = [];
         SaveSettings();
+        return true;
     }
 
     private void RenameHappRoutingProfile(HappRoutingProfile profile)
@@ -2157,7 +2172,7 @@ public sealed class MainForm : Form
 
         profile.Name = name.Trim();
         SaveSettings();
-        ShowSettingsWindow();
+        ShowSettingsWindow(SettingsSection.Routing);
     }
 
     private void DeleteHappRoutingProfile(HappRoutingProfile profile)
@@ -2165,7 +2180,7 @@ public sealed class MainForm : Form
         _state.HappRoutingProfiles.RemoveAll(x => x.Id == profile.Id);
         _state.SelectedHappRoutingProfileId = _state.HappRoutingProfiles.FirstOrDefault()?.Id;
         SaveSettings();
-        ShowSettingsWindow();
+        ShowSettingsWindow(SettingsSection.Routing);
     }
 
     private static void ExportHappRoutingProfile(HappRoutingProfile profile)
@@ -3324,11 +3339,26 @@ del "%~f0"
     {
         return value
             .Split(['\r', '\n', ',', ';', ' '], StringSplitOptions.RemoveEmptyEntries)
-            .Select(link => link.Trim())
-            .Where(link => Uri.TryCreate(link, UriKind.Absolute, out var uri) &&
-                           (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+            .Select(NormalizeRoutingLink)
+            .Where(link => link is not null)
+            .Select(link => link!)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private static string? NormalizeRoutingLink(string value)
+    {
+        var link = value.Trim().Trim('"', '\'');
+        if (link.Length == 0) return null;
+        if (!link.Contains("://", StringComparison.Ordinal) && link.Contains('.', StringComparison.Ordinal))
+        {
+            link = "https://" + link;
+        }
+
+        return Uri.TryCreate(link, UriKind.Absolute, out var uri) &&
+               (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+            ? link
+            : null;
     }
 
     private static void StyleCheck(CheckBox box)
@@ -5759,6 +5789,18 @@ del "%~f0"
         Config,
         Logs,
         Info
+    }
+
+    private enum SettingsSection
+    {
+        General,
+        Connection,
+        Dns,
+        Routing,
+        Advanced,
+        Customization,
+        Config,
+        Logs
     }
 
     private sealed record SubscriptionInfo(long UploadBytes, long DownloadBytes, long TotalBytes, DateTime? ExpireUtc);
