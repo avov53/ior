@@ -51,6 +51,7 @@ public static class SingBoxConfigBuilder
                     BuildDnsServer("remote", state.DnsServer, wireGuardMode),
                     new JsonObject { ["type"] = "local", ["tag"] = "local" }
                 },
+                ["rules"] = BuildDnsRules(state),
                 ["final"] = "remote",
                 ["strategy"] = dnsStrategy
             },
@@ -68,12 +69,18 @@ public static class SingBoxConfigBuilder
         });
     }
 
+    private static JsonArray BuildDnsRules(AppState state)
+    {
+        return [];
+    }
+
     private static JsonArray BuildRouteRules(AppState state, ProxyProfile selected)
     {
         var rules = new JsonArray();
+        AddEndpointDirectRule(rules, selected);
         if (selected.Protocol == ProxyProtocol.WireGuard)
         {
-            AddWireGuardStabilityRules(rules, selected);
+            AddWireGuardStabilityRules(rules);
         }
 
         if (state.SniffEnabled)
@@ -99,15 +106,13 @@ public static class SingBoxConfigBuilder
             }
         }
 
-        if (ProxyRoutingEnabled(state)) AddHappRoutingRules(rules, state);
+        if (HappRoutingEnabled(state)) AddHappRoutingRules(rules, state);
 
         return rules;
     }
 
-    private static void AddWireGuardStabilityRules(JsonArray rules, ProxyProfile selected)
+    private static void AddWireGuardStabilityRules(JsonArray rules)
     {
-        AddEndpointDirectRule(rules, selected);
-
         rules.Add(new JsonObject
         {
             ["domain_suffix"] = new JsonArray
@@ -155,7 +160,7 @@ public static class SingBoxConfigBuilder
 
     private static string RouteFinal(AppState state, string proxyTag)
     {
-        if (ProxyRoutingEnabled(state) && ActiveHappRoutingItems(state).Count > 0)
+        if (HappRoutingEnabled(state) && ActiveHappRoutingItems(state).Count > 0)
         {
             return ActiveHappRoutingConfigs(state).Any(HappConfigGlobalProxy) ? proxyTag : "direct";
         }
@@ -163,9 +168,9 @@ public static class SingBoxConfigBuilder
         return proxyTag;
     }
 
-    private static bool ProxyRoutingEnabled(AppState state)
+    private static bool HappRoutingEnabled(AppState state)
     {
-        return state.MixedProxyEnabled && !state.TunEnabled;
+        return state.TunEnabled || state.MixedProxyEnabled;
     }
 
     private static JsonArray BuildHappRouteRuleSets(AppState state)
@@ -307,8 +312,15 @@ public static class SingBoxConfigBuilder
 
     private static bool HappConfigGlobalProxy(JsonElement config)
     {
-        return TryGetProperty(config, "GlobalProxy", out var value) &&
-               value.ValueKind is JsonValueKind.True;
+        if (!TryGetProperty(config, "GlobalProxy", out var value)) return false;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.String => bool.TryParse(value.GetString(), out var enabled) && enabled,
+            JsonValueKind.Number => value.TryGetInt32(out var number) && number != 0,
+            _ => false
+        };
     }
 
     private static void AddHappConfigRules(JsonArray rules, JsonElement config)
@@ -535,7 +547,7 @@ public static class SingBoxConfigBuilder
                 ? false
                 : state.StrictRoute;
 
-            inbounds.Add(new JsonObject
+            var tun = new JsonObject
             {
                 ["type"] = "tun",
                 ["tag"] = "tun-in",
@@ -544,13 +556,14 @@ public static class SingBoxConfigBuilder
                 ["mtu"] = tunMtu,
                 ["auto_route"] = state.AutoRoute,
                 ["strict_route"] = strictRoute
-            });
+            };
+            AddTunRouteExcludes(tun, selected);
+            inbounds.Add(tun);
             if (state.Windows10TunCompatibilityMode || wireGuardMode)
             {
                 inbounds[^1]!["stack"] = "gvisor";
                 inbounds[^1]!["endpoint_independent_nat"] = true;
                 inbounds[^1]!["udp_timeout"] = "5m";
-                AddWireGuardTunRouteExcludes(inbounds[^1]!.AsObject(), selected);
             }
             else if (state.StackSystem) inbounds[^1]!["stack"] = "system";
         }
@@ -558,21 +571,24 @@ public static class SingBoxConfigBuilder
         return inbounds;
     }
 
-    private static void AddWireGuardTunRouteExcludes(JsonObject tun, ProxyProfile selected)
+    private static void AddTunRouteExcludes(JsonObject tun, ProxyProfile selected)
     {
-        if (selected.Protocol != ProxyProtocol.WireGuard ||
-            string.IsNullOrWhiteSpace(selected.Server) ||
-            !IPAddress.TryParse(selected.Server, out var address))
+        var excludes = new List<string>();
+        if (!string.IsNullOrWhiteSpace(selected.Server) &&
+            IPAddress.TryParse(selected.Server, out var address))
         {
-            return;
+            excludes.Add(address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+                ? $"{selected.Server}/128"
+                : $"{selected.Server}/32");
         }
 
-        tun["route_exclude_address"] = new JsonArray
+        if (excludes.Count == 0) return;
+        var array = new JsonArray();
+        foreach (var value in excludes.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
-                ? $"{selected.Server}/128"
-                : $"{selected.Server}/32"
-        };
+            array.Add(value);
+        }
+        tun["route_exclude_address"] = array;
     }
 
     private static int EffectiveTunMtu(AppState state, ProxyProfile selected)

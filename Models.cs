@@ -51,10 +51,20 @@ public sealed class AppState
     public bool ShowNavSeparators { get; set; } = true;
     public bool UsePanelGlass { get; set; } = true;
     public bool MinimizeToTray { get; set; } = true;
+    public List<ServiceMonitorTarget> ServiceMonitorTargets { get; set; } = [];
+    public List<ProxySubscription> Subscriptions { get; set; } = [];
     public List<ProxyProfile> Profiles { get; set; } = [];
 
     [JsonIgnore]
     public bool Windows10TunCompatibilityMode { get; set; }
+}
+
+public sealed class ServiceMonitorTarget
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Name { get; set; } = "Website";
+    public string Url { get; set; } = "https://example.com";
+    public string? PresetId { get; set; }
 }
 
 public sealed class ProxyProfile
@@ -97,6 +107,7 @@ public sealed class ProxyProfile
     public long? SubscriptionDownloadBytes { get; set; }
     public long? SubscriptionTotalBytes { get; set; }
     public DateTime? SubscriptionExpireUtc { get; set; }
+    public string? SubscriptionId { get; set; }
 
     [JsonIgnore]
     public string DisplayName => $"{Name}  [{Protocol}]";
@@ -107,9 +118,26 @@ public sealed class HappRoutingProfile
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string Name { get; set; } = "Happ routing";
     public List<string> Links { get; set; } = [];
+    public string? ManagedBySubscriptionId { get; set; }
+    public bool NameIsCustom { get; set; }
 
     [JsonIgnore]
     public string DisplayName => Name;
+}
+
+public sealed class ProxySubscription
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Name { get; set; } = "Subscription";
+    public bool NameIsCustom { get; set; }
+    public string Url { get; set; } = "";
+    public DateTime? LastUpdatedUtc { get; set; }
+    public string? LastError { get; set; }
+    public long? UploadBytes { get; set; }
+    public long? DownloadBytes { get; set; }
+    public long? TotalBytes { get; set; }
+    public DateTime? ExpireUtc { get; set; }
+    public string? RoutingProfileId { get; set; }
 }
 
 public enum ProxyProtocol

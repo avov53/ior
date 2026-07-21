@@ -9,6 +9,11 @@ public static class ProfileParser
 {
     public static List<ProxyProfile> ParseMany(string input)
     {
+        return ParseManyDetailed(input).Profiles;
+    }
+
+    public static ProfileParseResult ParseManyDetailed(string input)
+    {
         var text = input.Trim();
         var profiles = new List<ProxyProfile>();
 
@@ -16,16 +21,24 @@ public static class ProfileParser
         {
             var wg = TryParseWireGuardConfig(text, "WireGuard");
             if (wg is not null) profiles.Add(wg);
-            return profiles;
+            return new ProfileParseResult(profiles, wg is null ? 1 : 0);
         }
 
+        var rejected = 0;
         foreach (var line in ExpandSubscription(text))
         {
             var profile = TryParseLine(line.Trim());
-            if (profile is not null) profiles.Add(profile);
+            if (profile is not null)
+            {
+                profiles.Add(profile);
+            }
+            else
+            {
+                rejected++;
+            }
         }
 
-        return profiles;
+        return new ProfileParseResult(profiles, rejected);
     }
 
     private static IEnumerable<string> ExpandSubscription(string text)
@@ -303,3 +316,5 @@ public static class ProfileParser
         return (clean[..index].Trim('[', ']'), int.Parse(clean[(index + 1)..]));
     }
 }
+
+public sealed record ProfileParseResult(List<ProxyProfile> Profiles, int RejectedCount);

@@ -13,13 +13,16 @@ namespace HappBox;
 
 public sealed class MainForm : Form
 {
-    private const string AppVersion = "1.2.1";
+    private const string AppVersion = "1.2.2";
     private const string GitHubRepositoryUrl = "https://github.com/avov53/ior";
     private const string GitHubLatestReleaseApiUrl = "https://api.github.com/repos/avov53/ior/releases/latest";
     private const int SingBoxStartupTimeoutMs = 6000;
     private const int SingBoxStartupRetryDelayMs = 700;
     private const int EmLineScroll = 0x00B6;
     private const int EmGetFirstVisibleLine = 0x00CE;
+    private static readonly System.Text.RegularExpressions.Regex AnsiEscapeRegex = new(
+        @"\x1B\[[0-?]*[ -/]*[@-~]",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
     private static readonly string[] DefaultRoutingBypassSites =
     [
         "ozon.ru",
@@ -43,13 +46,21 @@ public sealed class MainForm : Form
     private static Color Line = Color.FromArgb(77, 78, 86);
     private static readonly string[] DefaultNavItemOrder = ["servers", "settings", "config", "logs", "info"];
 
-    private readonly string _appDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ior");
+    private readonly string _appDir = Environment.GetEnvironmentVariable("IOR_APPDATA_DIR") ??
+                                      Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ior");
     private readonly string _statePath;
     private readonly string _configPath;
     private readonly AppState _state;
     private readonly List<string> _logs = [];
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _pendingProcessLogs = new();
+    private readonly System.Windows.Forms.Timer _logFlushTimer = new() { Interval = 50 };
+    private LogViewer? _activeLogViewer;
+    private int _logFlushScheduled;
 
     private readonly BufferedListBox _profiles = new();
+    private readonly ServerTreeView _serverTree = new();
+    private readonly LatencyChart _latencyChart = new();
+    private readonly LatencyMonitor _latencyMonitor = new();
     private readonly Panel _serverContentHost = new();
     private readonly Panel _emptyStatePanel = new();
     private readonly Panel _inlineImportPanel = new();
@@ -61,13 +72,18 @@ public sealed class MainForm : Form
     private readonly SubscriptionUsageBar _subscriptionUsageBar = new();
     private readonly Label _statusLabel = new();
     private readonly Label _timerLabel = new();
-    private readonly ToggleButton _powerButton = new();
+    private readonly ConnectionOrbButton _powerButton = new();
     private readonly Panel _networkStatsPanel = new();
+    private readonly Label _serverCountLabel = new();
+    private readonly Panel _serviceStatsPanel = new();
     private readonly Label _downloadSpeedValue = new();
     private readonly Label _uploadSpeedValue = new();
     private readonly Label _pingValue = new();
     private readonly Label _qualityValue = new();
-    private readonly Dictionary<string, Label> _serviceStatusLabels = [];
+    private readonly ConnectionStateIndicator _connectionStateIndicator = new();
+    private readonly ServerIdentityControl _serverIdentity = new();
+    private readonly ServiceStatusStrip _serviceStatusStrip = new();
+    private readonly ServiceFaviconCache _faviconCache;
     private readonly HashSet<string> _countryLookupsInFlight = [];
     private readonly System.Windows.Forms.Timer _connectTimer = new() { Interval = 1000 };
     private readonly System.Windows.Forms.Timer _trafficTimer = new() { Interval = 750 };
@@ -76,6 +92,8 @@ public sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _profileDragHoldTimer = new() { Interval = 220 };
     private readonly System.Windows.Forms.Timer _navResponsiveTimer = new() { Interval = 120 };
     private readonly NotifyIcon _trayIcon = new();
+    private readonly ContextMenuStrip _trayMenu = new();
+    private ToolStripDropDown? _serviceEditorDropDown;
 
     private DateTime? _connectedAt;
     private bool _startupUpdatePromptShown;
@@ -126,6 +144,7 @@ public sealed class MainForm : Form
     private long? _lastLatencyMs;
     private int _healthyServiceCount;
     private int _checkedServiceCount;
+    private readonly HashSet<string> _subscriptionsRefreshing = [];
 
     public MainForm()
     {
@@ -133,6 +152,7 @@ public sealed class MainForm : Form
         _statePath = Path.Combine(_appDir, "state.json");
         _configPath = Path.Combine(_appDir, "config.generated.json");
         _state = LoadState(_statePath);
+        _faviconCache = new ServiceFaviconCache(Path.Combine(_appDir, "favicons"), _httpClient);
         ApplyPackageCompatibilityDefaults(_state);
         ApplyAppearanceSettings();
         if (_state.SingBoxPath == "sing-box.exe" ||
@@ -148,7 +168,9 @@ public sealed class MainForm : Form
         var workingArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1220, 810);
         Width = Math.Min(1120, Math.Max(920, workingArea.Width - 80));
         Height = Math.Min(810, Math.Max(620, workingArea.Height - 80));
-        MinimumSize = new Size(900, 620);
+        MinimumSize = new Size(
+            (int)Math.Round(900 * DeviceDpi / 96d),
+            (int)Math.Round(620 * DeviceDpi / 96d));
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.Sizable;
         BackColor = Bg;
@@ -156,10 +178,27 @@ public sealed class MainForm : Form
         DoubleBuffered = true;
 
         _connectTimer.Tick += (_, _) => UpdateConnectionTimer();
+        _logFlushTimer.Tick += (_, _) => FlushPendingProcessLogs();
         _trafficTimer.Tick += async (_, _) =>
         {
             UpdateTrafficStats();
             await UpdatePingAndServicesAsync();
+        };
+        _serverTree.ProfileSelected += (_, profile) => SelectProfile(profile, save: true);
+        _serviceStatusStrip.TargetClicked += (_, e) => ShowServiceTargetEditor(e.Index);
+        _serverTree.ProfileMenuRequested += (_, profile) =>
+            ShowServerMenu(profile, _serverTree.PointToClient(Cursor.Position), _serverTree);
+        _serverTree.SubscriptionActionRequested += (_, request) =>
+        {
+            if (request.Action == SubscriptionAction.Refresh)
+                _ = RefreshSubscriptionAsync(request.Subscription, showErrors: true);
+            else
+                ShowSubscriptionMenu(request.Subscription);
+        };
+        _latencyMonitor.Updated += (_, _) =>
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke(new Action(RefreshLatencyUi));
         };
         _profileDragHoldTimer.Tick += (_, _) => BeginProfileDrag();
         _navResponsiveTimer.Tick += (_, _) =>
@@ -176,12 +215,22 @@ public sealed class MainForm : Form
         ConfigureTrayIcon();
         RefreshProfiles();
         RefreshMainPreview();
+        _serviceStatusStrip.SetTargets(_state.ServiceMonitorTargets);
+        _ = LoadServiceIconsAsync();
         ResetTrafficCounters();
         RecoverConnectionState();
         QueueCountryLookups(_state.Profiles);
+        _latencyMonitor.SetProfiles(_state.Profiles, _state.SelectedProfileId);
+        _latencyMonitor.Start();
         _trafficTimer.Start();
         _ = UpdatePingAndServicesAsync(force: true);
-        Shown += async (_, _) => await CheckForStartupUpdateAsync();
+        Shown += async (_, _) =>
+        {
+            var skipStartupNetwork = string.Equals(Environment.GetEnvironmentVariable("IOR_SKIP_STARTUP_NETWORK"), "1", StringComparison.Ordinal);
+            if (!skipStartupNetwork)
+                await RefreshAllSubscriptionsAsync(startup: true);
+            if (!skipStartupNetwork) await CheckForStartupUpdateAsync();
+        };
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -194,8 +243,16 @@ public sealed class MainForm : Form
         }
 
         _trayIcon.Visible = false;
+        _serviceEditorDropDown?.Close();
+        _serviceEditorDropDown?.Dispose();
+        _trayIcon.ContextMenuStrip = null;
+        _trayMenu.Dispose();
         _trayIcon.Dispose();
         StopSingBox();
+        FlushPendingProcessLogs();
+        _logFlushTimer.Stop();
+        _logFlushTimer.Dispose();
+        _latencyMonitor.Dispose();
         SaveState();
         base.OnFormClosing(e);
     }
@@ -211,34 +268,69 @@ public sealed class MainForm : Form
         _trayIcon.Text = "ior";
         _trayIcon.Icon = Icon ?? SystemIcons.Application;
         _trayIcon.Visible = _state.MinimizeToTray;
+        _trayMenu.BackColor = CardBg2;
+        _trayMenu.ForeColor = TextColor;
+        _trayMenu.ShowImageMargin = false;
+        _trayMenu.Padding = new Padding(6);
+        _trayMenu.Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors());
+        _trayMenu.Opening += (_, _) => RebuildTrayMenu();
+        _trayIcon.ContextMenuStrip = _trayMenu;
         _trayIcon.MouseDoubleClick += (_, e) =>
         {
             if (e.Button == MouseButtons.Left) RestoreFromTray();
         };
-        _trayIcon.MouseClick += (_, e) =>
-        {
-            if (e.Button == MouseButtons.Right) ShowTrayMenu();
-        };
     }
 
-    private void ShowTrayMenu()
+    private void RebuildTrayMenu()
     {
-        var menu = new ContextMenuStrip
-        {
-            BackColor = CardBg2,
-            ForeColor = TextColor,
-            Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors())
-        };
+        var previousItems = _trayMenu.Items.Cast<ToolStripItem>().ToArray();
+        _trayMenu.Items.Clear();
+        foreach (var item in previousItems) item.Dispose();
+        var ru = _state.Language == AppLanguage.Russian;
+        var selected = SelectedProfile();
         var connected = IsConnectionActive();
-        menu.Items.Add(connected ? T("tray.disconnect") : T("tray.connect"), null, (_, _) => ToggleConnection());
-        menu.Items.Add(T("tray.close"), null, (_, _) =>
+
+        _trayMenu.Items.Add(new ToolStripMenuItem(ru ? "Открыть ior" : "Open ior", null, (_, _) => RestoreFromTray())
+        {
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+        });
+        _trayMenu.Items.Add(new ToolStripSeparator());
+        _trayMenu.Items.Add(new ToolStripMenuItem(selected is null
+            ? (ru ? "Сервер не выбран" : "No server selected")
+            : $"{(ru ? "Выбран" : "Selected")}: {selected.Name}")
+        {
+            Enabled = false
+        });
+
+        if (selected?.SubscriptionId is { Length: > 0 } subscriptionId &&
+            _state.Subscriptions.Any(x => x.Id == subscriptionId))
+        {
+            var switchItem = new ToolStripMenuItem(ru ? "Сменить сервер" : "Switch server");
+            foreach (var profile in _state.Profiles.Where(x => x.SubscriptionId == subscriptionId))
+            {
+                var profileItem = new ToolStripMenuItem($"{profile.Name} · {ProtocolLabel(profile)} · {profile.Server}:{profile.Port}")
+                {
+                    Checked = profile.Id == selected.Id,
+                    Enabled = !_connectionTransitionInProgress
+                };
+                profileItem.Click += (_, _) => SwitchServerFromTray(profile);
+                switchItem.DropDownItems.Add(profileItem);
+            }
+            _trayMenu.Items.Add(switchItem);
+        }
+
+        _trayMenu.Items.Add(new ToolStripSeparator());
+        _trayMenu.Items.Add(new ToolStripMenuItem(connected ? T("tray.disconnect") : T("tray.connect"), null, (_, _) => _ = ToggleConnectionAsync())
+        {
+            Enabled = !_connectionTransitionInProgress && selected is not null
+        });
+        _trayMenu.Items.Add(new ToolStripSeparator());
+        _trayMenu.Items.Add(new ToolStripMenuItem(ru ? "Выйти" : "Exit", null, (_, _) =>
         {
             _allowExit = true;
             _trayIcon.Visible = false;
             Close();
-        });
-        menu.Closed += (_, _) => BeginInvoke(new Action(menu.Dispose));
-        menu.Show(Cursor.Position);
+        }));
     }
 
     private void HideToTray()
@@ -247,12 +339,45 @@ public sealed class MainForm : Form
         Hide();
     }
 
-    private void RestoreFromTray()
+    internal void RestoreFromTray()
     {
         Show();
         WindowState = FormWindowState.Normal;
+        ShowInTaskbar = true;
         Activate();
+        SetForegroundWindow(Handle);
     }
+
+    private async void SwitchServerFromTray(ProxyProfile profile)
+    {
+        if (_connectionTransitionInProgress || profile.Id == _state.SelectedProfileId) return;
+        _connectionTransitionInProgress = true;
+        _powerButton.Enabled = false;
+        try
+        {
+            var connected = IsConnectionActive();
+            if (connected)
+            {
+                SetConnectionVisualState(ConnectionVisualState.Disconnecting);
+                await StopSingBoxAsync();
+            }
+            SelectProfile(profile, save: true);
+            if (connected)
+            {
+                SetConnectionVisualState(ConnectionVisualState.Connecting);
+                if (!await StartSingBoxAsync()) await ShowConnectionFailedAsync();
+            }
+        }
+        finally
+        {
+            _connectionTransitionInProgress = false;
+            _powerButton.Enabled = true;
+        }
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
 
     private bool IsConnectionActive()
     {
@@ -823,10 +948,15 @@ public sealed class MainForm : Form
             "settings.excluded.sites" => ru ? "Исключённые сайты" : "Excluded sites",
             "settings.proxied.sites" => ru ? "Проксируемые сайты" : "Proxied sites",
             "settings.happ.routing.links" => ru ? "Ссылки Happ" : "Happ links",
-            "settings.happ.routing.hint" => ru ? "Ссылки с routing.happ.su. В Proxy-режиме совпадения пойдут через VPN, остальное напрямую." : "Links from routing.happ.su. In Proxy mode matches go through VPN, the rest goes direct.",
+            "settings.happ.routing.hint" => ru ? "Профиль применяется в режимах TUN и Proxy. Совпадения идут через VPN, остальные подключения — по правилам профиля." : "The profile applies in TUN and Proxy modes. Matches go through VPN; other connections follow the profile rules.",
             "settings.happ.routing.site" => ru ? "Открыть routing.happ.su/ru" : "Open routing.happ.su/ru",
             "settings.happ.routing.profiles" => ru ? "Профили" : "Profiles",
             "settings.happ.routing.profile.name" => ru ? "Имя профиля" : "Profile name",
+            "settings.happ.routing.profile.new" => ru ? "Новый профиль" : "New profile",
+            "settings.happ.routing.profile.links.placeholder" => ru ? "Вставьте ссылки маршрутизации Happ" : "Paste Happ routing links",
+            "settings.happ.routing.profile.delete.confirm" => ru ? "Удалить этот профиль маршрутизации?" : "Delete this routing profile?",
+            "settings.happ.routing.profile.rename" => ru ? "Переименовать" : "Rename",
+            "settings.happ.routing.profile.copy" => ru ? "Скопировать ссылки" : "Copy links",
             "settings.happ.routing.empty" => ru ? "Профилей пока нет" : "No profiles yet",
             "settings.happ.routing.empty.input" => ru ? "Вставьте ссылку маршрутизации Happ." : "Paste a Happ routing link.",
             "settings.route" => ru ? "Маршрут" : "Route",
@@ -858,6 +988,13 @@ public sealed class MainForm : Form
             "config.write" => ru ? "Записать конфиг" : "Write config file",
             "config.select.profile" => ru ? "Сначала импортируйте и выберите профиль." : "Import and select a profile first.",
             "logs.title" => ru ? "Логи" : "Logs",
+            "logs.all" => ru ? "Все" : "All",
+            "logs.important" => ru ? "Важно" : "Important",
+            "logs.errors" => ru ? "Ошибки" : "Errors",
+            "logs.search" => ru ? "Поиск по логам" : "Search logs",
+            "logs.copy" => ru ? "Копировать" : "Copy",
+            "logs.clear" => ru ? "Очистить" : "Clear",
+            "logs.empty" => ru ? "Подходящих записей нет" : "No matching entries",
             "info.title" => ru ? "Информация" : "Information",
             "info.current.version" => ru ? "Текущая версия" : "Current version",
             "update.checking" => ru ? "Проверка обновлений..." : "Checking for updates...",
@@ -905,6 +1042,9 @@ public sealed class MainForm : Form
             "quality.poor" => ru ? "Плохое" : "Poor",
             "status.connected" => ru ? "ПОДКЛЮЧЁН" : "CONNECTED",
             "status.disconnected" => ru ? "НЕ ПОДКЛЮЧЕН" : "DISCONNECTED",
+            "status.connecting" => ru ? "ПОДКЛЮЧАЕМСЯ" : "CONNECTING",
+            "status.disconnecting" => ru ? "ОТКЛЮЧАЕМСЯ" : "DISCONNECTING",
+            "status.failed" => ru ? "ОШИБКА" : "FAILED",
             "dialog.singbox.title" => ru ? "Выберите sing-box.exe" : "Select sing-box.exe",
             "dialog.exe.files" => ru ? "Исполняемые файлы" : "Executable files",
             "dialog.all.files" => ru ? "Все файлы" : "All files",
@@ -1032,105 +1172,122 @@ public sealed class MainForm : Form
 
     private Control BuildServerList()
     {
-        var area = new TableLayoutPanel
+        var area = new Panel { Dock = DockStyle.Fill, BackColor = Bg, Padding = new Padding(24, 24, 10, 24) };
+        var serverCard = new GlassPanel
         {
             Dock = DockStyle.Fill,
-            RowCount = 3,
-            BackColor = Bg,
-            Padding = new Padding(31, 28, 39, 26)
-        };
-        area.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
-        area.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));
-        area.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-        area.Controls.Add(new Label
-        {
-            Text = T("servers.title"),
-            Dock = DockStyle.Fill,
-            ForeColor = TextColor,
-            Font = new Font("Segoe UI", 24f, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleLeft
-        }, 0, 0);
-
-        var serverCard = new RoundedPanel
-        {
-            Dock = DockStyle.Fill,
-            BackColor = CardBg2,
-            BorderColor = CardBg2,
-            Radius = 12,
-            Padding = new Padding(3),
-            Margin = new Padding(0, 16, 0, 0)
+            SurfaceColor = Color.FromArgb(35, 37, 41),
+            BorderColor = Color.FromArgb(64, 67, 75),
+            Radius = 14,
+            Padding = new Padding(1)
         };
         var serverLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             RowCount = 2,
-            BackColor = Color.Transparent
+            BackColor = Color.Transparent,
+            Margin = Padding.Empty
         };
         _serverListLayout = serverLayout;
-        serverLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
+        _serverExpandButton = null;
+        serverLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 126));
         serverLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
         var serverHeader = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 4,
-            BackColor = CardBg,
-            Padding = new Padding(18, 0, 16, 0),
-            Margin = new Padding(0, 0, 0, 1)
+            RowCount = 2,
+            BackColor = Color.Transparent,
+            Padding = new Padding(18, 12, 14, 10),
+            Margin = Padding.Empty
         };
-        serverHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 34));
-        serverHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        serverHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 44));
-        serverHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 44));
-        _serverExpandButton = new ChevronIcon { Dock = DockStyle.Fill, Expanded = _serversExpanded };
-        _serverExpandButton.Click += (_, _) => SetServersExpanded(!_serversExpanded);
-        serverHeader.Controls.Add(_serverExpandButton, 0, 0);
-        var serverTitle = new Label
+        serverHeader.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        serverHeader.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var heading = new TableLayoutPanel
         {
-            Text = T("servers.list"),
+            Dock = DockStyle.Fill,
+            ColumnCount = 4,
+            BackColor = Color.Transparent,
+            Margin = Padding.Empty
+        };
+        heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        heading.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 40));
+        heading.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 40));
+        heading.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 40));
+        var titleStack = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 2,
+            BackColor = Color.Transparent,
+            Margin = Padding.Empty
+        };
+        titleStack.RowStyles.Add(new RowStyle(SizeType.Absolute, 31));
+        titleStack.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        titleStack.Controls.Add(new Label
+        {
+            Text = T("servers.title"),
             Dock = DockStyle.Fill,
             ForeColor = TextColor,
-            Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleLeft,
-            Cursor = Cursors.Hand
+            Font = new Font("Segoe UI", 12.5f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft
+        }, 0, 0);
+        _serverCountLabel.Dock = DockStyle.Fill;
+        _serverCountLabel.ForeColor = Color.FromArgb(153, 157, 168);
+        _serverCountLabel.Font = new Font("Segoe UI", 8.2f);
+        _serverCountLabel.TextAlign = ContentAlignment.TopLeft;
+        titleStack.Controls.Add(_serverCountLabel, 0, 1);
+        heading.Controls.Add(titleStack, 0, 0);
+
+        var addButton = new ToolbarIconButton { Kind = ToolbarIconKind.Add, Size = new Size(34, 34), Anchor = AnchorStyles.Top, Margin = new Padding(3, 6, 3, 0) };
+        var refreshButton = new ToolbarIconButton { Kind = ToolbarIconKind.Refresh, Size = new Size(34, 34), Anchor = AnchorStyles.Top, Margin = new Padding(3, 6, 3, 0) };
+        var menuButton = new ToolbarIconButton { Kind = ToolbarIconKind.Menu, Size = new Size(34, 34), Anchor = AnchorStyles.Top, Margin = new Padding(3, 6, 3, 0) };
+        addButton.Click += (_, _) => ShowInlineImport();
+        refreshButton.Click += (_, _) => _ = RefreshAllSubscriptionsAsync();
+        menuButton.Click += (_, _) => ShowServersMenu(menuButton);
+        _navToolTip.SetToolTip(addButton, T("servers.add.subscription"));
+        _navToolTip.SetToolTip(refreshButton, _state.Language == AppLanguage.Russian ? "Обновить подписки" : "Refresh subscriptions");
+        _navToolTip.SetToolTip(menuButton, _state.Language == AppLanguage.Russian ? "Действия" : "Actions");
+        heading.Controls.Add(addButton, 1, 0);
+        heading.Controls.Add(refreshButton, 2, 0);
+        heading.Controls.Add(menuButton, 3, 0);
+        serverHeader.Controls.Add(heading, 0, 0);
+
+        var searchFrame = new FlatInputPanel
+        {
+            Dock = DockStyle.Fill,
+            Radius = 8,
+            FillColor = Color.FromArgb(28, 30, 34),
+            BorderColor = Color.FromArgb(57, 60, 68),
+            Margin = new Padding(0, 7, 0, 1),
+            Padding = new Padding(12, 8, 10, 7)
         };
-        serverTitle.Click += (_, _) => SetServersExpanded(!_serversExpanded);
-        serverHeader.Controls.Add(serverTitle, 1, 0);
-        serverHeader.Controls.Add(HeaderIcon("⟳", () => RefreshProfiles()), 2, 0);
-        var serverMenuButton = HeaderIcon("⋯");
-        serverMenuButton.Click += (_, _) => ShowServersMenu(serverMenuButton);
-        serverHeader.Controls.Add(serverMenuButton, 3, 0);
+        var search = new TextBox
+        {
+            PlaceholderText = _state.Language == AppLanguage.Russian ? "Поиск" : "Search",
+            Dock = DockStyle.Fill,
+            Margin = Padding.Empty,
+            BorderStyle = BorderStyle.None,
+            BackColor = Color.FromArgb(28, 30, 34),
+            ForeColor = Color.FromArgb(228, 230, 236),
+            Font = new Font("Segoe UI", 9.3f)
+        };
+        search.TextChanged += (_, _) => _serverTree.FilterText = search.Text;
+        searchFrame.Controls.Add(search);
+        serverHeader.Controls.Add(searchFrame, 0, 1);
         serverLayout.Controls.Add(serverHeader, 0, 0);
 
-        _profiles.Dock = DockStyle.Fill;
-        _profiles.BorderStyle = BorderStyle.None;
-        _profiles.BackColor = CardBg2;
-        _profiles.ForeColor = TextColor;
-        _profiles.DrawMode = DrawMode.OwnerDrawFixed;
-        _profiles.ItemHeight = 86;
-        _profiles.DrawItem += DrawProfileItem;
-        _profiles.MouseDown += ProfilesMouseDown;
-        _profiles.MouseMove += ProfilesMouseMove;
-        _profiles.MouseUp += ProfilesMouseUp;
-        _profiles.MouseLeave += (_, _) =>
-        {
-            if (!_profileDragging && (Control.MouseButtons & MouseButtons.Left) != MouseButtons.Left) CancelProfileDrag();
-        };
-        _profiles.SelectedIndexChanged += (_, _) =>
-        {
-            if (_profileDragPending || _profileDragging) return;
-            if (_profileDragSelectionChanging) return;
-            SelectProfile(_profiles.SelectedItem as ProxyProfile, save: true);
-        };
+        _serverTree.Dock = DockStyle.Fill;
+        _serverTree.BackColor = Color.FromArgb(35, 37, 41);
         _serverContentHost.Dock = DockStyle.Fill;
-        _serverContentHost.BackColor = CardBg2;
-        _serverContentHost.Padding = new Padding(1, 0, 1, 1);
-        _serverContentHost.Controls.Add(_profiles);
+        _serverContentHost.BackColor = Color.FromArgb(35, 37, 41);
+        _serverContentHost.Padding = new Padding(8, 0, 8, 10);
+        _serverContentHost.Controls.Add(_serverTree);
         _serverContentHost.Controls.Add(BuildEmptyState());
         _serverContentHost.Controls.Add(BuildInlineImportPanel());
         serverLayout.Controls.Add(_serverContentHost, 0, 1);
         serverCard.Controls.Add(serverLayout);
-        area.Controls.Add(serverCard, 0, 2);
+        area.Controls.Add(serverCard);
         return area;
     }
 
@@ -1237,37 +1394,51 @@ public sealed class MainForm : Form
 
     private Control BuildConnectionPanel()
     {
-        var area = new ConnectionPanel
+        var area = new ConnectionPanel { Dock = DockStyle.Fill, BackColor = Bg, Padding = new Padding(10, 24, 24, 24) };
+        var glass = new GlassPanel
         {
             Dock = DockStyle.Fill,
-            BackColor = PreviewBg,
-            Padding = new Padding(42)
+            Radius = 16,
+            SurfaceColor = Color.FromArgb(20, 22, 27),
+            BorderColor = Color.FromArgb(58, 61, 71),
+            Padding = new Padding(26, 20, 26, 20)
         };
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 6,
+            BackColor = Color.Transparent,
+            Margin = Padding.Empty
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 78));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 104));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 20));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
 
-        _powerButton.IsOn = false;
-        _powerButton.Width = 148;
-        _powerButton.Height = 62;
+        _powerButton.State = ConnectionVisualState.Disconnected;
+        _powerButton.Width = 50;
+        _powerButton.Height = 50;
+        _powerButton.Anchor = AnchorStyles.None;
         _powerButton.Cursor = Cursors.Hand;
-        _powerButton.Click += (_, _) => ToggleConnection();
+        _powerButton.Click += (_, _) => _ = ToggleConnectionAsync();
+        _navToolTip.SetToolTip(_powerButton, _state.Language == AppLanguage.Russian ? "Подключить или отключить" : "Connect or disconnect");
 
         _statusLabel.Text = T("status.disconnected");
-        _statusLabel.ForeColor = Color.FromArgb(188, 188, 196);
-        _statusLabel.Font = new Font("Segoe UI", 10f);
-        _statusLabel.TextAlign = ContentAlignment.MiddleCenter;
-        _statusLabel.AutoSize = false;
+        _statusLabel.ForeColor = Color.FromArgb(226, 228, 235);
+        _statusLabel.Font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
+        _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _statusLabel.Dock = DockStyle.Fill;
         _statusLabel.BackColor = Color.Transparent;
-        _statusLabel.Width = 240;
-        _statusLabel.Height = 24;
 
         _timerLabel.Text = "00:00:00";
-        _timerLabel.ForeColor = TextColor;
-        _timerLabel.Font = new Font("Segoe UI", 10.5f);
-        _timerLabel.TextAlign = ContentAlignment.MiddleCenter;
-        _timerLabel.AutoSize = false;
+        _timerLabel.ForeColor = Color.FromArgb(144, 148, 160);
+        _timerLabel.Font = new Font("Segoe UI", 8.5f);
+        _timerLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _timerLabel.Dock = DockStyle.Fill;
         _timerLabel.BackColor = Color.Transparent;
-        _timerLabel.Width = 136;
-        _timerLabel.Height = 24;
-        _timerLabel.Visible = false;
+        _timerLabel.Visible = true;
 
         _selectedName.ForeColor = TextColor;
         _selectedName.Font = new Font("Segoe UI", 12f);
@@ -1295,84 +1466,100 @@ public sealed class MainForm : Form
         _subscriptionUsageBar.BackColor = Color.Transparent;
         _subscriptionUsageBar.Visible = false;
 
+        _latencyChart.Dock = DockStyle.Fill;
+        _latencyChart.BackColor = Color.Transparent;
+        _latencyChart.Margin = new Padding(0, 8, 0, 12);
+
         var modeSwitch = new ModeSwitchControl
         {
-            Width = 210,
-            Height = 48,
+            Width = 184,
+            Height = 42,
+            Anchor = AnchorStyles.None,
             IsTun = _state.TunEnabled,
             ProxyText = T("settings.proxy")
         };
-        modeSwitch.ModeChanged += (_, tunEnabled) =>
+        modeSwitch.ModeChanged += async (_, tunEnabled) =>
         {
-            ApplyConnectionMode(tunEnabled);
+            await ApplyConnectionModeAsync(tunEnabled);
             modeSwitch.IsTun = _state.TunEnabled;
         };
 
         BuildNetworkStatsPanel();
+        BuildServiceStatsPanel();
 
-        area.Resize += (_, _) => LayoutConnectionPanel(area, modeSwitch);
-        area.Controls.Add(_powerButton);
-        area.Controls.Add(_statusLabel);
-        area.Controls.Add(_timerLabel);
-        area.Controls.Add(_selectedName);
-        area.Controls.Add(_selectedProtocol);
-        area.Controls.Add(_selectedServer);
-        area.Controls.Add(_subscriptionUsageBar);
-        area.Controls.Add(_networkStatsPanel);
-        area.Controls.Add(modeSwitch);
-        LayoutConnectionPanel(area, modeSwitch);
-        return area;
-    }
-
-    private void LayoutConnectionPanel(Control area, Control modeSwitch)
-    {
-        var cx = area.ClientSize.Width / 2;
-        var h = area.ClientSize.Height;
-        var statsWidth = Math.Max(430, Math.Min(650, area.ClientSize.Width - 32));
-        if (_networkStatsPanel.Width != statsWidth)
+        var topBar = new TableLayoutPanel
         {
-            _networkStatsPanel.Width = statsWidth;
-        }
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            BackColor = Color.Transparent,
+            Margin = Padding.Empty
+        };
+        topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 198));
+        topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 62));
+        var statusArea = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            BackColor = Color.Transparent,
+            Margin = Padding.Empty
+        };
+        statusArea.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 22));
+        statusArea.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        _connectionStateIndicator.Dock = DockStyle.Fill;
+        var statusText = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, BackColor = Color.Transparent, Margin = Padding.Empty };
+        statusText.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        statusText.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        statusText.Controls.Add(_statusLabel, 0, 0);
+        statusText.Controls.Add(_timerLabel, 0, 1);
+        statusArea.Controls.Add(_connectionStateIndicator, 0, 0);
+        statusArea.Controls.Add(statusText, 1, 0);
+        topBar.Controls.Add(statusArea, 0, 0);
+        topBar.Controls.Add(modeSwitch, 1, 0);
+        topBar.Controls.Add(_powerButton, 2, 0);
 
-        _powerButton.Location = new Point(cx - _powerButton.Width / 2, h / 2 - 120);
-        _statusLabel.Location = new Point(cx - _statusLabel.Width / 2, h / 2 - 40);
-        _timerLabel.Location = new Point(cx - _timerLabel.Width / 2, h / 2 - 15);
-        _selectedName.Location = new Point(cx - _selectedName.Width / 2, h - 282);
-        _selectedProtocol.Location = new Point(cx - _selectedProtocol.Width / 2, h - 250);
-        _selectedServer.Location = new Point(cx - _selectedServer.Width / 2, h - 226);
-        _subscriptionUsageBar.Location = new Point(cx - _subscriptionUsageBar.Width / 2, h - 190);
-        _networkStatsPanel.Location = new Point(cx - _networkStatsPanel.Width / 2, h - 168);
-        modeSwitch.Location = new Point(cx - modeSwitch.Width / 2, h - 60);
+        _serverIdentity.Dock = DockStyle.Fill;
+        _serverIdentity.Margin = new Padding(0, 2, 0, 2);
+        _subscriptionUsageBar.Dock = DockStyle.Fill;
+        _subscriptionUsageBar.Margin = new Padding(0, 2, 0, 4);
+        _networkStatsPanel.Dock = DockStyle.Fill;
+        _networkStatsPanel.Margin = new Padding(0, 5, 0, 3);
+        _serviceStatsPanel.Dock = DockStyle.Fill;
+        _serviceStatsPanel.Margin = new Padding(0, 3, 0, 0);
+
+        layout.Controls.Add(topBar, 0, 0);
+        layout.Controls.Add(_serverIdentity, 0, 1);
+        layout.Controls.Add(_subscriptionUsageBar, 0, 2);
+        layout.Controls.Add(_latencyChart, 0, 3);
+        layout.Controls.Add(_networkStatsPanel, 0, 4);
+        layout.Controls.Add(_serviceStatsPanel, 0, 5);
+        glass.Controls.Add(layout);
+        area.Controls.Add(glass);
+        return area;
     }
 
     private void BuildNetworkStatsPanel()
     {
-        _networkStatsPanel.Width = 650;
-        _networkStatsPanel.Height = 96;
         _networkStatsPanel.BackColor = Color.Transparent;
 
         var grid = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 4,
-            RowCount = 2,
+            RowCount = 1,
             BackColor = Color.Transparent
         };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
-        grid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        grid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        grid.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         grid.Controls.Add(BuildMetricCard(T("metrics.download"), _downloadSpeedValue), 0, 0);
         grid.Controls.Add(BuildMetricCard(T("metrics.upload"), _uploadSpeedValue), 1, 0);
         grid.Controls.Add(BuildMetricCard(T("metrics.ping"), _pingValue), 2, 0);
         grid.Controls.Add(BuildMetricCard(T("metrics.quality"), _qualityValue), 3, 0);
-        grid.Controls.Add(BuildServiceCard("Discord"), 0, 1);
-        grid.Controls.Add(BuildServiceCard("YouTube"), 1, 1);
-        grid.Controls.Add(BuildServiceCard("Telegram"), 2, 1);
-
         _downloadSpeedValue.Text = "0 KB/s";
         _uploadSpeedValue.Text = "0 KB/s";
         _pingValue.Text = "-";
@@ -1382,15 +1569,229 @@ public sealed class MainForm : Form
         _networkStatsPanel.Controls.Add(grid);
     }
 
+    private void BuildServiceStatsPanel()
+    {
+        _serviceStatsPanel.BackColor = Color.Transparent;
+        _serviceStatusStrip.Dock = DockStyle.Fill;
+        _serviceStatusStrip.Margin = Padding.Empty;
+        _serviceStatsPanel.Controls.Clear();
+        _serviceStatsPanel.Controls.Add(_serviceStatusStrip);
+    }
+
+    private void ShowServiceTargetEditor(int index)
+    {
+        if (index < 0 || index >= _state.ServiceMonitorTargets.Count) return;
+        _serviceEditorDropDown?.Close();
+
+        var editor = new Panel
+        {
+            Size = new Size(430, 326),
+            BackColor = Color.FromArgb(31, 33, 39),
+            Padding = new Padding(12)
+        };
+        var title = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 28,
+            Text = _state.Language == AppLanguage.Russian ? "Выберите проверяемый сервис" : "Choose a monitored service",
+            ForeColor = TextColor,
+            Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+        var inputs = new ServiceEditorInputRow
+        {
+            Dock = DockStyle.Top,
+            Height = 40,
+            ColumnCount = 3,
+            Padding = new Padding(0, 3, 0, 4),
+            BackColor = editor.BackColor
+        };
+        inputs.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 44));
+        inputs.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
+        inputs.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 10));
+        var search = new TextBox { Dock = DockStyle.Fill, PlaceholderText = _state.Language == AppLanguage.Russian ? "Поиск" : "Search", Margin = Padding.Empty, BorderStyle = BorderStyle.None };
+        var customUrl = new TextBox { Dock = DockStyle.Fill, PlaceholderText = _state.Language == AppLanguage.Russian ? "Сайт" : "Website", Margin = Padding.Empty, BorderStyle = BorderStyle.None };
+        StyleInput(search);
+        StyleInput(customUrl);
+        var searchFrame = new FlatInputPanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 6, 0), Padding = new Padding(9, 8, 9, 5), Radius = 6 };
+        var customFrame = new FlatInputPanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 6, 0), Padding = new Padding(9, 8, 9, 5), Radius = 6 };
+        searchFrame.Controls.Add(search);
+        customFrame.Controls.Add(customUrl);
+        _navToolTip.SetToolTip(inputs, _state.Language == AppLanguage.Russian ? "Проверять этот сайт" : "Monitor this website");
+        inputs.Controls.Add(searchFrame, 0, 0);
+        inputs.Controls.Add(customFrame, 1, 0);
+
+        var list = new ServicePresetList
+        {
+            Dock = DockStyle.Fill,
+            BackColor = editor.BackColor
+        };
+        _ = LoadPresetListIconsAsync(list);
+        editor.Controls.Add(list);
+        editor.Controls.Add(inputs);
+        editor.Controls.Add(title);
+
+        var dropDown = new ToolStripDropDown
+        {
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
+            BackColor = editor.BackColor,
+            AutoClose = true,
+            Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors())
+        };
+        _serviceEditorDropDown = dropDown;
+        var host = new ToolStripControlHost(editor)
+        {
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
+            AutoSize = false,
+            Size = editor.Size
+        };
+        dropDown.Items.Add(host);
+
+        void Apply(ServiceMonitorTarget target)
+        {
+            ApplyServiceTarget(index, target);
+            dropDown.Close(ToolStripDropDownCloseReason.ItemClicked);
+        }
+
+        void ApplyCustomTarget()
+        {
+            if (ServiceMonitorCatalog.TryCreateCustom(customUrl.Text, out var target))
+            {
+                Apply(target);
+                return;
+            }
+            customUrl.BackColor = Color.FromArgb(72, 38, 43);
+            System.Media.SystemSounds.Beep.Play();
+        }
+
+        void Populate()
+        {
+            var query = search.Text.Trim();
+            list.SetItems(ServiceMonitorCatalog.Presets.Where(x =>
+                query.Length == 0 || x.Name.Contains(query, StringComparison.CurrentCultureIgnoreCase) ||
+                x.Url.Contains(query, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        list.PresetSelected += (_, preset) => Apply(ServiceMonitorCatalog.ToTarget(preset));
+        search.TextChanged += (_, _) => Populate();
+        inputs.ApplyRequested += (_, _) => ApplyCustomTarget();
+        customUrl.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            ApplyCustomTarget();
+            e.SuppressKeyPress = true;
+        };
+        Populate();
+        dropDown.Closed += (_, _) => BeginInvoke(new Action(() =>
+        {
+            if (ReferenceEquals(_serviceEditorDropDown, dropDown)) _serviceEditorDropDown = null;
+            dropDown.Dispose();
+        }));
+        dropDown.Show(_serviceStatusStrip, new Point(_serviceStatusStrip.Width, 0), ToolStripDropDownDirection.AboveLeft);
+        search.Focus();
+    }
+
+    private void ApplyServiceTarget(int index, ServiceMonitorTarget target)
+    {
+        if (index < 0 || index >= _state.ServiceMonitorTargets.Count) return;
+        target.Id = _state.ServiceMonitorTargets[index].Id;
+        _state.ServiceMonitorTargets[index] = target;
+        _serviceStatusStrip.SetTargets(_state.ServiceMonitorTargets);
+        _serviceStatusStrip.ResetStatus(target.Id);
+        _serviceStatusStrip.ResetIcon(target.Id);
+        SaveState();
+        _statusProbeCts?.Cancel();
+        _ = LoadServiceIconAsync(target);
+        _ = UpdatePingAndServicesAsync(force: true);
+    }
+
+    private async Task LoadServiceIconsAsync()
+    {
+        foreach (var target in _state.ServiceMonitorTargets.ToArray())
+            await LoadServiceIconAsync(target);
+    }
+
+    private async Task LoadServiceIconAsync(ServiceMonitorTarget target)
+    {
+        var expectedUrl = target.Url;
+        if (!string.IsNullOrWhiteSpace(target.PresetId))
+        {
+            var bundled = LoadBundledServiceIcon(target.PresetId);
+            if (bundled is not null) _serviceStatusStrip.SetIcon(target.Id, bundled);
+        }
+        var preferredIcon = ServiceMonitorCatalog.Presets.FirstOrDefault(x => x.Id == target.PresetId)?.IconUrl;
+        var bytes = await _faviconCache.GetAsync(expectedUrl, preferredIconUrl: preferredIcon);
+        if (bytes is null || IsDisposed || !IsHandleCreated) return;
+        try
+        {
+            using var stream = new MemoryStream(bytes, writable: false);
+            using var source = Image.FromStream(stream);
+            var icon = new Bitmap(source);
+            if (_state.ServiceMonitorTargets.Any(x => x.Id == target.Id && x.Url == expectedUrl))
+                BeginInvoke(new Action(() => _serviceStatusStrip.SetIcon(target.Id, icon)));
+            else
+                icon.Dispose();
+        }
+        catch
+        {
+        }
+    }
+
+    private async Task LoadPresetListIconsAsync(ServicePresetList list)
+    {
+        foreach (var preset in ServiceMonitorCatalog.Presets)
+        {
+            if (list.IsDisposed) return;
+            var bundled = LoadBundledServiceIcon(preset.Id);
+            if (bundled is not null)
+            {
+                list.SetIcon(preset.Id, bundled);
+                continue;
+            }
+
+            var bytes = await _faviconCache.GetAsync(preset.Url, preferredIconUrl: preset.IconUrl);
+            if (bytes is null || list.IsDisposed) continue;
+            try
+            {
+                using var stream = new MemoryStream(bytes, writable: false);
+                using var source = Image.FromStream(stream);
+                list.SetIcon(preset.Id, new Bitmap(source));
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static Image? LoadBundledServiceIcon(string presetId)
+    {
+        foreach (var extension in new[] { ".png", ".ico" })
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "assets", "service-icons", presetId + extension);
+            try
+            {
+                if (!File.Exists(path)) continue;
+                using var source = Image.FromFile(path);
+                return new Bitmap(source);
+            }
+            catch
+            {
+            }
+        }
+        return null;
+    }
+
     private Control BuildMetricCard(string title, Label value)
     {
-        var card = new RoundedPanel
+        var card = new GlassPanel
         {
             Dock = DockStyle.Fill,
             Radius = 7,
-            BackColor = Color.FromArgb(38, 40, 46),
+            SurfaceColor = Color.FromArgb(31, 33, 39),
             BorderColor = Color.FromArgb(62, 64, 72),
-            Margin = new Padding(4),
+            Margin = new Padding(3),
             Padding = new Padding(8, 4, 8, 4)
         };
         var titleLabel = new Label
@@ -1399,62 +1800,15 @@ public sealed class MainForm : Form
             Dock = DockStyle.Top,
             Height = 16,
             ForeColor = Muted,
-            Font = new Font("Segoe UI", 7.8f),
+            Font = new Font("Segoe UI", 7.2f),
             TextAlign = ContentAlignment.MiddleLeft
         };
         value.Dock = DockStyle.Fill;
         value.ForeColor = TextColor;
-        value.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+        value.Font = new Font("Segoe UI", 8.9f, FontStyle.Bold);
         value.TextAlign = ContentAlignment.MiddleLeft;
         card.Controls.Add(value);
         card.Controls.Add(titleLabel);
-        return card;
-    }
-
-    private Control BuildServiceCard(string serviceName)
-    {
-        var value = new Label
-        {
-            Text = "-",
-            Dock = DockStyle.Right,
-            Width = 18,
-            ForeColor = Muted,
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleCenter
-        };
-        _serviceStatusLabels[serviceName] = value;
-
-        var card = new RoundedPanel
-        {
-            Dock = DockStyle.Fill,
-            Radius = 7,
-            BackColor = Color.FromArgb(38, 40, 46),
-            BorderColor = Color.FromArgb(62, 64, 72),
-            Margin = new Padding(3),
-            Padding = new Padding(5, 4, 5, 4)
-        };
-        var layout = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            BackColor = Color.Transparent,
-            ColumnCount = 2,
-            RowCount = 1,
-            Margin = Padding.Empty,
-            Padding = Padding.Empty
-        };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 18));
-        var name = new Label
-        {
-            Text = serviceName,
-            Dock = DockStyle.Fill,
-            ForeColor = Color.FromArgb(218, 220, 228),
-            Font = new Font("Segoe UI", 8.0f, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleLeft
-        };
-        layout.Controls.Add(name, 0, 0);
-        layout.Controls.Add(value, 1, 0);
-        card.Controls.Add(layout);
         return card;
     }
 
@@ -1668,13 +2022,14 @@ public sealed class MainForm : Form
     private int ServerListColumnWidth()
     {
         var width = _contentHost?.ClientSize.Width ?? ClientSize.Width - NavRailThickness();
-        if (width <= 0) return 583;
+        if (width <= 0) return ScaleLogical(420);
 
-        var desired = ScaleLogical(583);
-        var minConnectionWidth = ScaleLogical(430);
-        var minServerListWidth = ScaleLogical(430);
+        var desired = (int)Math.Round(width * 0.40);
+        var minConnectionWidth = ScaleLogical(470);
+        var minServerListWidth = ScaleLogical(330);
+        var preferredMaximum = ScaleLogical(500);
         var maxServerListWidth = Math.Max(minServerListWidth, width - minConnectionWidth);
-        return Math.Clamp(desired, minServerListWidth, maxServerListWidth);
+        return Math.Clamp(desired, minServerListWidth, Math.Min(preferredMaximum, maxServerListWidth));
     }
 
     private void UpdateServerListColumnWidth()
@@ -1713,6 +2068,10 @@ public sealed class MainForm : Form
     private void ShowEmbeddedPage(Control page)
     {
         if (_contentHost is null) return;
+        if (_activeLogViewer is not null && !page.Contains(_activeLogViewer))
+        {
+            _activeLogViewer = null;
+        }
 
         _contentHost.SuspendLayout();
         _contentHost.Controls.Clear();
@@ -1952,61 +2311,159 @@ public sealed class MainForm : Form
     private Control BuildRoutingSettingsSection()
     {
         NormalizeHappRoutingProfiles(_state);
-        var panel = SettingsCard();
-        panel.RowCount = 5;
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 116));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 230));
-        var happLinks = new TextBox
+        var panel = new TableLayoutPanel
         {
-            Text = "",
-            Multiline = true,
-            AcceptsReturn = true,
-            WordWrap = false,
-            ScrollBars = ScrollBars.None
+            Dock = DockStyle.Top,
+            Height = 500,
+            ColumnCount = 1,
+            RowCount = 4,
+            BackColor = Bg,
+            Padding = new Padding(4, 8, 10, 0)
         };
-        StyleInput(happLinks);
-        var modeHint = FieldLabel(T("settings.proxy.mode.only"));
-        modeHint.Margin = new Padding(8, 6, 8, 8);
-        panel.Controls.Add(modeHint, 1, 0);
-        var hint = new Label
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 354));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));
+
+        var intro = new TableLayoutPanel
         {
-            Text = T("settings.happ.routing.hint"),
             Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = Bg,
+            Margin = Padding.Empty
+        };
+        intro.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        intro.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        intro.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = T("settings.happ.routing.profiles"),
+            ForeColor = TextColor,
+            BackColor = Bg,
+            Font = new Font("Segoe UI", 13f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft
+        }, 0, 0);
+        intro.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = T("settings.happ.routing.hint"),
             ForeColor = Muted,
             BackColor = Bg,
             Font = new Font("Segoe UI", 9f),
             TextAlign = ContentAlignment.MiddleLeft,
-            Margin = new Padding(4, 0, 10, 0)
-        };
-        panel.Controls.Add(hint, 1, 1);
-        panel.Controls.Add(LightButton(T("settings.happ.routing.site"), () => OpenExternalUrl("https://routing.happ.su/ru"), width: 190), 2, 1);
-        panel.Controls.Add(FieldLabel(T("settings.happ.routing.links")), 0, 2);
-        var happLinksInput = SettingsTextInput(happLinks, height: 108);
-        panel.Controls.Add(happLinksInput, 1, 2);
-        panel.SetColumnSpan(happLinksInput, 2);
+            AutoEllipsis = true
+        }, 0, 1);
+        panel.Controls.Add(intro, 0, 0);
 
-        var addActions = new FlowLayoutPanel
+        var toolbar = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 1,
             BackColor = Bg,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            Margin = new Padding(0, 0, 0, 0)
+            Margin = Padding.Empty
         };
-        addActions.Controls.Add(LightButton(T("servers.add"), () =>
-        {
-            if (AddHappRoutingProfile(happLinks.Text)) ShowSettingsWindow(SettingsSection.Routing);
-        }, primary: true, width: 128));
-        panel.Controls.Add(addActions, 1, 3);
-        panel.SetColumnSpan(addActions, 2);
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 146));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 198));
 
-        panel.Controls.Add(FieldLabel(T("settings.happ.routing.profiles")), 0, 4);
+        var editorExpanded = false;
+        var addButton = LightButton(T("settings.happ.routing.profile.new"), () => { }, primary: true, width: 138);
+        var siteButton = LightButton(T("settings.happ.routing.site"), () => OpenExternalUrl("https://routing.happ.su/ru"), width: 190);
+        addButton.Dock = DockStyle.Left;
+        siteButton.Dock = DockStyle.Right;
+        toolbar.Controls.Add(addButton, 0, 0);
+        toolbar.Controls.Add(siteButton, 2, 0);
+        panel.Controls.Add(toolbar, 0, 1);
+
         var profilesList = BuildHappRoutingProfilesList();
-        panel.Controls.Add(profilesList, 1, 4);
-        panel.SetColumnSpan(profilesList, 2);
+        panel.Controls.Add(profilesList, 0, 2);
+
+        var editor = new RoundedPanel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = CardBg2,
+            BorderColor = Color.FromArgb(82, 84, 92),
+            Radius = 7,
+            Margin = new Padding(0, 6, 0, 0),
+            Padding = new Padding(14, 10, 14, 10),
+            Visible = false
+        };
+        var editorLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 3,
+            BackColor = CardBg2,
+            Margin = Padding.Empty
+        };
+        editorLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        editorLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
+        editorLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        editorLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        editorLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var profileName = new TextBox { PlaceholderText = T("settings.happ.routing.profile.name") };
+        var happLinks = new TextBox
+        {
+            Multiline = true,
+            AcceptsReturn = true,
+            WordWrap = false,
+            ScrollBars = ScrollBars.Vertical,
+            PlaceholderText = T("settings.happ.routing.profile.links.placeholder")
+        };
+        StyleInput(profileName);
+        StyleInput(happLinks);
+        var nameInput = SettingsTextInput(profileName, height: 36);
+        var linksInput = SettingsTextInput(happLinks, height: 70);
+        nameInput.Margin = new Padding(4, 2, 10, 2);
+        linksInput.Margin = new Padding(4, 4, 10, 4);
+        editorLayout.Controls.Add(nameInput, 0, 0);
+        editorLayout.SetColumnSpan(nameInput, 2);
+        editorLayout.Controls.Add(linksInput, 0, 1);
+        editorLayout.SetColumnSpan(linksInput, 2);
+
+        var addProfile = LightButton(T("servers.add"), () =>
+        {
+            if (AddHappRoutingProfile(happLinks.Text, profileName.Text))
+            {
+                ShowSettingsWindow(SettingsSection.Routing);
+            }
+        }, primary: true, width: 108);
+        addProfile.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        addProfile.Margin = new Padding(4, 2, 4, 2);
+        editorLayout.Controls.Add(addProfile, 1, 2);
+        editor.Controls.Add(editorLayout);
+        panel.Controls.Add(editor, 0, 3);
+
+        var animation = new System.Windows.Forms.Timer { Interval = 15 };
+        animation.Tick += (_, _) =>
+        {
+            const float expandedHeight = 174f;
+            var target = editorExpanded ? expandedHeight : 0f;
+            var current = panel.RowStyles[3].Height;
+            var next = current + (target - current) * 0.24f;
+            if (Math.Abs(target - next) < 1f)
+            {
+                next = target;
+                animation.Stop();
+                if (!editorExpanded) editor.Visible = false;
+            }
+
+            panel.RowStyles[3].Height = next;
+            panel.RowStyles[2].Height = 354f - next;
+            editor.Visible = next > 0f || editorExpanded;
+            panel.PerformLayout();
+        };
+        addButton.Click += (_, _) =>
+        {
+            editorExpanded = !editorExpanded;
+            if (editorExpanded) editor.Visible = true;
+            animation.Start();
+        };
+        panel.Disposed += (_, _) => animation.Dispose();
         return panel;
     }
 
@@ -2015,12 +2472,12 @@ public sealed class MainForm : Form
         var wrap = new RoundedPanel
         {
             Dock = DockStyle.Fill,
-            Height = 222,
+            Height = 340,
             BackColor = CardBg2,
             BorderColor = Color.FromArgb(82, 84, 92),
-            Radius = 6,
-            Margin = new Padding(4, 8, 10, 8),
-            Padding = new Padding(8)
+            Radius = 7,
+            Margin = new Padding(0, 4, 0, 6),
+            Padding = new Padding(10)
         };
 
         var list = new FlowLayoutPanel
@@ -2056,9 +2513,22 @@ public sealed class MainForm : Form
         }
         else
         {
+            var cards = new List<HappRoutingProfileCard>();
             foreach (var profile in _state.HappRoutingProfiles)
             {
-                list.Controls.Add(BuildHappRoutingProfileRow(profile));
+                var card = BuildHappRoutingProfileRow(profile, selectedId =>
+                {
+                    if (_state.SelectedHappRoutingProfileId == selectedId) return;
+
+                    _state.SelectedHappRoutingProfileId = selectedId;
+                    foreach (var item in cards)
+                    {
+                        item.Selected = item.ProfileId == selectedId;
+                    }
+                    SaveSettings();
+                });
+                cards.Add(card);
+                list.Controls.Add(card);
             }
         }
 
@@ -2066,82 +2536,34 @@ public sealed class MainForm : Form
         return wrap;
     }
 
-    private Control BuildHappRoutingProfileRow(HappRoutingProfile profile)
+    private HappRoutingProfileCard BuildHappRoutingProfileRow(HappRoutingProfile profile, Action<string> onSelected)
     {
-        var selected = profile.Id == _state.SelectedHappRoutingProfileId;
-        var row = new TableLayoutPanel
+        var managedSubscription = string.IsNullOrWhiteSpace(profile.ManagedBySubscriptionId)
+            ? null
+            : _state.Subscriptions.FirstOrDefault(x => x.Id == profile.ManagedBySubscriptionId);
+        var details = managedSubscription is null
+            ? HappRoutingLinksCountText(profile.Links.Count)
+            : $"3x-ui · {managedSubscription.Name}";
+        return new HappRoutingProfileCard(
+            profile.Id,
+            profile.Name,
+            details,
+            profile.Id == _state.SelectedHappRoutingProfileId,
+            () => onSelected(profile.Id),
+            () => RenameHappRoutingProfile(profile),
+            () => DeleteHappRoutingProfile(profile),
+            () => ExportHappRoutingProfile(profile),
+            T("settings.happ.routing.profile.rename"),
+            T("settings.happ.routing.profile.copy"),
+            T("servers.delete"))
         {
             Width = 420,
-            Height = 42,
-            ColumnCount = 4,
-            RowCount = 1,
-            BackColor = selected ? Color.FromArgb(62, 64, 72) : CardBg2,
-            Margin = new Padding(0, 0, 0, 6),
-            Padding = new Padding(10, 0, 8, 0),
-            Cursor = Cursors.Hand
+            Height = 60,
+            Margin = new Padding(0, 0, 0, 8)
         };
-        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 32));
-        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 32));
-        row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 32));
-
-        var name = new Label
-        {
-            Text = profile.Name,
-            Dock = DockStyle.Fill,
-            ForeColor = selected ? Color.White : TextColor,
-            BackColor = Color.Transparent,
-            Font = new Font("Segoe UI", 10f, selected ? FontStyle.Bold : FontStyle.Regular),
-            TextAlign = ContentAlignment.MiddleLeft,
-            AutoEllipsis = true,
-            Cursor = Cursors.Hand
-        };
-        var rename = new HappProfileActionButton(HappProfileActionKind.Rename, () => RenameHappRoutingProfile(profile)) { Dock = DockStyle.Fill };
-        var delete = new HappProfileActionButton(HappProfileActionKind.Delete, () => DeleteHappRoutingProfile(profile)) { Dock = DockStyle.Fill };
-        var export = new HappProfileActionButton(HappProfileActionKind.Export, () => ExportHappRoutingProfile(profile)) { Dock = DockStyle.Fill };
-        foreach (var icon in new[] { rename, delete, export }) icon.Visible = false;
-
-        row.Controls.Add(name, 0, 0);
-        row.Controls.Add(rename, 1, 0);
-        row.Controls.Add(delete, 2, 0);
-        row.Controls.Add(export, 3, 0);
-
-        void SelectProfile()
-        {
-            _state.SelectedHappRoutingProfileId = profile.Id;
-            SaveSettings();
-            ShowSettingsWindow(SettingsSection.Routing);
-        }
-
-        void SetHover(bool hover)
-        {
-            row.BackColor = selected
-                ? hover ? Color.FromArgb(72, 74, 84) : Color.FromArgb(62, 64, 72)
-                : hover ? Color.FromArgb(48, 50, 56) : CardBg2;
-            foreach (var icon in new[] { rename, delete, export }) icon.Visible = hover;
-        }
-
-        row.Click += (_, _) => SelectProfile();
-        name.Click += (_, _) => SelectProfile();
-        void WireHover(Control control)
-        {
-            control.MouseEnter += (_, _) => SetHover(true);
-            control.MouseLeave += (_, _) =>
-            {
-                if (!row.ClientRectangle.Contains(row.PointToClient(Cursor.Position)))
-                {
-                    SetHover(false);
-                }
-            };
-        }
-
-        WireHover(row);
-        WireHover(name);
-        foreach (var icon in new[] { rename, delete, export }) WireHover(icon);
-        return row;
     }
 
-    private bool AddHappRoutingProfile(string value)
+    private bool AddHappRoutingProfile(string value, string? requestedName = null)
     {
         var links = ParseRoutingLinks(value);
         if (links.Count == 0)
@@ -2150,7 +2572,9 @@ public sealed class MainForm : Form
             return false;
         }
 
-        var name = DefaultHappRoutingProfileName(links);
+        var name = string.IsNullOrWhiteSpace(requestedName)
+            ? DefaultHappRoutingProfileName(links)
+            : requestedName.Trim();
         var profile = new HappRoutingProfile
         {
             Name = name,
@@ -2171,12 +2595,22 @@ public sealed class MainForm : Form
         if (string.IsNullOrWhiteSpace(name)) return;
 
         profile.Name = name.Trim();
+        profile.NameIsCustom = true;
         SaveSettings();
         ShowSettingsWindow(SettingsSection.Routing);
     }
 
     private void DeleteHappRoutingProfile(HappRoutingProfile profile)
     {
+        if (MessageBox.Show(
+                T("settings.happ.routing.profile.delete.confirm"),
+                T("settings.happ.routing.profiles"),
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning) != DialogResult.Yes)
+        {
+            return;
+        }
+
         _state.HappRoutingProfiles.RemoveAll(x => x.Id == profile.Id);
         _state.SelectedHappRoutingProfileId = _state.HappRoutingProfiles.FirstOrDefault()?.Id;
         SaveSettings();
@@ -2234,6 +2668,25 @@ public sealed class MainForm : Form
         }
 
         return $"Happ routing {DateTime.Now:HHmm}";
+    }
+
+    private string HappRoutingLinksCountText(int count)
+    {
+        if (_state.Language != AppLanguage.Russian)
+        {
+            return $"{count} {(count == 1 ? "link" : "links")}";
+        }
+
+        var lastTwo = count % 100;
+        var last = count % 10;
+        var word = lastTwo is >= 11 and <= 14
+            ? "ссылок"
+            : last == 1
+                ? "ссылка"
+                : last is >= 2 and <= 4
+                    ? "ссылки"
+                    : "ссылок";
+        return $"{count} {word}";
     }
 
     private Control BuildAdvancedSettingsSection()
@@ -2715,19 +3168,128 @@ public sealed class MainForm : Form
 
     private Control BuildLogSection()
     {
-        var logBox = new TextBox
+        var panel = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            Multiline = true,
-            ReadOnly = true,
-            ScrollBars = ScrollBars.Both,
-            Font = new Font("Consolas", 10),
-            BorderStyle = BorderStyle.None,
-            BackColor = Color.FromArgb(20, 22, 22),
-            ForeColor = Color.FromArgb(200, 200, 200),
-            Text = string.Join(Environment.NewLine, _logs)
+            Height = 440,
+            MinimumSize = new Size(0, 360),
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = Bg,
+            Margin = Padding.Empty
         };
-        return SettingsTextInput(logBox, height: 420);
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var toolbar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 4,
+            RowCount = 1,
+            BackColor = Bg,
+            Margin = Padding.Empty
+        };
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 244));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 102));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+
+        var viewer = new LogViewer(T("logs.empty"))
+        {
+            Dock = DockStyle.Fill,
+            Font = new Font("Consolas", 9.5f),
+            Margin = Padding.Empty
+        };
+        viewer.ReplaceLogs(_logs);
+        _activeLogViewer = viewer;
+
+        var filterHost = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            BackColor = Bg,
+            Margin = Padding.Empty,
+            Padding = new Padding(0, 5, 0, 5)
+        };
+        var filterButtons = new Dictionary<LogViewFilter, RoundedButton>();
+        void SetFilter(LogViewFilter filter)
+        {
+            viewer.Filter = filter;
+            foreach (var pair in filterButtons)
+            {
+                var active = pair.Key == filter;
+                pair.Value.BackColor = active ? Accent : CardBg2;
+                pair.Value.BorderColor = active ? Accent : Color.FromArgb(72, 74, 82);
+                pair.Value.ForeColor = active ? Color.White : Muted;
+                pair.Value.Invalidate();
+            }
+        }
+
+        RoundedButton AddFilter(string text, LogViewFilter filter, int width)
+        {
+            var button = new RoundedButton
+            {
+                Text = text,
+                Width = width,
+                Height = 34,
+                Radius = 7,
+                BackColor = CardBg2,
+                BorderColor = Color.FromArgb(72, 74, 82),
+                ForeColor = Muted,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                Margin = new Padding(0, 2, 6, 2),
+                Cursor = Cursors.Hand
+            };
+            button.Click += (_, _) => SetFilter(filter);
+            button.MouseEnter += (_, _) =>
+            {
+                if (viewer.Filter != filter) button.BackColor = Color.FromArgb(48, 50, 56);
+            };
+            button.MouseLeave += (_, _) =>
+            {
+                if (viewer.Filter != filter) button.BackColor = CardBg2;
+            };
+            filterButtons[filter] = button;
+            filterHost.Controls.Add(button);
+            return button;
+        }
+
+        AddFilter(T("logs.all"), LogViewFilter.All, 58);
+        AddFilter(T("logs.important"), LogViewFilter.Important, 82);
+        AddFilter(T("logs.errors"), LogViewFilter.Errors, 86);
+        SetFilter(LogViewFilter.All);
+
+        var search = new TextBox { PlaceholderText = T("logs.search") };
+        StyleInput(search);
+        var searchWrap = SettingsTextInput(search, height: 34);
+        searchWrap.Margin = new Padding(4, 7, 8, 7);
+        search.TextChanged += (_, _) => viewer.SearchText = search.Text;
+
+        var copy = LightButton(T("logs.copy"), () =>
+        {
+            var text = viewer.ExportText();
+            if (!string.IsNullOrWhiteSpace(text)) Clipboard.SetText(text);
+        }, width: 94);
+        var clear = LightButton(T("logs.clear"), () =>
+        {
+            _logs.Clear();
+            viewer.ReplaceLogs(_logs);
+        }, width: 88);
+        copy.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        clear.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+
+        toolbar.Controls.Add(filterHost, 0, 0);
+        toolbar.Controls.Add(searchWrap, 1, 0);
+        toolbar.Controls.Add(copy, 2, 0);
+        toolbar.Controls.Add(clear, 3, 0);
+        panel.Controls.Add(toolbar, 0, 0);
+        panel.Controls.Add(viewer, 0, 1);
+        panel.Disposed += (_, _) =>
+        {
+            if (ReferenceEquals(_activeLogViewer, viewer)) _activeLogViewer = null;
+        };
+        return panel;
     }
 
     private Control BuildInformationSection()
@@ -3826,7 +4388,7 @@ del "%~f0"
         if (!_profiles.IsDisposed) _profiles.Invalidate();
     }
 
-    private void ShowServerMenu(ProxyProfile profile, Point location)
+    private void ShowServerMenu(ProxyProfile profile, Point location, Control? owner = null)
     {
         var menu = new ContextMenuStrip
         {
@@ -3839,7 +4401,48 @@ del "%~f0"
         menu.Items.Add(T("servers.rename"), null, (_, _) => RenameProfile(profile));
         menu.Items.Add(T("servers.delete"), null, (_, _) => DeleteProfile(profile));
         menu.Closed += (_, _) => BeginInvoke(new Action(menu.Dispose));
-        menu.Show(_profiles, location);
+        menu.Show(owner ?? _profiles, location);
+    }
+
+    private void ShowSubscriptionMenu(ProxySubscription subscription)
+    {
+        var menu = new ContextMenuStrip
+        {
+            BackColor = Color.FromArgb(42, 44, 50),
+            ForeColor = TextColor,
+            ShowImageMargin = false,
+            Padding = new Padding(6),
+            Renderer = new DarkMenuRenderer()
+        };
+        menu.Items.Add(_state.Language == AppLanguage.Russian ? "Обновить" : "Refresh", null,
+            (_, _) => _ = RefreshSubscriptionAsync(subscription, showErrors: true));
+        menu.Items.Add(T("servers.rename"), null, (_, _) => RenameSubscription(subscription));
+        menu.Items.Add(T("servers.delete"), null, (_, _) => DeleteSubscription(subscription));
+        menu.Closed += (_, _) => BeginInvoke(new Action(menu.Dispose));
+        menu.Show(_serverTree, _serverTree.PointToClient(Cursor.Position));
+    }
+
+    private void RenameSubscription(ProxySubscription subscription)
+    {
+        var name = PromptForServerName(subscription.Name);
+        if (string.IsNullOrWhiteSpace(name)) return;
+        subscription.Name = name.Trim();
+        subscription.NameIsCustom = true;
+        RefreshProfiles();
+        SaveState();
+    }
+
+    private void DeleteSubscription(ProxySubscription subscription)
+    {
+        var text = _state.Language == AppLanguage.Russian
+            ? $"Удалить подписку «{subscription.Name}», её серверы и профиль маршрутизации?"
+            : $"Delete subscription '{subscription.Name}', its servers and routing profile?";
+        if (MessageBox.Show(text, T("servers.delete"), MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+            return;
+        SubscriptionService.Remove(_state, subscription);
+        RefreshProfiles();
+        RefreshMainPreview();
+        SaveState();
     }
 
     private void ShowServersMenu(Control anchor)
@@ -3887,6 +4490,7 @@ del "%~f0"
     private void DeleteAllProfiles()
     {
         _state.Profiles.Clear();
+        foreach (var subscription in _state.Subscriptions.ToList()) SubscriptionService.Remove(_state, subscription);
         _state.SelectedProfileId = null;
         RefreshProfiles();
         RefreshMainPreview();
@@ -4101,29 +4705,25 @@ del "%~f0"
         return "UN";
     }
 
-    private async Task<bool> ImportProfilesFromTextAsync(string text)
+    private async Task<bool> ImportProfilesFromTextAsync(string text, string? requestedSubscriptionName = null)
     {
         var importText = text.Trim();
-        SubscriptionInfo? subscriptionInfo = null;
         if (LooksLikeSubscriptionUrl(importText))
         {
             try
             {
-                Log($"Downloading subscription: {importText}");
-                using var response = await _httpClient.GetAsync(importText);
-                response.EnsureSuccessStatusCode();
-                subscriptionInfo = ParseSubscriptionInfo(response);
-                importText = await response.Content.ReadAsStringAsync();
+                var fetched = await SubscriptionService.FetchAsync(_httpClient, importText);
+                return CommitSubscription(importText, requestedSubscriptionName, fetched);
             }
             catch (Exception ex)
             {
                 MessageBox.Show(ex.Message, T("import.download.failed"), MessageBoxButtons.OK, MessageBoxIcon.Error);
-                Log($"Subscription download failed: {ex.Message}");
+                Log($"Subscription download failed for {SubscriptionDisplayHost(importText)}: {ex.Message}");
                 return false;
             }
         }
 
-        var parsed = ProfileParser.ParseMany(importText);
+        var parsed = ProfileParser.ParseManyDetailed(importText).Profiles;
         if (parsed.Count == 0)
         {
             MessageBox.Show(T("import.none"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -4132,16 +4732,9 @@ del "%~f0"
 
         foreach (var profile in parsed)
         {
-            if (subscriptionInfo is not null)
-            {
-                ApplySubscriptionInfo(profile, subscriptionInfo);
-            }
-
+            var identity = SubscriptionService.ProfileIdentity(profile);
             var existing = _state.Profiles.FindIndex(x =>
-                x.Protocol == profile.Protocol &&
-                x.Server.Equals(profile.Server, StringComparison.OrdinalIgnoreCase) &&
-                x.Port == profile.Port &&
-                (x.UserId ?? x.Password ?? x.PrivateKey) == (profile.UserId ?? profile.Password ?? profile.PrivateKey));
+                string.IsNullOrWhiteSpace(x.SubscriptionId) && SubscriptionService.ProfileIdentity(x) == identity);
 
             if (existing >= 0)
             {
@@ -4150,13 +4743,10 @@ del "%~f0"
                 profile.CountryCode = current.CountryCode;
                 profile.CountryName = current.CountryName;
                 profile.CountryLookupUtc = current.CountryLookupUtc;
-                if (subscriptionInfo is null)
-                {
-                    profile.SubscriptionUploadBytes = current.SubscriptionUploadBytes;
-                    profile.SubscriptionDownloadBytes = current.SubscriptionDownloadBytes;
-                    profile.SubscriptionTotalBytes = current.SubscriptionTotalBytes;
-                    profile.SubscriptionExpireUtc = current.SubscriptionExpireUtc;
-                }
+                profile.SubscriptionUploadBytes = current.SubscriptionUploadBytes;
+                profile.SubscriptionDownloadBytes = current.SubscriptionDownloadBytes;
+                profile.SubscriptionTotalBytes = current.SubscriptionTotalBytes;
+                profile.SubscriptionExpireUtc = current.SubscriptionExpireUtc;
                 _state.Profiles[existing] = profile;
             }
             else _state.Profiles.Add(profile);
@@ -4168,6 +4758,97 @@ del "%~f0"
         SaveState();
         Log($"Imported {parsed.Count} profile(s).");
         return true;
+    }
+
+    private bool CommitSubscription(string url, string? requestedName, SubscriptionFetchResult fetched)
+    {
+        if (fetched.Profiles.Count == 0)
+        {
+            MessageBox.Show(T("import.none"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        var subscription = _state.Subscriptions.FirstOrDefault(x =>
+            x.Url.Equals(url, StringComparison.OrdinalIgnoreCase));
+        var isNew = subscription is null;
+        subscription ??= new ProxySubscription { Url = url };
+        if (!string.IsNullOrWhiteSpace(requestedName))
+        {
+            subscription.Name = requestedName.Trim();
+            subscription.NameIsCustom = true;
+        }
+        else if (isNew)
+        {
+            subscription.Name = fetched.SuggestedName ?? SubscriptionService.DefaultName(url);
+        }
+
+        if (isNew) _state.Subscriptions.Add(subscription);
+        try
+        {
+            var merged = SubscriptionService.Apply(_state, subscription, fetched);
+            if (!string.IsNullOrWhiteSpace(merged.Warning)) Log(merged.Warning);
+            RefreshProfiles();
+            RefreshMainPreview();
+            SaveState();
+            Log($"Subscription {subscription.Name}: +{merged.Added}, updated {merged.Updated}, removed {merged.Removed}, skipped {fetched.RejectedCount}.");
+            return true;
+        }
+        catch
+        {
+            if (isNew) _state.Subscriptions.Remove(subscription);
+            throw;
+        }
+    }
+
+    private async Task RefreshSubscriptionAsync(ProxySubscription subscription, bool showErrors = false)
+    {
+        if (!_subscriptionsRefreshing.Add(subscription.Id)) return;
+        subscription.LastError = null;
+        RefreshProfiles();
+        try
+        {
+            var fetched = await SubscriptionService.FetchAsync(_httpClient, subscription.Url);
+            var merged = SubscriptionService.Apply(_state, subscription, fetched);
+            if (!string.IsNullOrWhiteSpace(merged.Warning)) Log(merged.Warning);
+            Log($"Subscription {subscription.Name} refreshed: +{merged.Added}, updated {merged.Updated}, removed {merged.Removed}.");
+        }
+        catch (Exception ex)
+        {
+            subscription.LastError = ex.Message;
+            Log($"Subscription refresh failed for {SubscriptionDisplayHost(subscription.Url)}: {ex.Message}");
+            if (showErrors)
+                MessageBox.Show(ex.Message, T("import.download.failed"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _subscriptionsRefreshing.Remove(subscription.Id);
+            RefreshProfiles();
+            RefreshMainPreview();
+            SaveState();
+        }
+    }
+
+    private async Task RefreshAllSubscriptionsAsync(bool startup = false)
+    {
+        if (_state.Subscriptions.Count == 0)
+        {
+            if (!startup) RefreshProfiles();
+            return;
+        }
+
+        using var gate = new SemaphoreSlim(2, 2);
+        var tasks = _state.Subscriptions.ToList().Select(async subscription =>
+        {
+            await gate.WaitAsync();
+            try { await RefreshSubscriptionAsync(subscription, showErrors: false); }
+            finally { gate.Release(); }
+        });
+        await Task.WhenAll(tasks);
+    }
+
+    private static string SubscriptionDisplayHost(string url)
+    {
+        return Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.Host : "subscription";
     }
 
     private static bool LooksLikeSubscriptionUrl(string text)
@@ -4238,7 +4919,7 @@ del "%~f0"
         SaveState();
     }
 
-    private void ToggleConnection()
+    private async Task ToggleConnectionAsync()
     {
         if (_connectionTransitionInProgress) return;
 
@@ -4250,9 +4931,14 @@ del "%~f0"
             trackedProcess?.Dispose();
             if (_process is { HasExited: false } || hasTrackedProcess)
             {
-                StopSingBox();
+                SetConnectionVisualState(ConnectionVisualState.Disconnecting);
+                await StopSingBoxAsync();
             }
-            else StartSingBox();
+            else
+            {
+                SetConnectionVisualState(ConnectionVisualState.Connecting);
+                if (!await StartSingBoxAsync()) await ShowConnectionFailedAsync();
+            }
         }
         finally
         {
@@ -4284,10 +4970,19 @@ del "%~f0"
                Path.GetFileName(baseDir).Equals("windows-10", StringComparison.OrdinalIgnoreCase);
     }
 
-    private void ApplyConnectionMode(bool tunEnabled)
+    private async Task ApplyConnectionModeAsync(bool tunEnabled)
     {
+        if (_connectionTransitionInProgress) return;
+        _connectionTransitionInProgress = true;
+        _powerButton.Enabled = false;
+        try
+        {
         var wasRunning = _process is { HasExited: false };
-        if (wasRunning) StopSingBox();
+        if (wasRunning)
+        {
+            SetConnectionVisualState(ConnectionVisualState.Disconnecting);
+            await StopSingBoxAsync();
+        }
 
         _state.TunEnabled = tunEnabled;
         _state.MixedProxyEnabled = true;
@@ -4295,7 +4990,17 @@ del "%~f0"
         RefreshMainPreview();
         Log(tunEnabled ? "Mode changed: TUN" : "Mode changed: Proxy");
 
-        if (wasRunning) StartSingBox();
+        if (wasRunning)
+        {
+            SetConnectionVisualState(ConnectionVisualState.Connecting);
+            if (!await StartSingBoxAsync()) await ShowConnectionFailedAsync();
+        }
+        }
+        finally
+        {
+            _connectionTransitionInProgress = false;
+            _powerButton.Enabled = true;
+        }
     }
 
     private void RecoverConnectionState()
@@ -4409,27 +5114,32 @@ del "%~f0"
 
     private void StartSingBox()
     {
-        StartSingBoxCore(allowStartupRetry: true);
+        _ = StartSingBoxAsync();
     }
 
-    private void StartSingBoxCore(bool allowStartupRetry)
+    private Task<bool> StartSingBoxAsync()
+    {
+        return StartSingBoxCoreAsync(allowStartupRetry: true);
+    }
+
+    private async Task<bool> StartSingBoxCoreAsync(bool allowStartupRetry)
     {
         if (_process is { HasExited: false })
         {
             Log("sing-box is already running.");
-            return;
+            return true;
         }
 
         var profile = SelectedProfile();
         if (profile is null)
         {
             MessageBox.Show(T("start.select.profile"), T("start.title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
+            return false;
         }
 
         SaveSettings();
-        if (!TryWriteConfig(profile)) return;
-        if (!ValidateSingBoxConfig()) return;
+        if (!TryWriteConfig(profile)) return false;
+        if (!ValidateSingBoxConfig()) return false;
 
         var startInfo = new ProcessStartInfo
         {
@@ -4461,15 +5171,21 @@ del "%~f0"
             _process.BeginOutputReadLine();
             _process.BeginErrorReadLine();
 
-            var ready = WaitForSingBoxStartup(_process, SingBoxStartupTimeoutMs);
+            var ready = await Task.Run(() => WaitForSingBoxStartup(startedProcess, SingBoxStartupTimeoutMs));
             if (!ready)
             {
-                var exited = _process.HasExited;
-                var exitCode = exited ? TryGetExitCode(_process) : "still running";
+                var exited = startedProcess.HasExited;
+                var exitCode = exited ? TryGetExitCode(startedProcess) : "still running";
                 if (!exited)
                 {
-                    _process.Kill(entireProcessTree: true);
-                    _process.WaitForExit(3000);
+                    await Task.Run(() =>
+                    {
+                        if (!startedProcess.HasExited)
+                        {
+                            startedProcess.Kill(entireProcessTree: true);
+                            startedProcess.WaitForExit(3000);
+                        }
+                    });
                 }
                 SetDisconnected();
                 Log($"sing-box startup did not become ready ({exitCode}).");
@@ -4477,22 +5193,24 @@ del "%~f0"
                 if (allowStartupRetry && _state.TunEnabled)
                 {
                     Log("Retrying TUN startup once.");
-                    Thread.Sleep(SingBoxStartupRetryDelayMs);
-                    StartSingBoxCore(allowStartupRetry: false);
-                    return;
+                    SetConnectionVisualState(ConnectionVisualState.Connecting);
+                    await Task.Delay(SingBoxStartupRetryDelayMs);
+                    return await StartSingBoxCoreAsync(allowStartupRetry: false);
                 }
 
                 MessageBox.Show(T("connection.not.ready"), T("connection.failed"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
+                return false;
             }
 
             ApplySystemProxyIfNeeded();
             SetConnected();
             Log("sing-box started.");
+            return true;
         }
         catch (Exception ex)
         {
             MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
         }
     }
 
@@ -4564,6 +5282,44 @@ del "%~f0"
             RestoreSystemProxyIfNeeded();
             SetDisconnected();
         }
+    }
+
+    private async Task StopSingBoxAsync()
+    {
+        string? stoppedMessage = null;
+        string? errorMessage = null;
+        var trackedByPort = false;
+        var process = _process;
+        if (process is null || process.HasExited)
+        {
+            trackedByPort = TryGetTrackedSingBoxProcess(out process);
+        }
+
+        try
+        {
+            if (process is { HasExited: false })
+            {
+                await Task.Run(() =>
+                {
+                    process.Kill(entireProcessTree: true);
+                    process.WaitForExit(3000);
+                });
+                stoppedMessage = trackedByPort ? "tracked sing-box process stopped." : "sing-box stopped.";
+            }
+        }
+        catch (Exception ex)
+        {
+            errorMessage = $"Stop failed: {ex.Message}";
+        }
+        finally
+        {
+            if (trackedByPort) process?.Dispose();
+        }
+
+        if (errorMessage is not null) Log(errorMessage);
+        else if (stoppedMessage is not null) Log(stoppedMessage);
+        RestoreSystemProxyIfNeeded();
+        SetDisconnected();
     }
 
     private void ApplySystemProxyIfNeeded()
@@ -4686,17 +5442,46 @@ del "%~f0"
         InternetSetOption(IntPtr.Zero, 37, IntPtr.Zero, 0);
     }
 
+    private void SetConnectionVisualState(ConnectionVisualState state)
+    {
+        _powerButton.State = state;
+        _connectionStateIndicator.State = state;
+        _timerLabel.Visible = state == ConnectionVisualState.Connected;
+
+        _statusLabel.Text = state switch
+        {
+            ConnectionVisualState.Connecting => T("status.connecting"),
+            ConnectionVisualState.Connected => T("status.connected"),
+            ConnectionVisualState.Disconnecting => T("status.disconnecting"),
+            ConnectionVisualState.Failed => T("status.failed"),
+            _ => T("status.disconnected")
+        };
+        _statusLabel.ForeColor = state switch
+        {
+            ConnectionVisualState.Connected => Color.FromArgb(218, 218, 224),
+            ConnectionVisualState.Connecting or ConnectionVisualState.Disconnecting => Color.FromArgb(226, 222, 255),
+            ConnectionVisualState.Failed => Color.FromArgb(255, 156, 166),
+            _ => Color.FromArgb(188, 188, 196)
+        };
+    }
+
+    private async Task ShowConnectionFailedAsync()
+    {
+        SetConnectionVisualState(ConnectionVisualState.Failed);
+        await Task.Delay(1000);
+        if (!_connectionTransitionInProgress || !IsConnectionActive())
+        {
+            SetDisconnected();
+        }
+    }
+
     private void SetConnected()
     {
         _connectedAt = _state.ActiveConnectionStartedUtc is { } startedUtc
             ? startedUtc.ToLocalTime()
             : DateTime.Now;
         _connectTimer.Start();
-        _statusLabel.Text = T("status.connected");
-        _statusLabel.ForeColor = Color.FromArgb(218, 218, 224);
-        _timerLabel.Visible = true;
-        _powerButton.IsOn = true;
-        _powerButton.Invalidate();
+        SetConnectionVisualState(ConnectionVisualState.Connected);
         UpdateConnectionTimer();
     }
 
@@ -4707,12 +5492,8 @@ del "%~f0"
         _state.ActiveConnectionStartedUtc = null;
         SaveState();
         _connectTimer.Stop();
-        _statusLabel.Text = T("status.disconnected");
-        _statusLabel.ForeColor = Color.FromArgb(188, 188, 196);
         _timerLabel.Text = "00:00:00";
-        _timerLabel.Visible = false;
-        _powerButton.IsOn = false;
-        _powerButton.Invalidate();
+        SetConnectionVisualState(ConnectionVisualState.Disconnected);
     }
 
     private void UpdateConnectionTimer()
@@ -4926,31 +5707,15 @@ del "%~f0"
             var profile = SelectedProfile();
             if (profile is not null)
             {
-                try
-                {
-                    var latency = await MeasureServerLatencyAsync(profile, token);
-                    if (token.IsCancellationRequested || version != _statusProbeVersion) return;
-                    _lastLatencyMs = latency;
-                    _pingValue.Text = latency is null ? "-" : $"{latency.Value} ms";
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                catch
-                {
-                    if (token.IsCancellationRequested || version != _statusProbeVersion) return;
-                    _lastLatencyMs = null;
-                    _pingValue.Text = "-";
-                }
+                var latency = _latencyMonitor.SnapshotFor(profile)?.Current;
+                _lastLatencyMs = latency;
+                _pingValue.Text = latency is null ? "-" : $"{latency.Value} ms";
             }
 
             _healthyServiceCount = 0;
             _checkedServiceCount = 0;
-            await Task.WhenAll(
-                UpdateServiceStatusAsync("Discord", "https://discord.com", token),
-                UpdateServiceStatusAsync("YouTube", "https://www.youtube.com", token),
-                UpdateServiceStatusAsync("Telegram", "https://telegram.org", token));
+            var targets = _state.ServiceMonitorTargets.Take(3).ToArray();
+            await Task.WhenAll(targets.Select(target => UpdateServiceStatusAsync(target, token)));
             if (token.IsCancellationRequested || version != _statusProbeVersion) return;
             UpdateConnectionQuality(profile);
         }
@@ -4962,24 +5727,7 @@ del "%~f0"
 
     private static async Task<long?> MeasureServerLatencyAsync(ProxyProfile profile, CancellationToken cancellationToken = default)
     {
-        if (profile.Protocol == ProxyProtocol.WireGuard)
-        {
-            return await MeasureIcmpLatencyAsync(profile.Server, cancellationToken);
-        }
-
-        try
-        {
-            using var client = new System.Net.Sockets.TcpClient();
-            var sw = Stopwatch.StartNew();
-            await client.ConnectAsync(profile.Server, profile.Port).WaitAsync(TimeSpan.FromMilliseconds(1200), cancellationToken);
-            sw.Stop();
-            return Math.Max(1, sw.ElapsedMilliseconds);
-        }
-        catch
-        {
-            if (cancellationToken.IsCancellationRequested) throw;
-            return await MeasureIcmpLatencyAsync(profile.Server, cancellationToken);
-        }
+        return await LatencyMonitor.MeasureAsync(profile, cancellationToken);
     }
 
     private static async Task<long?> MeasureIcmpLatencyAsync(string host, CancellationToken cancellationToken = default)
@@ -4998,16 +5746,13 @@ del "%~f0"
         }
     }
 
-    private async Task UpdateServiceStatusAsync(string serviceName, string url, CancellationToken cancellationToken)
+    private async Task UpdateServiceStatusAsync(ServiceMonitorTarget target, CancellationToken cancellationToken)
     {
-        if (!_serviceStatusLabels.TryGetValue(serviceName, out var label)) return;
-
         try
         {
-            var ok = await ProbeServiceAsync(url, cancellationToken);
+            var ok = await ProbeServiceAsync(target.Url, cancellationToken);
             if (cancellationToken.IsCancellationRequested) return;
-            label.Text = ok ? "OK" : "!";
-            label.ForeColor = ok ? Color.FromArgb(92, 220, 148) : Color.FromArgb(255, 190, 92);
+            _serviceStatusStrip.SetStatus(target.Id, ok ? ServiceHealth.Available : ServiceHealth.Warning);
             _checkedServiceCount++;
             if (ok) _healthyServiceCount++;
         }
@@ -5017,8 +5762,7 @@ del "%~f0"
         catch
         {
             if (cancellationToken.IsCancellationRequested) return;
-            label.Text = "!";
-            label.ForeColor = Color.FromArgb(255, 116, 116);
+            _serviceStatusStrip.SetStatus(target.Id, ServiceHealth.Failed);
             _checkedServiceCount++;
         }
     }
@@ -5104,17 +5848,16 @@ del "%~f0"
     private void RefreshProfiles()
     {
         var source = _state.Profiles;
-
-        _profiles.DataSource = null;
-        _profiles.DataSource = source;
-        _profiles.DisplayMember = nameof(ProxyProfile.DisplayName);
-        var selected = source.FindIndex(x => x.Id == _state.SelectedProfileId);
-        if (selected >= 0) _profiles.SelectedIndex = selected;
         var hasProfiles = source.Count > 0;
-        _profiles.Visible = hasProfiles;
+        _serverTree.SetData(source, _state.Subscriptions, _state.SelectedProfileId, _latencyMonitor.Snapshot(), _subscriptionsRefreshing);
+        _serverCountLabel.Text = _state.Language == AppLanguage.Russian
+            ? $"{source.Count} протоколов · {_state.Subscriptions.Count} подписок"
+            : $"{source.Count} protocols · {_state.Subscriptions.Count} subscriptions";
+        _serverTree.Visible = hasProfiles;
         _emptyStatePanel.Visible = !hasProfiles;
         if (hasProfiles) HideInlineImport();
         QueueCountryLookups(source);
+        _latencyMonitor.SetProfiles(source, _state.SelectedProfileId);
     }
 
     private void QueueCountryLookups(IEnumerable<ProxyProfile> profiles)
@@ -5168,6 +5911,7 @@ del "%~f0"
             profile.CountryLookupUtc = DateTime.UtcNow;
             SaveState();
             _profiles.Invalidate();
+            _serverTree.Invalidate();
         }
         catch (Exception ex)
         {
@@ -5186,28 +5930,30 @@ del "%~f0"
         _selectedProtocol.Text = profile is null ? T("servers.add.subscription") : ProtocolLabel(profile);
         _selectedServer.Text = profile is null ? "" : $"{profile.Server}:{profile.Port}";
         _subscriptionUsageBar.SetProfile(profile);
+        _serverIdentity.SetProfile(profile);
+        _latencyChart.SetSnapshot(_latencyMonitor.SnapshotFor(profile));
         Invalidate(true);
+    }
+
+    private void RefreshLatencyUi()
+    {
+        var snapshots = _latencyMonitor.Snapshot();
+        _serverTree.UpdateLatencies(snapshots);
+        var selected = SelectedProfile();
+        var snapshot = _latencyMonitor.SnapshotFor(selected);
+        _latencyChart.SetSnapshot(snapshot);
+        _lastLatencyMs = snapshot?.Current;
+        _pingValue.Text = snapshot?.Current is { } latency ? $"{latency} ms" : "-";
+        UpdateConnectionQuality(selected);
     }
 
     private void SelectProfile(ProxyProfile? profile, bool save)
     {
-        if (profile is null) return;
+        if (profile is null || _profileDragSelectionChanging) return;
 
         _state.SelectedProfileId = profile.Id;
-        var selectedIndex = _state.Profiles.FindIndex(x => x.Id == profile.Id);
-        if (selectedIndex >= 0 && _profiles.SelectedIndex != selectedIndex)
-        {
-            _profileDragSelectionChanging = true;
-            try
-            {
-                _profiles.SelectedIndex = selectedIndex;
-            }
-            finally
-            {
-                _profileDragSelectionChanging = false;
-            }
-        }
-
+        _serverTree.SelectProfile(profile.Id);
+        _latencyMonitor.Select(profile.Id);
         RefreshMainPreview();
         _lastLatencyMs = null;
         _pingValue.Text = "...";
@@ -5259,7 +6005,67 @@ del "%~f0"
     private void ShowInlineImport()
     {
         SetServersExpanded(true);
-        using var dialog = BuildImportDialog(out var linksBox, out var wireGuardBox);
+        using var dialog = BuildImportDialog(out var nameBox, out var linksBox, out var wireGuardBox, out var previewLabel);
+        using var previewTimer = new System.Windows.Forms.Timer { Interval = 550 };
+        CancellationTokenSource? previewCts = null;
+        SubscriptionFetchResult? previewResult = null;
+        string? previewUrl = null;
+
+        async Task UpdatePreviewAsync()
+        {
+            previewCts?.Cancel();
+            previewCts?.Dispose();
+            previewCts = new CancellationTokenSource();
+            var token = previewCts.Token;
+            var text = linksBox.Text.Trim();
+            previewResult = null;
+            previewUrl = null;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                previewLabel.Text = _state.Language == AppLanguage.Russian
+                    ? "Вставьте ссылку, чтобы увидеть серверы"
+                    : "Paste a link to preview servers";
+                return;
+            }
+
+            try
+            {
+                if (LooksLikeSubscriptionUrl(text))
+                {
+                    previewLabel.Text = _state.Language == AppLanguage.Russian ? "Загрузка подписки..." : "Loading subscription...";
+                    var fetched = await SubscriptionService.FetchAsync(_httpClient, text, token);
+                    if (token.IsCancellationRequested) return;
+                    previewResult = fetched;
+                    previewUrl = text;
+                    if (!nameBox.Modified && string.IsNullOrWhiteSpace(nameBox.Text) && !string.IsNullOrWhiteSpace(fetched.SuggestedName))
+                        nameBox.PlaceholderText = fetched.SuggestedName;
+                    previewLabel.Text = SubscriptionPreviewText(fetched);
+                }
+                else
+                {
+                    var parsed = ProfileParser.ParseManyDetailed(text);
+                    previewLabel.Text = ProfilePreviewText(parsed.Profiles, parsed.RejectedCount);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                if (!token.IsCancellationRequested) previewLabel.Text = ex.Message;
+            }
+        }
+
+        previewTimer.Tick += async (_, _) =>
+        {
+            previewTimer.Stop();
+            await UpdatePreviewAsync();
+        };
+        linksBox.TextChanged += (_, _) =>
+        {
+            previewTimer.Stop();
+            previewTimer.Start();
+        };
         var addButton = dialog.Controls.Find("AddImportButton", true).OfType<Button>().FirstOrDefault();
         if (addButton is not null)
         {
@@ -5271,7 +6077,10 @@ del "%~f0"
 
                 if (!string.IsNullOrWhiteSpace(links))
                 {
-                    imported |= await ImportProfilesFromTextAsync(links);
+                    if (previewResult is not null && previewUrl == links)
+                        imported |= CommitSubscription(links, nameBox.Text, previewResult);
+                    else
+                        imported |= await ImportProfilesFromTextAsync(links, nameBox.Text);
                 }
 
                 if (!string.IsNullOrWhiteSpace(wireGuardConfig))
@@ -5288,6 +6097,27 @@ del "%~f0"
         }
 
         dialog.ShowDialog(this);
+        previewCts?.Cancel();
+        previewCts?.Dispose();
+    }
+
+    private static string SubscriptionPreviewText(SubscriptionFetchResult result)
+    {
+        return ProfilePreviewText(result.Profiles, result.RejectedCount);
+    }
+
+    private static string ProfilePreviewText(IReadOnlyList<ProxyProfile> profiles, int rejectedCount)
+    {
+        if (profiles.Count == 0) return rejectedCount > 0 ? $"Не поддерживается: {rejectedCount}" : "Серверы не найдены";
+        var lines = profiles
+            .GroupBy(ServerTreeView.EndpointKey, StringComparer.OrdinalIgnoreCase)
+            .Take(5)
+            .Select(group => $"{group.Key}  ·  {string.Join(", ", group.Select(x => x.Protocol).Distinct())}")
+            .ToList();
+        var remaining = profiles.Select(ServerTreeView.EndpointKey).Distinct(StringComparer.OrdinalIgnoreCase).Count() - lines.Count;
+        if (remaining > 0) lines.Add($"+ ещё {remaining}");
+        if (rejectedCount > 0) lines.Add($"Пропущено неподдерживаемых: {rejectedCount}");
+        return string.Join(Environment.NewLine, lines);
     }
 
     private void SetServersExpanded(bool expanded)
@@ -5314,7 +6144,7 @@ del "%~f0"
         _inlineImportPanel.Visible = false;
     }
 
-    private Form BuildImportDialog(out TextBox linksBox, out TextBox wireGuardBox)
+    private Form BuildImportDialog(out TextBox nameBox, out TextBox linksBox, out TextBox wireGuardBox, out Label previewLabel)
     {
         var dialog = new Form
         {
@@ -5322,7 +6152,7 @@ del "%~f0"
             FormBorderStyle = FormBorderStyle.None,
             StartPosition = FormStartPosition.Manual,
             Width = 560,
-            Height = 500,
+            Height = 640,
             BackColor = Bg,
             ShowInTaskbar = false,
             Font = Font,
@@ -5365,16 +6195,19 @@ del "%~f0"
         var layout = new TableLayoutPanel
         {
             Width = 486,
-            Height = 392,
+            Height = 524,
             BackColor = CardBg2,
             ColumnCount = 1,
-            RowCount = 5
+            RowCount = 8
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 106));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 212));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 160));
         viewport.Content = layout;
 
         layout.Controls.Add(new Label
@@ -5386,7 +6219,13 @@ del "%~f0"
             TextAlign = ContentAlignment.MiddleLeft
         }, 0, 0);
 
-        layout.Controls.Add(ImportFieldLabel(T("import.links")), 0, 1);
+        layout.Controls.Add(ImportFieldLabel(_state.Language == AppLanguage.Russian ? "Имя подписки" : "Subscription name"), 0, 1);
+        var nameInput = new TextBox { PlaceholderText = _state.Language == AppLanguage.Russian ? "Будет взято из 3x-ui" : "Will be read from 3x-ui" };
+        nameBox = nameInput;
+        StyleInput(nameBox);
+        layout.Controls.Add(ImportTextInput(nameBox, 44), 0, 2);
+
+        layout.Controls.Add(ImportFieldLabel(T("import.links")), 0, 3);
         var linksInput = new TextBox
         {
             Multiline = false,
@@ -5395,7 +6234,22 @@ del "%~f0"
         };
         linksBox = linksInput;
         StyleInput(linksBox);
-        layout.Controls.Add(ImportLinkTextInput(linksBox), 0, 2);
+        layout.Controls.Add(ImportLinkTextInput(linksBox), 0, 4);
+
+        var preview = new Label
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Color.FromArgb(31, 33, 37),
+            ForeColor = Color.FromArgb(188, 190, 200),
+            Font = new Font("Segoe UI", 8.8f),
+            Padding = new Padding(12, 8, 12, 8),
+            Text = _state.Language == AppLanguage.Russian
+                ? "Вставьте ссылку, чтобы увидеть серверы"
+                : "Paste a link to preview servers",
+            AutoEllipsis = true
+        };
+        previewLabel = preview;
+        layout.Controls.Add(preview, 0, 5);
 
         var wireGuardHeader = new TableLayoutPanel
         {
@@ -5409,7 +6263,7 @@ del "%~f0"
         wireGuardHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         wireGuardHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
         wireGuardHeader.Controls.Add(ImportFieldLabel("WireGuard config"), 0, 0);
-        layout.Controls.Add(wireGuardHeader, 0, 3);
+        layout.Controls.Add(wireGuardHeader, 0, 6);
         var wireGuardInput = new TextBox
         {
             Multiline = true,
@@ -5422,9 +6276,9 @@ del "%~f0"
         StyleInput(wireGuardBox);
         wireGuardHeader.Controls.Add(LightButton(T("common.file"), () => LoadWireGuardConfigFile(wireGuardInput), width: 86), 1, 0);
         EnableWireGuardConfigDrop(wireGuardBox);
-        var wireGuardWrap = ImportTextInput(wireGuardBox, height: 202);
+        var wireGuardWrap = ImportTextInput(wireGuardBox, height: 150);
         EnableWireGuardConfigDrop(wireGuardWrap, wireGuardBox);
-        layout.Controls.Add(wireGuardWrap, 0, 4);
+        layout.Controls.Add(wireGuardWrap, 0, 7);
 
         var actions = new FlowLayoutPanel
         {
@@ -5434,7 +6288,7 @@ del "%~f0"
             BackColor = CardBg2,
             Padding = new Padding(0, 6, 0, 0)
         };
-        var add = LightButton(T("servers.add"), () => { }, primary: true);
+        var add = LightButton(T("servers.add"), () => { }, primary: true, width: 108);
         add.Name = "AddImportButton";
         var cancel = LightButton(T("common.cancel"), () => dialog.Close());
         actions.Controls.Add(add);
@@ -5634,14 +6488,18 @@ del "%~f0"
                 ? JsonSerializer.Deserialize<AppState>(File.ReadAllText(path), JsonOptions()) ?? new AppState()
                 : new AppState();
             SeedDefaultRoutingSites(state);
+            NormalizeSubscriptions(state);
             NormalizeHappRoutingProfiles(state);
+            ServiceMonitorCatalog.NormalizeTargets(state);
             return state;
         }
         catch
         {
             var state = new AppState();
             SeedDefaultRoutingSites(state);
+            NormalizeSubscriptions(state);
             NormalizeHappRoutingProfiles(state);
+            ServiceMonitorCatalog.NormalizeTargets(state);
             return state;
         }
     }
@@ -5684,9 +6542,30 @@ del "%~f0"
         }
     }
 
+    private static void NormalizeSubscriptions(AppState state)
+    {
+        state.Subscriptions ??= [];
+        state.Profiles ??= [];
+        var validIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var subscription in state.Subscriptions)
+        {
+            if (string.IsNullOrWhiteSpace(subscription.Id)) subscription.Id = Guid.NewGuid().ToString("N");
+            if (string.IsNullOrWhiteSpace(subscription.Name))
+                subscription.Name = SubscriptionService.DefaultName(subscription.Url);
+            validIds.Add(subscription.Id);
+        }
+        foreach (var profile in state.Profiles)
+        {
+            if (!string.IsNullOrWhiteSpace(profile.SubscriptionId) && !validIds.Contains(profile.SubscriptionId))
+                profile.SubscriptionId = null;
+        }
+    }
+
     private void SaveState()
     {
+        NormalizeSubscriptions(_state);
         NormalizeHappRoutingProfiles(_state);
+        ServiceMonitorCatalog.NormalizeTargets(_state);
         File.WriteAllText(_statePath, JsonSerializer.Serialize(_state, JsonOptions()));
     }
 
@@ -5766,13 +6645,46 @@ del "%~f0"
 
     private void LogFromProcess(string? line)
     {
-        if (!string.IsNullOrWhiteSpace(line)) BeginInvoke(new Action(() => Log(line)));
+        if (string.IsNullOrWhiteSpace(line) || IsDisposed || Disposing) return;
+
+        _pendingProcessLogs.Enqueue(line);
+        if (IsHandleCreated && Interlocked.Exchange(ref _logFlushScheduled, 1) == 0)
+        {
+            BeginInvoke(new Action(() =>
+            {
+                if (!_logFlushTimer.Enabled) _logFlushTimer.Start();
+            }));
+        }
+    }
+
+    private void FlushPendingProcessLogs()
+    {
+        var flushed = 0;
+        while (flushed < 200 && _pendingProcessLogs.TryDequeue(out var line))
+        {
+            Log(line);
+            flushed++;
+        }
+
+        if (!_pendingProcessLogs.IsEmpty) return;
+
+        _logFlushTimer.Stop();
+        Interlocked.Exchange(ref _logFlushScheduled, 0);
+        if (!_pendingProcessLogs.IsEmpty && Interlocked.Exchange(ref _logFlushScheduled, 1) == 0)
+        {
+            _logFlushTimer.Start();
+        }
     }
 
     private void Log(string message)
     {
-        _logs.Add($"[{DateTime.Now:HH:mm:ss}] {message}");
+        var line = $"[{DateTime.Now:HH:mm:ss}] {AnsiEscapeRegex.Replace(message, "")}";
+        _logs.Add(line);
         if (_logs.Count > 600) _logs.RemoveRange(0, _logs.Count - 600);
+        if (_activeLogViewer is { IsDisposed: false } viewer)
+        {
+            viewer.Append(line);
+        }
     }
 
     private void DragWindow(object? sender, MouseEventArgs e)
@@ -5819,88 +6731,696 @@ del "%~f0"
         Logs
     }
 
+    private enum LogViewFilter
+    {
+        All,
+        Important,
+        Errors
+    }
+
     private sealed record SubscriptionInfo(long UploadBytes, long DownloadBytes, long TotalBytes, DateTime? ExpireUtc);
 
     private sealed record ReleaseInfo(string Tag, string ReleaseUrl, string? AssetName, string? AssetDownloadUrl);
 
-    private enum HappProfileActionKind
+    private sealed class LogViewer : Control
     {
-        Rename,
-        Delete,
-        Export
-    }
+        private readonly List<string> _allLines = [];
+        private readonly List<string> _visibleLines = [];
+        private readonly string _emptyText;
+        private readonly System.Windows.Forms.Timer _scrollTimer = new() { Interval = 15 };
+        private LogViewFilter _filter;
+        private string _searchText = "";
+        private int _scrollOffset;
+        private int _targetScrollOffset;
+        private bool _followTail = true;
+        private bool _draggingThumb;
+        private int _thumbDragOffset;
 
-    private sealed class HappProfileActionButton : Control
-    {
-        private readonly HappProfileActionKind _kind;
-        private readonly Action _action;
-        private bool _hover;
-
-        public HappProfileActionButton(HappProfileActionKind kind, Action action)
+        public LogViewFilter Filter
         {
-            _kind = kind;
-            _action = action;
-            Cursor = Cursors.Hand;
+            get => _filter;
+            set
+            {
+                if (_filter == value) return;
+                _filter = value;
+                RebuildVisibleLines();
+            }
+        }
+
+        public string SearchText
+        {
+            get => _searchText;
+            set
+            {
+                var normalized = value.Trim();
+                if (_searchText == normalized) return;
+                _searchText = normalized;
+                RebuildVisibleLines();
+            }
+        }
+
+        public LogViewer(string emptyText)
+        {
+            _emptyText = emptyText;
+            BackColor = Color.FromArgb(20, 22, 24);
+            ForeColor = Color.FromArgb(218, 220, 226);
+            TabStop = true;
             SetStyle(ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer |
                      ControlStyles.ResizeRedraw |
                      ControlStyles.UserPaint |
-                     ControlStyles.SupportsTransparentBackColor, true);
-            BackColor = Color.Transparent;
+                     ControlStyles.Selectable, true);
+            _scrollTimer.Tick += (_, _) => AnimateScroll();
+        }
+
+        public void ReplaceLogs(IEnumerable<string> lines)
+        {
+            _allLines.Clear();
+            _allLines.AddRange(lines.TakeLast(600));
+            RebuildVisibleLines();
+        }
+
+        public void Append(string line)
+        {
+            _allLines.Add(line);
+            if (_allLines.Count > 600)
+            {
+                var removed = _allLines[0];
+                _allLines.RemoveAt(0);
+                var visibleIndex = _visibleLines.IndexOf(removed);
+                if (visibleIndex >= 0) _visibleLines.RemoveAt(visibleIndex);
+            }
+
+            if (Matches(line))
+            {
+                _visibleLines.Add(line);
+            }
+
+            if (_followTail)
+            {
+                _targetScrollOffset = MaxScrollOffset();
+                _scrollTimer.Start();
+            }
+            Invalidate();
+        }
+
+        public string ExportText()
+        {
+            return string.Join(Environment.NewLine, _visibleLines);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            e.Graphics.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            e.Graphics.Clear(Parent?.BackColor ?? Bg);
+
+            var bounds = new Rectangle(1, 1, Math.Max(1, Width - 3), Math.Max(1, Height - 3));
+            using var path = RoundedRect(bounds, 8);
+            using var background = new SolidBrush(BackColor);
+            using var border = new Pen(Color.FromArgb(66, 69, 78), 1f);
+            e.Graphics.FillPath(background, path);
+            e.Graphics.DrawPath(border, path);
+
+            var state = e.Graphics.Save();
+            e.Graphics.SetClip(Rectangle.Inflate(bounds, -2, -2));
+            if (_visibleLines.Count == 0)
+            {
+                using var emptyFont = new Font("Segoe UI", 10f);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    _emptyText,
+                    emptyFont,
+                    bounds,
+                    Muted,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            }
+            else
+            {
+                DrawVisibleLines(e.Graphics, bounds);
+            }
+            e.Graphics.Restore(state);
+            DrawScrollBar(e.Graphics, bounds);
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            var direction = -Math.Sign(e.Delta);
+            _targetScrollOffset = Math.Clamp(
+                _targetScrollOffset + direction * LineHeight() * 4,
+                0,
+                MaxScrollOffset());
+            _followTail = _targetScrollOffset >= MaxScrollOffset() - 2;
+            _scrollTimer.Start();
+            base.OnMouseWheel(e);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            Focus();
+            var thumb = ThumbBounds();
+            if (thumb.Contains(e.Location))
+            {
+                _draggingThumb = true;
+                _thumbDragOffset = e.Y - thumb.Top;
+                Capture = true;
+            }
+            else if (ScrollTrackBounds().Contains(e.Location))
+            {
+                ScrollFromThumbPosition(e.Y - thumb.Height / 2);
+            }
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            if (_draggingThumb) ScrollFromThumbPosition(e.Y - _thumbDragOffset);
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            _draggingThumb = false;
+            Capture = false;
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            switch (e.KeyCode)
+            {
+                case Keys.Home:
+                    SetScrollTarget(0);
+                    e.Handled = true;
+                    break;
+                case Keys.End:
+                    SetScrollTarget(MaxScrollOffset());
+                    e.Handled = true;
+                    break;
+                case Keys.PageUp:
+                    SetScrollTarget(_targetScrollOffset - ClientSize.Height + LineHeight());
+                    e.Handled = true;
+                    break;
+                case Keys.PageDown:
+                    SetScrollTarget(_targetScrollOffset + ClientSize.Height - LineHeight());
+                    e.Handled = true;
+                    break;
+            }
+            base.OnKeyDown(e);
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            _scrollOffset = Math.Clamp(_scrollOffset, 0, MaxScrollOffset());
+            _targetScrollOffset = Math.Clamp(_targetScrollOffset, 0, MaxScrollOffset());
+            if (_followTail) _scrollOffset = _targetScrollOffset = MaxScrollOffset();
+            base.OnResize(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _scrollTimer.Dispose();
+            base.Dispose(disposing);
+        }
+
+        private void DrawVisibleLines(Graphics graphics, Rectangle bounds)
+        {
+            var lineHeight = LineHeight();
+            var first = Math.Max(0, (_scrollOffset - 10) / lineHeight);
+            var y = 10 + first * lineHeight - _scrollOffset;
+            var textRight = bounds.Right - (MaxScrollOffset() > 0 ? 18 : 8);
+            using var timestampFont = new Font("Consolas", Font.Size, FontStyle.Regular);
+
+            for (var index = first; index < _visibleLines.Count && y < bounds.Bottom; index++, y += lineHeight)
+            {
+                var line = _visibleLines[index];
+                var levelColor = LogColor(line);
+                using var marker = new SolidBrush(levelColor);
+                graphics.FillRectangle(marker, bounds.Left + 7, y + 5, 3, Math.Max(8, lineHeight - 10));
+
+                var timestamp = line.Length >= 10 ? line[..10] : "";
+                var message = line.Length >= 11 ? line[11..] : line;
+                TextRenderer.DrawText(
+                    graphics,
+                    timestamp,
+                    timestampFont,
+                    new Rectangle(bounds.Left + 16, y, 84, lineHeight),
+                    Color.FromArgb(126, 130, 142),
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                TextRenderer.DrawText(
+                    graphics,
+                    message,
+                    Font,
+                    new Rectangle(bounds.Left + 102, y, Math.Max(20, textRight - bounds.Left - 102), lineHeight),
+                    levelColor,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            }
+        }
+
+        private void DrawScrollBar(Graphics graphics, Rectangle bounds)
+        {
+            if (MaxScrollOffset() <= 0) return;
+            var track = ScrollTrackBounds();
+            using var trackBrush = new SolidBrush(Color.FromArgb(34, 37, 43));
+            using var thumbBrush = new SolidBrush(_draggingThumb
+                ? Color.FromArgb(150, 154, 170)
+                : Color.FromArgb(92, 96, 112));
+            graphics.FillRectangle(trackBrush, track);
+            var thumb = ThumbBounds();
+            using var thumbPath = RoundedRect(thumb, 3);
+            graphics.FillPath(thumbBrush, thumbPath);
+        }
+
+        private void RebuildVisibleLines()
+        {
+            _visibleLines.Clear();
+            _visibleLines.AddRange(_allLines.Where(Matches));
+            _followTail = true;
+            _scrollOffset = _targetScrollOffset = MaxScrollOffset();
+            Invalidate();
+        }
+
+        private bool Matches(string line)
+        {
+            if (!string.IsNullOrWhiteSpace(_searchText) &&
+                !line.Contains(_searchText, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return _filter switch
+            {
+                LogViewFilter.Errors => IsError(line),
+                LogViewFilter.Important => IsError(line) ||
+                                           line.Contains("WARN", StringComparison.OrdinalIgnoreCase) ||
+                                           line.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
+                                           line.Contains("retry", StringComparison.OrdinalIgnoreCase),
+                _ => true
+            };
+        }
+
+        private static bool IsError(string line)
+        {
+            if (IsExpectedConnectionClose(line))
+            {
+                return false;
+            }
+
+            return line.Contains("ERROR", StringComparison.OrdinalIgnoreCase) ||
+                   line.Contains(" failed", StringComparison.OrdinalIgnoreCase) ||
+                   line.Contains("cannot ", StringComparison.OrdinalIgnoreCase) ||
+                   line.Contains("rejected", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static Color LogColor(string line)
+        {
+            if (IsExpectedConnectionClose(line)) return Color.FromArgb(150, 154, 166);
+            if (IsError(line)) return Color.FromArgb(255, 135, 145);
+            if (line.Contains("WARN", StringComparison.OrdinalIgnoreCase) ||
+                line.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
+                line.Contains("retry", StringComparison.OrdinalIgnoreCase))
+            {
+                return Color.FromArgb(245, 196, 112);
+            }
+            if (line.Contains("started", StringComparison.OrdinalIgnoreCase) ||
+                line.Contains("enabled", StringComparison.OrdinalIgnoreCase) ||
+                line.Contains("written", StringComparison.OrdinalIgnoreCase))
+            {
+                return Color.FromArgb(139, 214, 170);
+            }
+            return Color.FromArgb(210, 212, 220);
+        }
+
+        private static bool IsExpectedConnectionClose(string line)
+        {
+            return line.Contains("connection upload closed", StringComparison.OrdinalIgnoreCase) &&
+                   (line.Contains("forcibly closed by the remote host", StringComparison.OrdinalIgnoreCase) ||
+                    line.Contains("use of closed network connection", StringComparison.OrdinalIgnoreCase) ||
+                    line.Contains("connection reset by peer", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private int LineHeight()
+        {
+            return Math.Max(22, Font.Height + 7);
+        }
+
+        private int MaxScrollOffset()
+        {
+            return Math.Max(0, 20 + _visibleLines.Count * LineHeight() - Math.Max(1, ClientSize.Height));
+        }
+
+        private Rectangle ScrollTrackBounds()
+        {
+            return new Rectangle(Math.Max(0, Width - 10), 8, 4, Math.Max(1, Height - 16));
+        }
+
+        private Rectangle ThumbBounds()
+        {
+            var track = ScrollTrackBounds();
+            var contentHeight = Math.Max(ClientSize.Height, 20 + _visibleLines.Count * LineHeight());
+            var thumbHeight = Math.Max(28, (int)Math.Round(track.Height * ClientSize.Height / (double)contentHeight));
+            var available = Math.Max(1, track.Height - thumbHeight);
+            var top = track.Top + (MaxScrollOffset() == 0
+                ? 0
+                : (int)Math.Round(available * _scrollOffset / (double)MaxScrollOffset()));
+            return new Rectangle(track.Left - 1, top, 6, thumbHeight);
+        }
+
+        private void ScrollFromThumbPosition(int top)
+        {
+            var track = ScrollTrackBounds();
+            var thumb = ThumbBounds();
+            var available = Math.Max(1, track.Height - thumb.Height);
+            var relative = Math.Clamp(top - track.Top, 0, available);
+            _scrollOffset = _targetScrollOffset = (int)Math.Round(relative / (double)available * MaxScrollOffset());
+            _followTail = _scrollOffset >= MaxScrollOffset() - 2;
+            _scrollTimer.Stop();
+            Invalidate();
+        }
+
+        private void SetScrollTarget(int value)
+        {
+            _targetScrollOffset = Math.Clamp(value, 0, MaxScrollOffset());
+            _followTail = _targetScrollOffset >= MaxScrollOffset() - 2;
+            _scrollTimer.Start();
+        }
+
+        private void AnimateScroll()
+        {
+            var delta = _targetScrollOffset - _scrollOffset;
+            if (Math.Abs(delta) <= 1)
+            {
+                _scrollOffset = _targetScrollOffset;
+                _scrollTimer.Stop();
+            }
+            else
+            {
+                _scrollOffset += (int)Math.Round(delta * 0.28);
+            }
+            Invalidate();
+        }
+
+        private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
+        {
+            var path = new GraphicsPath();
+            var diameter = radius * 2;
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    private sealed class HappRoutingProfileCard : Control
+    {
+        private const float AnimationStep = 0.2f;
+        private readonly Action _select;
+        private readonly Action _rename;
+        private readonly Action _delete;
+        private readonly Action _copy;
+        private readonly string[] _actionTooltips;
+        private readonly ToolTip _toolTip = new();
+        private readonly System.Windows.Forms.Timer _animationTimer = new() { Interval = 15 };
+        private float _hoverProgress;
+        private float _hoverTarget;
+        private float _selectedProgress;
+        private float _selectedTarget;
+        private int _hoveredAction = -1;
+        private bool _selected;
+
+        public string ProfileId { get; }
+        public string ProfileName { get; }
+        public string Subtitle { get; }
+
+        public bool Selected
+        {
+            get => _selected;
+            set
+            {
+                if (_selected == value) return;
+                _selected = value;
+                _selectedTarget = value ? 1f : 0f;
+                _animationTimer.Start();
+                Invalidate();
+            }
+        }
+
+        public HappRoutingProfileCard(
+            string profileId,
+            string profileName,
+            string subtitle,
+            bool selected,
+            Action select,
+            Action rename,
+            Action delete,
+            Action copy,
+            string renameTooltip,
+            string copyTooltip,
+            string deleteTooltip)
+        {
+            ProfileId = profileId;
+            ProfileName = profileName;
+            Subtitle = subtitle;
+            _select = select;
+            _rename = rename;
+            _delete = delete;
+            _copy = copy;
+            _actionTooltips = [renameTooltip, copyTooltip, deleteTooltip];
+            _selected = selected;
+            _selectedProgress = selected ? 1f : 0f;
+            _selectedTarget = _selectedProgress;
+            Cursor = Cursors.Hand;
+            TabStop = true;
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw |
+                     ControlStyles.UserPaint, true);
+            _animationTimer.Tick += (_, _) => Animate();
         }
 
         protected override void OnMouseEnter(EventArgs e)
         {
-            _hover = true;
-            Invalidate();
+            _hoverTarget = 1f;
+            _animationTimer.Start();
             base.OnMouseEnter(e);
         }
 
         protected override void OnMouseLeave(EventArgs e)
         {
-            _hover = false;
-            Invalidate();
+            _hoverTarget = 0f;
+            _hoveredAction = -1;
+            _toolTip.SetToolTip(this, null);
+            _animationTimer.Start();
             base.OnMouseLeave(e);
         }
 
-        protected override void OnClick(EventArgs e)
+        protected override void OnMouseMove(MouseEventArgs e)
         {
-            _action();
-            base.OnClick(e);
+            var action = HitAction(e.Location);
+            if (_hoveredAction != action)
+            {
+                _hoveredAction = action;
+                _toolTip.SetToolTip(this, action >= 0 ? _actionTooltips[action] : null);
+                Invalidate();
+            }
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left)
+            {
+                base.OnMouseClick(e);
+                return;
+            }
+
+            switch (HitAction(e.Location))
+            {
+                case 0:
+                    _rename();
+                    break;
+                case 1:
+                    _copy();
+                    break;
+                case 2:
+                    _delete();
+                    break;
+                default:
+                    _select();
+                    break;
+            }
+            base.OnMouseClick(e);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode is Keys.Enter or Keys.Space)
+            {
+                _select();
+                e.Handled = true;
+            }
+            base.OnKeyDown(e);
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            base.OnPaint(e);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            var color = _hover ? Color.White : Color.FromArgb(196, 198, 206);
-            using var pen = new Pen(color, 1.8f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
-            using var brush = new SolidBrush(color);
-            var cx = Width / 2f;
-            var cy = Height / 2f;
+            e.Graphics.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            e.Graphics.Clear(Parent?.BackColor ?? CardBg2);
 
-            switch (_kind)
+            var bounds = new Rectangle(1, 1, Math.Max(1, Width - 3), Math.Max(1, Height - 3));
+            var activeAmount = _selectedProgress;
+            var hoverAmount = _hoverProgress;
+            var background = Blend(CardBg2, Color.FromArgb(49, 51, 58), Math.Max(hoverAmount, activeAmount * 0.7f));
+            var border = Blend(Color.FromArgb(70, 72, 80), Accent, activeAmount);
+            using var path = RoundedRect(bounds, 7);
+            using var fill = new SolidBrush(background);
+            using var borderPen = new Pen(border, 1.2f);
+            e.Graphics.FillPath(fill, path);
+            e.Graphics.DrawPath(borderPen, path);
+
+            var cy = Height / 2f;
+            using var radioPen = new Pen(Blend(Color.FromArgb(120, 123, 136), Accent, activeAmount), 1.8f);
+            e.Graphics.DrawEllipse(radioPen, 17, cy - 8, 16, 16);
+            if (activeAmount > 0.02f)
             {
-                case HappProfileActionKind.Rename:
-                    e.Graphics.DrawLine(pen, cx - 6, cy + 5, cx + 5, cy - 6);
-                    e.Graphics.DrawLine(pen, cx + 3, cy - 8, cx + 7, cy - 4);
-                    e.Graphics.DrawLine(pen, cx - 7, cy + 7, cx - 2, cy + 6);
+                var size = 8f * activeAmount;
+                using var radioFill = new SolidBrush(Color.FromArgb((int)(255 * activeAmount), Accent));
+                e.Graphics.FillEllipse(radioFill, 25f - size / 2f, cy - size / 2f, size, size);
+            }
+
+            var actionStart = Math.Max(150, Width - 112);
+            var textWidth = Math.Max(40, actionStart - 52);
+            using var nameFont = new Font("Segoe UI", 10f, _selected ? FontStyle.Bold : FontStyle.Regular);
+            using var subtitleFont = new Font("Segoe UI", 8.5f);
+            TextRenderer.DrawText(
+                e.Graphics,
+                ProfileName,
+                nameFont,
+                new Rectangle(44, 9, textWidth, 22),
+                Blend(TextColor, Color.White, activeAmount),
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+            TextRenderer.DrawText(
+                e.Graphics,
+                Subtitle,
+                subtitleFont,
+                new Rectangle(44, 31, textWidth, 18),
+                Blend(Muted, Color.FromArgb(190, 184, 255), activeAmount),
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+
+            var iconOpacity = Math.Max(0.36f * activeAmount, hoverAmount);
+            for (var i = 0; i < 3; i++)
+            {
+                DrawActionIcon(e.Graphics, i, ActionBounds(i), iconOpacity, _hoveredAction == i);
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _animationTimer.Dispose();
+                _toolTip.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        private Rectangle ActionBounds(int index)
+        {
+            return new Rectangle(Width - 108 + index * 34, (Height - 34) / 2, 34, 34);
+        }
+
+        private int HitAction(Point point)
+        {
+            for (var i = 0; i < 3; i++)
+            {
+                if (ActionBounds(i).Contains(point)) return i;
+            }
+            return -1;
+        }
+
+        private void Animate()
+        {
+            _hoverProgress = Approach(_hoverProgress, _hoverTarget);
+            _selectedProgress = Approach(_selectedProgress, _selectedTarget);
+            if (_hoverProgress == _hoverTarget && _selectedProgress == _selectedTarget)
+            {
+                _animationTimer.Stop();
+            }
+            Invalidate();
+        }
+
+        private static float Approach(float current, float target)
+        {
+            var next = current + (target - current) * AnimationStep;
+            return Math.Abs(target - next) < 0.01f ? target : next;
+        }
+
+        private static void DrawActionIcon(Graphics graphics, int action, Rectangle bounds, float opacity, bool hovered)
+        {
+            var alpha = (int)(255 * Math.Max(opacity, hovered ? 1f : 0f));
+            if (alpha <= 2) return;
+
+            var color = action == 2 && hovered
+                ? Color.FromArgb(alpha, 255, 122, 132)
+                : Color.FromArgb(alpha, 210, 212, 222);
+            using var pen = new Pen(color, 1.7f)
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round
+            };
+            var cx = bounds.Left + bounds.Width / 2f;
+            var cy = bounds.Top + bounds.Height / 2f;
+            if (hovered)
+            {
+                using var hoverBrush = new SolidBrush(Color.FromArgb(28, color));
+                graphics.FillEllipse(hoverBrush, bounds);
+            }
+
+            switch (action)
+            {
+                case 0:
+                    graphics.DrawLine(pen, cx - 5, cy + 5, cx + 5, cy - 5);
+                    graphics.DrawLine(pen, cx + 3, cy - 7, cx + 7, cy - 3);
+                    graphics.DrawLine(pen, cx - 6, cy + 7, cx - 2, cy + 6);
                     break;
-                case HappProfileActionKind.Delete:
-                    e.Graphics.DrawLine(pen, cx - 7, cy - 6, cx + 7, cy - 6);
-                    e.Graphics.DrawLine(pen, cx - 4, cy - 9, cx + 4, cy - 9);
-                    e.Graphics.DrawRectangle(pen, cx - 6, cy - 3, 12, 12);
-                    e.Graphics.DrawLine(pen, cx - 2, cy, cx - 2, cy + 6);
-                    e.Graphics.DrawLine(pen, cx + 2, cy, cx + 2, cy + 6);
+                case 1:
+                    graphics.DrawRectangle(pen, cx - 6, cy - 7, 11, 11);
+                    graphics.DrawRectangle(pen, cx - 3, cy - 4, 11, 11);
                     break;
-                case HappProfileActionKind.Export:
-                    e.Graphics.DrawRectangle(pen, cx - 7, cy - 2, 14, 10);
-                    e.Graphics.DrawLine(pen, cx, cy - 9, cx, cy + 3);
-                    e.Graphics.DrawLine(pen, cx, cy - 9, cx - 4, cy - 5);
-                    e.Graphics.DrawLine(pen, cx, cy - 9, cx + 4, cy - 5);
+                case 2:
+                    graphics.DrawLine(pen, cx - 6, cy - 5, cx + 6, cy - 5);
+                    graphics.DrawLine(pen, cx - 3, cy - 8, cx + 3, cy - 8);
+                    graphics.DrawRectangle(pen, cx - 5, cy - 2, 10, 10);
                     break;
             }
+        }
+
+        private static Color Blend(Color from, Color to, float amount)
+        {
+            amount = Math.Clamp(amount, 0f, 1f);
+            return Color.FromArgb(
+                (int)(from.A + (to.A - from.A) * amount),
+                (int)(from.R + (to.R - from.R) * amount),
+                (int)(from.G + (to.G - from.G) * amount),
+                (int)(from.B + (to.B - from.B) * amount));
+        }
+
+        private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
+        {
+            var path = new GraphicsPath();
+            var diameter = radius * 2;
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+            path.CloseFigure();
+            return path;
         }
     }
 
@@ -8038,7 +9558,7 @@ del "%~f0"
 
     private sealed class SubscriptionUsageBar : Control
     {
-        private readonly System.Windows.Forms.Timer _animationTimer = new() { Interval = 15 };
+        private readonly Func<bool> _animationFrame;
         private ProxyProfile? _profile;
         private float _displayRatio;
         private float _targetRatio;
@@ -8051,7 +9571,7 @@ del "%~f0"
                      ControlStyles.UserPaint |
                      ControlStyles.SupportsTransparentBackColor, true);
             BackColor = Color.Transparent;
-            _animationTimer.Tick += (_, _) => Animate();
+            _animationFrame = Animate;
         }
 
         public void SetProfile(ProxyProfile? profile)
@@ -8061,7 +9581,7 @@ del "%~f0"
             _targetRatio = _profile is null ? 0f : SubscriptionRatio(_profile);
             if (Math.Abs(_displayRatio - _targetRatio) > 0.001f)
             {
-                _animationTimer.Start();
+                UiAnimationClock.Start(_animationFrame);
             }
             Invalidate();
         }
@@ -8109,15 +9629,21 @@ del "%~f0"
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
         }
 
-        private void Animate()
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) UiAnimationClock.Stop(_animationFrame);
+            base.Dispose(disposing);
+        }
+
+        private bool Animate()
         {
             _displayRatio += (_targetRatio - _displayRatio) * 0.22f;
             if (Math.Abs(_targetRatio - _displayRatio) < 0.003f)
             {
                 _displayRatio = _targetRatio;
-                _animationTimer.Stop();
             }
             Invalidate();
+            return Math.Abs(_targetRatio - _displayRatio) >= 0.003f;
         }
 
         private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
@@ -8135,9 +9661,13 @@ del "%~f0"
 
     private sealed class ModeSwitchControl : Control
     {
-        private readonly System.Windows.Forms.Timer _animationTimer = new() { Interval = 15 };
+        private const double AnimationDurationMs = 190;
+        private readonly Func<bool> _animationFrame;
         private float _thumbPosition;
         private float _targetPosition;
+        private float _animationStartPosition;
+        private long _animationStartedAt;
+        private int _modeChangeVersion;
         private bool _hoverProxy;
         private bool _hoverTun;
         private bool _isTun;
@@ -8151,11 +9681,15 @@ del "%~f0"
             get => _isTun;
             set
             {
+                var target = value ? 1f : 0f;
+                if (_isTun == value && Math.Abs(_targetPosition - target) < 0.001f) return;
                 _isTun = value;
-                _targetPosition = value ? 1f : 0f;
+                _animationStartPosition = _thumbPosition;
+                _targetPosition = target;
+                _animationStartedAt = Stopwatch.GetTimestamp();
                 if (Math.Abs(_thumbPosition - _targetPosition) > 0.001f)
                 {
-                    _animationTimer.Start();
+                    UiAnimationClock.Start(_animationFrame);
                 }
                 Invalidate();
             }
@@ -8167,10 +9701,20 @@ del "%~f0"
                      ControlStyles.OptimizedDoubleBuffer |
                      ControlStyles.ResizeRedraw |
                      ControlStyles.UserPaint |
-                     ControlStyles.SupportsTransparentBackColor, true);
-            BackColor = Color.Transparent;
+                     ControlStyles.Opaque, true);
+            BackColor = Color.FromArgb(29, 31, 37);
             Cursor = Cursors.Hand;
-            _animationTimer.Tick += (_, _) => Animate();
+            _animationFrame = Animate;
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (Width < 2 || Height < 2) return;
+            using var path = RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), 8);
+            var previousRegion = Region;
+            Region = new Region(path);
+            previousRegion?.Dispose();
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -8199,7 +9743,7 @@ del "%~f0"
                 if (nextTun != _isTun)
                 {
                     IsTun = nextTun;
-                    ModeChanged?.Invoke(this, nextTun);
+                    QueueModeChanged(nextTun);
                 }
             }
             base.OnMouseDown(e);
@@ -8210,12 +9754,12 @@ del "%~f0"
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            g.Clear(Parent?.BackColor ?? Bg);
+            g.Clear(BackColor);
 
             var outer = new Rectangle(0, 0, Width - 1, Height - 1);
             using var outerPath = RoundedRect(outer, 8);
-            using var outerFill = new SolidBrush(Color.FromArgb(18, 18, 18));
-            using var outerBorder = new Pen(Color.FromArgb(38, 40, 46), 1f);
+            using var outerFill = new SolidBrush(Color.FromArgb(29, 31, 37));
+            using var outerBorder = new Pen(Color.FromArgb(62, 65, 75), 1f);
             g.FillPath(outerFill, outerPath);
             g.DrawPath(outerBorder, outerPath);
 
@@ -8226,33 +9770,51 @@ del "%~f0"
             using var thumbPath = RoundedRect(Rectangle.Round(thumb), 7);
             using var thumbBrush = new LinearGradientBrush(
                 thumb,
-                Color.FromArgb(126, 106, 255),
-                Color.FromArgb(75, 165, 255),
-                LinearGradientMode.Horizontal);
-            using var glow = new SolidBrush(Color.FromArgb(38, Accent));
-            g.FillPath(glow, RoundedRect(new Rectangle((int)thumb.X, (int)thumb.Y + 2, (int)thumb.Width, (int)thumb.Height), 7));
+                Color.FromArgb(132, 112, 255),
+                Color.FromArgb(104, 91, 223),
+                LinearGradientMode.Vertical);
+            using var glow = new SolidBrush(Color.FromArgb(30, Accent));
+            using var glowPath = RoundedRect(new Rectangle((int)thumb.X, (int)thumb.Y + 2, (int)thumb.Width, (int)thumb.Height), 7);
+            g.FillPath(glow, glowPath);
             g.FillPath(thumbBrush, thumbPath);
 
             var proxyRect = new Rectangle(0, 0, Width / 2, Height);
             var tunRect = new Rectangle(Width / 2, 0, Width - Width / 2, Height);
-            DrawLabel(g, ProxyText, proxyRect, !_isTun, _hoverProxy);
-            DrawLabel(g, TunText, tunRect, _isTun, _hoverTun);
+            DrawLabel(g, ProxyText, proxyRect, 1f - _thumbPosition, _hoverProxy);
+            DrawLabel(g, TunText, tunRect, _thumbPosition, _hoverTun);
         }
 
-        private void Animate()
+        protected override void Dispose(bool disposing)
         {
-            _thumbPosition += (_targetPosition - _thumbPosition) * 0.24f;
-            if (Math.Abs(_targetPosition - _thumbPosition) < 0.01f)
-            {
-                _thumbPosition = _targetPosition;
-                _animationTimer.Stop();
-            }
+            if (disposing) UiAnimationClock.Stop(_animationFrame);
+            base.Dispose(disposing);
+        }
+
+        private bool Animate()
+        {
+            var elapsed = Stopwatch.GetElapsedTime(_animationStartedAt).TotalMilliseconds;
+            var progress = (float)Math.Clamp(elapsed / AnimationDurationMs, 0d, 1d);
+            var eased = 1f - MathF.Pow(1f - progress, 3f);
+            _thumbPosition = _animationStartPosition + (_targetPosition - _animationStartPosition) * eased;
+            if (progress >= 1f) _thumbPosition = _targetPosition;
             Invalidate();
+            return progress < 1f;
         }
 
-        private static void DrawLabel(Graphics g, string text, Rectangle bounds, bool active, bool hover)
+        private async void QueueModeChanged(bool tunEnabled)
         {
-            var color = active ? Color.White : hover ? Color.FromArgb(220, 224, 235) : Color.FromArgb(178, 182, 194);
+            var version = ++_modeChangeVersion;
+            await Task.Delay((int)AnimationDurationMs + 20);
+            if (IsDisposed || version != _modeChangeVersion || _isTun != tunEnabled) return;
+            ModeChanged?.Invoke(this, tunEnabled);
+        }
+
+        private static void DrawLabel(Graphics g, string text, Rectangle bounds, float activity, bool hover)
+        {
+            activity = Math.Clamp(activity, 0f, 1f);
+            var eased = activity * activity * (3f - 2f * activity);
+            var inactive = hover ? Color.FromArgb(207, 210, 221) : Color.FromArgb(164, 168, 181);
+            var color = Blend(inactive, Color.White, eased);
             using var font = new Font("Segoe UI", 10f, FontStyle.Bold);
             TextRenderer.DrawText(
                 g,
@@ -8262,6 +9824,11 @@ del "%~f0"
                 color,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
         }
+
+        private static Color Blend(Color from, Color to, float amount) => Color.FromArgb(
+            (int)Math.Round(from.R + (to.R - from.R) * amount),
+            (int)Math.Round(from.G + (to.G - from.G) * amount),
+            (int)Math.Round(from.B + (to.B - from.B) * amount));
 
         private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
         {
@@ -8276,32 +9843,33 @@ del "%~f0"
         }
     }
 
-    private sealed class ToggleButton : Control
+    private sealed class ConnectionOrbButton : Control
     {
-        private readonly System.Windows.Forms.Timer _animationTimer = new() { Interval = 15 };
+        private readonly Func<bool> _animationFrame;
         private bool _hover;
         private bool _pressed;
-        private bool _isOn;
+        private ConnectionVisualState _state;
         private float _thumbPosition;
         private float _targetPosition;
 
-        public bool IsOn
+        public ConnectionVisualState State
         {
-            get => _isOn;
+            get => _state;
             set
             {
-                if (_isOn == value && Math.Abs(_targetPosition - (value ? 1f : 0f)) < 0.001f) return;
-                _isOn = value;
-                _targetPosition = value ? 1f : 0f;
+                var target = value == ConnectionVisualState.Connected ? 1f : 0f;
+                if (_state == value && Math.Abs(_targetPosition - target) < 0.001f) return;
+                _state = value;
+                _targetPosition = target;
                 if (Math.Abs(_thumbPosition - _targetPosition) > 0.001f)
                 {
-                    _animationTimer.Start();
+                    UiAnimationClock.Start(_animationFrame);
                 }
                 Invalidate();
             }
         }
 
-        public ToggleButton()
+        public ConnectionOrbButton()
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer |
@@ -8309,7 +9877,7 @@ del "%~f0"
                      ControlStyles.UserPaint |
                      ControlStyles.SupportsTransparentBackColor, true);
             BackColor = Color.Transparent;
-            _animationTimer.Tick += (_, _) => Animate();
+            _animationFrame = Animate;
         }
 
         protected override void OnMouseEnter(EventArgs e)
@@ -8346,66 +9914,49 @@ del "%~f0"
             base.OnPaint(e);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            var rect = new Rectangle(3, 5, Math.Max(1, Width - 6), Math.Max(1, Height - 10));
-            var active = _isOn;
-            using var path = RoundedRect(rect, rect.Height / 2);
-            using var shadow = new SolidBrush(Color.FromArgb(55, Color.Black));
-            e.Graphics.FillPath(shadow, RoundedRect(new Rectangle(rect.X, rect.Y + 3, rect.Width, rect.Height), rect.Height / 2));
+            var size = Math.Max(1, Math.Min(Width, Height) - 6);
+            var rect = new Rectangle((Width - size) / 2, (Height - size) / 2 + (_pressed ? 1 : 0), size, size);
+            var active = _thumbPosition;
+            var baseColor = Blend(Color.FromArgb(38, 41, 49), Color.FromArgb(119, 99, 248), active);
+            using var shadow = new SolidBrush(Color.FromArgb(65, Color.Black));
+            e.Graphics.FillEllipse(shadow, rect.X, rect.Y + 3, rect.Width, rect.Height);
+            using var fill = new SolidBrush(baseColor);
+            e.Graphics.FillEllipse(fill, rect);
+            using var border = new Pen(_hover ? Color.FromArgb(204, 198, 255) : Blend(Color.FromArgb(79, 83, 96), Color.FromArgb(170, 158, 255), active), 1.4f);
+            e.Graphics.DrawEllipse(border, rect);
 
-            using var bg = new LinearGradientBrush(
-                rect,
-                active ? Color.FromArgb(126, 106, 255) : Color.FromArgb(43, 45, 55),
-                active ? Color.FromArgb(96, 125, 255) : Color.FromArgb(28, 30, 38),
-                LinearGradientMode.Horizontal);
-            e.Graphics.FillPath(bg, path);
-
-            using var border = new Pen(active ? Color.FromArgb(172, 160, 255) : Color.FromArgb(82, 84, 98), _hover ? 1.6f : 1.2f)
+            var cx = rect.Left + rect.Width / 2f;
+            var cy = rect.Top + rect.Height / 2f;
+            using var icon = new Pen(Color.White, 2.2f)
             {
-                Alignment = PenAlignment.Inset
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round
             };
-            e.Graphics.DrawPath(border, path);
-
-            var knobSize = rect.Height - 10;
-            var leftX = rect.Left + 6;
-            var rightX = rect.Right - knobSize - 6;
-            var knobX = (int)Math.Round(leftX + (rightX - leftX) * _thumbPosition);
-            if (_pressed) knobX += active ? -2 : 2;
-            var knob = new Rectangle(knobX, rect.Top + 5, knobSize, knobSize);
-            using var knobBrush = new SolidBrush(Color.White);
-            using var knobShadow = new SolidBrush(Color.FromArgb(70, Color.Black));
-            e.Graphics.FillEllipse(knobShadow, knob.X, knob.Y + 2, knob.Width, knob.Height);
-            e.Graphics.FillEllipse(knobBrush, knob);
-
-            var text = active ? "ON" : "OFF";
-            using var font = new Font("Segoe UI", 12f, FontStyle.Bold);
-            var textRect = active
-                ? new Rectangle(rect.Left + 18, rect.Top, rect.Width - knobSize - 26, rect.Height)
-                : new Rectangle(rect.Left + knobSize + 16, rect.Top, rect.Width - knobSize - 24, rect.Height);
-            TextRenderer.DrawText(e.Graphics, text, font, textRect, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            e.Graphics.DrawArc(icon, cx - 8, cy - 7, 16, 16, -45, 270);
+            e.Graphics.DrawLine(icon, cx, cy - 11, cx, cy - 1);
         }
 
-        private void Animate()
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) UiAnimationClock.Stop(_animationFrame);
+            base.Dispose(disposing);
+        }
+
+        private bool Animate()
         {
             _thumbPosition += (_targetPosition - _thumbPosition) * 0.26f;
             if (Math.Abs(_targetPosition - _thumbPosition) < 0.01f)
             {
                 _thumbPosition = _targetPosition;
-                _animationTimer.Stop();
             }
             Invalidate();
+            return Math.Abs(_targetPosition - _thumbPosition) >= 0.01f;
         }
 
-        private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
-        {
-            var path = new GraphicsPath();
-            var d = radius * 2;
-            path.AddArc(bounds.Left, bounds.Top, d, d, 180, 90);
-            path.AddArc(bounds.Right - d, bounds.Top, d, d, 270, 90);
-            path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
-            path.AddArc(bounds.Left, bounds.Bottom - d, d, d, 90, 90);
-            path.CloseFigure();
-            return path;
-        }
+        private static Color Blend(Color a, Color b, float t) => Color.FromArgb(
+            (int)(a.R + (b.R - a.R) * t),
+            (int)(a.G + (b.G - a.G) * t),
+            (int)(a.B + (b.B - a.B) * t));
     }
 
     private sealed class ConnectionPanel : Panel
@@ -8422,7 +9973,7 @@ del "%~f0"
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
-            e.Graphics.Clear(Color.FromArgb(6, 7, 10));
+            e.Graphics.Clear(Bg);
         }
     }
 }

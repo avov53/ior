@@ -8,6 +8,19 @@ internal static class Program
     private static void Main()
     {
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm());
+        using var instance = new SingleInstanceCoordinator();
+        if (!instance.IsPrimary)
+        {
+            instance.SignalPrimary();
+            return;
+        }
+
+        using var form = new MainForm();
+        instance.Listen(() =>
+        {
+            if (form.IsDisposed || !form.IsHandleCreated) return;
+            form.BeginInvoke(new Action(form.RestoreFromTray));
+        });
+        Application.Run(form);
     }
 }

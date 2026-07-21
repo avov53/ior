@@ -10,12 +10,16 @@
     <RootNamespace>HappBox</RootNamespace>
     <Product>ior</Product>
     <Title>ior</Title>
-    <Version>1.2.1</Version>
+    <Version>1.2.2</Version>
     <ApplicationIcon />
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="HappBox.Tests\**\*.cs" />
     <Content Include="core\sing-box.exe" Condition="Exists('core\sing-box.exe')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="assets\service-icons\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
