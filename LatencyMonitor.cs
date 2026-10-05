@@ -14,6 +14,7 @@ public sealed class LatencyMonitor : IDisposable
     private List<ProxyProfile> _profiles = [];
     private string? _selectedProfileId;
     private Task? _loop;
+    public bool LowPowerMode { get; set; }
 
     public event EventHandler<string>? Updated;
 
@@ -145,8 +146,8 @@ public sealed class LatencyMonitor : IDisposable
                 {
                     var state = _states[ServerTreeView.EndpointKey(profile)];
                     var interval = selected is not null && ServerTreeView.EndpointKey(selected) == ServerTreeView.EndpointKey(profile)
-                        ? TimeSpan.FromSeconds(4)
-                        : TimeSpan.FromSeconds(30);
+                        ? TimeSpan.FromSeconds(LowPowerMode ? 20 : 4)
+                        : TimeSpan.FromSeconds(LowPowerMode ? 120 : 30);
                     return !state.Running && DateTime.UtcNow - state.LastProbeUtc >= interval;
                 })
                 .ToList();

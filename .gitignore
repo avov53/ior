@@ -3,4 +3,10 @@ obj/
 .vs/
 *.user
 dist/
+ior-core/target/
+publish-check/
+verification-publish/
 test-shots*/
+
+__pycache__/
+*.py[cod]

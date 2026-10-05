@@ -1,0 +1,70 @@
+{
+  "lines": 503,
+  "parsedEvents": 500,
+  "otherLines": 3,
+  "firstTime": "20:44:10",
+  "lastTime": "20:44:53",
+  "codes": {
+    "TUN_DNS_QUERY_ACCEPTED": 12,
+    "ROUTE_SELECTED": 45,
+    "DNS_IPV6_NODATA": 11,
+    "TUN_TCP_IO_WAIT": 148,
+    "AWG_TRAFFIC_METRICS": 125,
+    "TUN_UDP_IDLE_CLOSED": 2,
+    "TUN_TCP_ACCEPTED": 15,
+    "TUN_NAME_SNI_HTTP": 15,
+    "DNS_FLOW_LINKED": 5,
+    "TUN_TCP_FIRST_SENT_BYTE": 15,
+    "TUN_TCP_RELAY_READY": 15,
+    "TUN_TCP_FIRST_REMOTE_BYTE": 15,
+    "TUN_TCP_RELAY_CLOSED": 39,
+    "AWG_HANDSHAKE_AUTHENTICATED": 1,
+    "DNS_RESPONSE_READY": 1,
+    "TUN_UDP_ACCEPTED": 12,
+    "TUN_UDP_FAILED": 10,
+    "TUN_UDP_NETWORK_REJECTED": 10,
+    "TUN_TCP_IO_FAILED": 2,
+    "TUN_TCP_FAILED": 2
+  },
+  "firstRemoteByteAfterRelayReady": {
+    "count": 15,
+    "medianMs": 211,
+    "p95Ms": 6494,
+    "minMs": 133,
+    "maxMs": 6494
+  },
+  "udpFailureReasons": {
+    "TUNNEL_IPV6_LOCAL_ADDRESS_REQUIRED": 10
+  },
+  "tcpIoFailureSides": {
+    "application": 2
+  },
+  "slowFirstRemoteByte": [
+    {
+      "flow": 360,
+      "durationMs": 6494
+    },
+    {
+      "flow": 380,
+      "durationMs": 5176
+    }
+  ],
+  "limits": "Partial log; absent DNS observations cannot distinguish browser cache, DoH or unobserved hints. Read waits and application closes do not prove a transport failure.",
+  "priorComparison": {
+    "failureCount": 14,
+    "byProtocolVariant": {
+      "AmneziaWG/current": 6,
+      "Hysteria2/baseline": 3,
+      "AmneziaWG/baseline": 3,
+      "Hysteria2/current": 2
+    },
+    "byCode": {
+      "WebSocketException": 3,
+      "HttpRequestException": 8,
+      "TaskCanceledException": 1,
+      "NATIVE_TUN_TRAFFIC_FAILED": 2
+    },
+    "accelerationConfirmed": false,
+    "limits": "Failure records contain only run/protocol/variant/exception type; they do not establish the failed host, HTTP status, inner socket error or causal transport issue."
+  }
+}

@@ -7,13 +7,24 @@ namespace HappBox;
 
 public static class SingBoxConfigBuilder
 {
-    public static string Build(AppState state, ProxyProfile selected)
+    public static string Build(AppState state, ProxyProfile selected, string? resolvedServer = null, string? outboundInterface = null)
     {
+        var bootstrapDomain = !string.IsNullOrWhiteSpace(resolvedServer) && !IPAddress.TryParse(selected.Server, out _);
+        if (!string.IsNullOrWhiteSpace(resolvedServer))
+        {
+            if (!IPAddress.TryParse(resolvedServer, out _)) throw new ArgumentException("Resolved server must be an IP address.", nameof(resolvedServer));
+            var originalHost = selected.Server;
+            selected = JsonSerializer.Deserialize<ProxyProfile>(JsonSerializer.Serialize(selected))!;
+            selected.Server = resolvedServer;
+            if ((selected.TlsEnabled || selected.RealityEnabled || selected.Protocol is ProxyProtocol.Hysteria2 or ProxyProtocol.Trojan) &&
+                string.IsNullOrWhiteSpace(selected.ServerName) && !IPAddress.TryParse(originalHost, out _))
+                selected.ServerName = originalHost;
+        }
         var outbounds = new JsonArray();
         var endpoints = new JsonArray();
         var proxyTag = "proxy";
         var wireGuardMode = selected.Protocol == ProxyProtocol.WireGuard;
-        var dnsStrategy = DnsStrategyForProfile(state, selected);
+        var dnsStrategy = DnsStrategyForProfile(state, selected, bootstrapDomain);
 
         if (wireGuardMode)
         {
@@ -26,6 +37,7 @@ public static class SingBoxConfigBuilder
 
         outbounds.Add(BuildDirectOutbound());
 
+        var routeRules = BuildRouteRules(state, selected);
         var route = new JsonObject
         {
             ["auto_detect_interface"] = true,
@@ -34,10 +46,16 @@ public static class SingBoxConfigBuilder
                 ["server"] = "remote",
                 ["strategy"] = dnsStrategy
             },
-            ["rules"] = BuildRouteRules(state, selected),
+            ["rules"] = routeRules,
             ["final"] = RouteFinal(state, proxyTag)
         };
+        if (state.TunEnabled && !string.IsNullOrWhiteSpace(outboundInterface))
+        {
+            route["auto_detect_interface"] = false;
+            route["default_interface"] = outboundInterface;
+        }
         var happRuleSets = BuildHappRouteRuleSets(state);
+        AddGeoRuleSets(happRuleSets, routeRules);
         if (happRuleSets.Count > 0) route["rule_set"] = happRuleSets;
 
         var root = new JsonObject
@@ -47,7 +65,7 @@ public static class SingBoxConfigBuilder
             {
                 ["servers"] = new JsonArray
                 {
-                    BuildBootstrapDnsServer(),
+                    BuildBootstrapDnsServer(state),
                     BuildDnsServer("remote", state.DnsServer, wireGuardMode),
                     new JsonObject { ["type"] = "local", ["tag"] = "local" }
                 },
@@ -59,6 +77,18 @@ public static class SingBoxConfigBuilder
             ["outbounds"] = outbounds,
             ["route"] = route
         };
+
+        if (happRuleSets.Count > 0)
+        {
+            root["experimental"] = new JsonObject
+            {
+                ["cache_file"] = new JsonObject
+                {
+                    ["enabled"] = true,
+                    ["path"] = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ior", "rules-cache.db")
+                }
+            };
+        }
 
         if (endpoints.Count > 0) root["endpoints"] = endpoints;
 
@@ -77,13 +107,10 @@ public static class SingBoxConfigBuilder
     private static JsonArray BuildRouteRules(AppState state, ProxyProfile selected)
     {
         var rules = new JsonArray();
-        AddEndpointDirectRule(rules, selected);
-        if (selected.Protocol == ProxyProtocol.WireGuard)
-        {
-            AddWireGuardStabilityRules(rules);
-        }
-
-        if (state.SniffEnabled)
+        // TUN's DNS address is private (normally the next address in its /30).
+        // Hijack it before the private-address direct rule, even when sniffing
+        // is disabled; otherwise DNS packets are routed out instead of handled.
+        if (state.TunEnabled || state.MixedProxyEnabled)
         {
             rules.Add(new JsonObject
             {
@@ -96,6 +123,16 @@ public static class SingBoxConfigBuilder
                 },
                 ["action"] = "hijack-dns"
             });
+        }
+        AddEndpointDirectRule(rules, selected);
+        rules.Add(new JsonObject { ["ip_is_private"] = true, ["action"] = "route", ["outbound"] = "direct" });
+        if (selected.Protocol == ProxyProtocol.WireGuard)
+        {
+            AddWireGuardStabilityRules(rules);
+        }
+
+        if (state.SniffEnabled)
+        {
             if (selected.Protocol != ProxyProtocol.WireGuard)
             {
                 rules.Add(new JsonObject
@@ -106,7 +143,18 @@ public static class SingBoxConfigBuilder
             }
         }
 
-        if (HappRoutingEnabled(state)) AddHappRoutingRules(rules, state);
+        if (HappRoutingEnabled(state))
+        {
+            var activeRoute = ActiveRoutingProfile(state);
+            if (activeRoute?.Source == RoutingProfileSource.Clash)
+            {
+                if (!SingBoxClashRuleCompiler.TryCompile(activeRoute, out var ordered, out var reason))
+                    throw new FormatException(reason);
+                foreach (var rule in ordered) rules.Add(rule?.DeepClone());
+            }
+            else if (activeRoute?.Source == RoutingProfileSource.Ior) AddLocalRoutingRules(rules, activeRoute);
+            else AddHappRoutingRules(rules, state);
+        }
 
         return rules;
     }
@@ -160,6 +208,11 @@ public static class SingBoxConfigBuilder
 
     private static string RouteFinal(AppState state, string proxyTag)
     {
+        var activeRoute = ActiveRoutingProfile(state);
+        if (activeRoute?.Source is RoutingProfileSource.Ior or RoutingProfileSource.Clash)
+        {
+            return activeRoute.GlobalProxy ? proxyTag : "direct";
+        }
         if (HappRoutingEnabled(state) && ActiveHappRoutingItems(state).Count > 0)
         {
             return ActiveHappRoutingConfigs(state).Any(HappConfigGlobalProxy) ? proxyTag : "direct";
@@ -216,6 +269,63 @@ public static class SingBoxConfigBuilder
         }
     }
 
+    private static void AddLocalRoutingRules(JsonArray rules, HappRoutingProfile profile)
+    {
+        AddLocalDomainRule(rules, profile.BlockSites, "reject", null);
+        AddLocalTextRule(rules, profile.BlockDomains, "domain", "reject", null);
+        AddLocalTextRule(rules, profile.BlockKeywords, "domain_keyword", "reject", null);
+        AddLocalIpRule(rules, profile.BlockIp, "reject", null);
+        AddLocalDomainRule(rules, profile.ProxySites, "route", "proxy");
+        AddLocalTextRule(rules, profile.ProxyDomains, "domain", "route", "proxy");
+        AddLocalTextRule(rules, profile.ProxyKeywords, "domain_keyword", "route", "proxy");
+        AddLocalIpRule(rules, profile.ProxyIp, "route", "proxy");
+        AddLocalDomainRule(rules, profile.DirectSites, "route", "direct");
+        AddLocalTextRule(rules, profile.DirectDomains, "domain", "route", "direct");
+        AddLocalTextRule(rules, profile.DirectKeywords, "domain_keyword", "route", "direct");
+        AddLocalIpRule(rules, profile.DirectIp, "route", "direct");
+    }
+
+    private static void AddLocalTextRule(JsonArray rules, IEnumerable<string> values, string field, string action, string? outbound)
+    {
+        var clean = values.Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (clean.Length == 0) return;
+        var entries = new JsonArray();
+        foreach (var value in clean) entries.Add(value);
+        var rule = new JsonObject { [field] = entries, ["action"] = action };
+        if (outbound is not null) rule["outbound"] = outbound;
+        rules.Add(rule);
+    }
+
+    private static void AddLocalDomainRule(JsonArray rules, IEnumerable<string> values, string action, string? outbound)
+    {
+        var clean = values.Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (clean.Length == 0) return;
+        var domains = new JsonArray();
+        foreach (var value in clean)
+        {
+            if (value.StartsWith("geosite:", StringComparison.OrdinalIgnoreCase))
+                AddGeoRule(rules, "geosite", value[8..], action, outbound);
+            else domains.Add(value);
+        }
+        if (domains.Count > 0)
+        {
+            var rule = new JsonObject { ["domain_suffix"] = domains, ["action"] = action };
+            if (outbound is not null) rule["outbound"] = outbound;
+            rules.Add(rule);
+        }
+    }
+
+    private static void AddLocalIpRule(JsonArray rules, IEnumerable<string> values, string action, string? outbound)
+    {
+        AddIpRules(rules, values, action, outbound);
+    }
+
+    private static HappRoutingProfile? ActiveRoutingProfile(AppState state)
+    {
+        return state.HappRoutingProfiles.FirstOrDefault(profile => profile.Id == state.SelectedHappRoutingProfileId) ??
+               state.HappRoutingProfiles.FirstOrDefault();
+    }
+
     private static string HappRuleSetTag(int index)
     {
         return $"happ-routing-{index}";
@@ -223,8 +333,8 @@ public static class SingBoxConfigBuilder
 
     private static List<string> ActiveHappRoutingItems(AppState state)
     {
-        var selected = state.HappRoutingProfiles.FirstOrDefault(x => x.Id == state.SelectedHappRoutingProfileId) ??
-                       state.HappRoutingProfiles.FirstOrDefault();
+        var selected = ActiveRoutingProfile(state);
+        if (selected?.Source is RoutingProfileSource.Ior or RoutingProfileSource.Clash) return [];
         return selected is null
             ? CleanRoutingItems(state.HappRoutingLinks)
             : CleanRoutingItems(selected.Links);
@@ -262,7 +372,7 @@ public static class SingBoxConfigBuilder
                !uri.Host.Equals("routing.happ.su", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static JsonElement? TryParseHappRoutingConfig(string value)
+    internal static JsonElement? TryParseHappRoutingConfig(string value)
     {
         var payload = ExtractHappPayload(value.Trim());
         foreach (var candidate in DecodeHappPayloadCandidates(payload))
@@ -310,7 +420,7 @@ public static class SingBoxConfigBuilder
         yield return System.Text.Encoding.UTF8.GetString(bytes);
     }
 
-    private static bool HappConfigGlobalProxy(JsonElement config)
+    internal static bool HappConfigGlobalProxy(JsonElement config)
     {
         if (!TryGetProperty(config, "GlobalProxy", out var value)) return false;
 
@@ -345,7 +455,7 @@ public static class SingBoxConfigBuilder
         }
     }
 
-    private static IEnumerable<string> HappRouteOrder(JsonElement config)
+    internal static IEnumerable<string> HappRouteOrder(JsonElement config)
     {
         var value = TryGetString(config, "RouteOrder");
         var parts = string.IsNullOrWhiteSpace(value)
@@ -365,35 +475,104 @@ public static class SingBoxConfigBuilder
         if (values.Count == 0) return;
 
         var domains = new JsonArray();
-        foreach (var value in values) domains.Add(value);
-
-        var rule = new JsonObject
+        foreach (var value in values)
         {
-            ["domain_suffix"] = domains,
-            ["action"] = action
-        };
-        if (!string.IsNullOrWhiteSpace(outbound)) rule["outbound"] = outbound;
-        rules.Add(rule);
+            if (value.StartsWith("geosite:", StringComparison.OrdinalIgnoreCase))
+                AddGeoRule(rules, "geosite", value[8..], action, outbound);
+            else domains.Add(value);
+        }
+        if (domains.Count > 0)
+        {
+            var rule = new JsonObject { ["domain_suffix"] = domains, ["action"] = action };
+            if (!string.IsNullOrWhiteSpace(outbound)) rule["outbound"] = outbound;
+            rules.Add(rule);
+        }
     }
 
     private static void AddHappIpRule(JsonArray rules, JsonElement config, string property, string action, string? outbound)
     {
-        var values = GetStringArray(config, property);
-        if (values.Count == 0) return;
+        AddIpRules(rules, GetStringArray(config, property), action, outbound);
+    }
 
+    private static void AddIpRules(JsonArray rules, IEnumerable<string> values, string action, string? outbound)
+    {
         var cidrs = new JsonArray();
-        foreach (var value in values) cidrs.Add(value);
-
-        var rule = new JsonObject
+        foreach (var value in values.Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value.Trim()).Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            ["ip_cidr"] = cidrs,
-            ["action"] = action
-        };
-        if (!string.IsNullOrWhiteSpace(outbound)) rule["outbound"] = outbound;
+            if (value.StartsWith("geoip:", StringComparison.OrdinalIgnoreCase))
+            {
+                var code = value[6..];
+                if (code.Equals("private", StringComparison.OrdinalIgnoreCase))
+                {
+                    var privateRule = new JsonObject { ["ip_is_private"] = true, ["action"] = action };
+                    if (outbound is not null) privateRule["outbound"] = outbound;
+                    rules.Add(privateRule);
+                }
+                else AddGeoRule(rules, "geoip", code, action, outbound);
+                continue;
+            }
+            if (IPAddress.TryParse(value, out var address))
+            {
+                cidrs.Add(address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? $"{address}/128" : $"{address}/32");
+                continue;
+            }
+            if (!IPNetwork.TryParse(value, out _))
+                throw new FormatException($"Некорректное IP/CIDR-правило маршрута: {value}");
+            cidrs.Add(value);
+        }
+        if (cidrs.Count > 0)
+        {
+            var rule = new JsonObject { ["ip_cidr"] = cidrs, ["action"] = action };
+            if (outbound is not null) rule["outbound"] = outbound;
+            rules.Add(rule);
+        }
+    }
+
+    private static void AddGeoRule(JsonArray rules, string kind, string code, string action, string? outbound)
+    {
+        code = code.Trim().ToLowerInvariant();
+        if (code.Length == 0 || code.Any(ch => !char.IsAsciiLetterLower(ch) && !char.IsAsciiDigit(ch) && ch != '-'))
+            throw new FormatException($"Некорректное {kind}-правило маршрута: {code}");
+        var rule = new JsonObject { ["rule_set"] = new JsonArray($"{kind}-{code}"), ["action"] = action };
+        if (outbound is not null) rule["outbound"] = outbound;
         rules.Add(rule);
     }
 
-    private static List<string> GetStringArray(JsonElement config, string property)
+    private static void AddGeoRuleSets(JsonArray definitions, JsonArray rules)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var rule in rules.OfType<JsonObject>())
+        {
+            if (rule["rule_set"] is not JsonArray tags) continue;
+            foreach (var node in tags)
+            {
+                var tag = node?.GetValue<string>();
+                if (tag is null || !seen.Add(tag)) continue;
+                var kind = tag.StartsWith("geoip-", StringComparison.Ordinal) ? "geoip" :
+                    tag.StartsWith("geosite-", StringComparison.Ordinal) ? "geosite" : null;
+                if (kind is null) continue;
+                var repository = kind == "geoip" ? "sing-geoip" : "sing-geosite";
+                var bundledPath = tag == "geoip-ru"
+                    ? Path.Combine(AppContext.BaseDirectory, "core", "rules", "geoip-ru.srs") : null;
+                if (bundledPath is not null && File.Exists(bundledPath))
+                {
+                    definitions.Add(new JsonObject { ["type"] = "local", ["tag"] = tag,
+                        ["format"] = "binary", ["path"] = bundledPath });
+                }
+                else
+                {
+                    definitions.Add(new JsonObject
+                    {
+                        ["type"] = "remote", ["tag"] = tag, ["format"] = "binary",
+                        ["url"] = $"https://raw.githubusercontent.com/SagerNet/{repository}/rule-set/{tag}.srs",
+                        ["download_detour"] = "direct"
+                    });
+                }
+            }
+        }
+    }
+
+    internal static List<string> GetStringArray(JsonElement config, string property)
     {
         if (!TryGetProperty(config, property, out var value) || value.ValueKind != JsonValueKind.Array) return [];
 
@@ -406,7 +585,7 @@ public static class SingBoxConfigBuilder
             .ToList();
     }
 
-    private static string? TryGetString(JsonElement config, string property)
+    internal static string? TryGetString(JsonElement config, string property)
     {
         return TryGetProperty(config, property, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
@@ -428,8 +607,9 @@ public static class SingBoxConfigBuilder
         return false;
     }
 
-    private static string DnsStrategyForProfile(AppState state, ProxyProfile selected)
+    private static string DnsStrategyForProfile(AppState state, ProxyProfile selected, bool bootstrapDomain)
     {
+        if (state.TunEnabled && bootstrapDomain) return "ipv4_only";
         return selected.Protocol == ProxyProtocol.WireGuard && !HasIpv6Address(selected.LocalAddress)
             ? "ipv4_only"
             : state.DnsStrategy;
@@ -520,9 +700,9 @@ public static class SingBoxConfigBuilder
                !value.Contains(':', StringComparison.Ordinal);
     }
 
-    private static JsonObject BuildBootstrapDnsServer()
+    private static JsonObject BuildBootstrapDnsServer(AppState state)
     {
-        return BuildUdpDnsServer("bootstrap", "1.1.1.1", "direct");
+        return BuildUdpDnsServer("bootstrap", BootstrapDnsResolver.ServerAddress(state.BootstrapDnsServer).ToString(), "direct");
     }
 
     private static JsonArray BuildInbounds(AppState state, ProxyProfile selected)
@@ -566,6 +746,7 @@ public static class SingBoxConfigBuilder
                 inbounds[^1]!["udp_timeout"] = "5m";
             }
             else if (state.StackSystem) inbounds[^1]!["stack"] = "system";
+            else inbounds[^1]!["stack"] = "gvisor";
         }
 
         return inbounds;
@@ -605,6 +786,7 @@ public static class SingBoxConfigBuilder
 
     private static JsonObject BuildOutbound(AppState state, ProxyProfile profile, string tag)
     {
+        if (RemovedProtocolPolicy.IsRemoved(profile)) throw new NotSupportedException(RemovedProtocolPolicy.Message);
         return profile.Protocol switch
         {
             ProxyProtocol.Vless => BuildVless(state, profile, tag),
@@ -620,8 +802,19 @@ public static class SingBoxConfigBuilder
                 ["password"] = profile.Password
             },
             ProxyProtocol.Hysteria2 => BuildHysteria2(state, profile, tag),
+            ProxyProtocol.Http or ProxyProtocol.Socks => BuildForwardProxy(state, profile, tag),
             _ => throw new NotSupportedException($"Unsupported outbound: {profile.Protocol}")
         };
+    }
+
+    private static JsonObject BuildForwardProxy(AppState state, ProxyProfile profile, string tag)
+    {
+        var outbound = new JsonObject { ["type"] = profile.Protocol == ProxyProtocol.Http ? "http" : "socks",
+            ["tag"] = tag, ["server"] = profile.Server, ["server_port"] = profile.Port, ["domain_resolver"] = "bootstrap" };
+        if (profile.Protocol == ProxyProtocol.Socks) outbound["version"] = "5";
+        if (!string.IsNullOrEmpty(profile.Username)) { outbound["username"] = profile.Username; outbound["password"] = profile.Password; }
+        if (profile.TlsEnabled) outbound["tls"] = BuildTls(state, profile);
+        return outbound;
     }
 
     private static JsonObject BuildVless(AppState state, ProxyProfile profile, string tag)

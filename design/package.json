@@ -1,0 +1,26 @@
+{
+  "name": "ior-design-prototype",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build && node scripts/build-standalone.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "flag-icons": "^7.5.0",
+    "motion": "^13.4.0",
+    "react": "latest",
+    "react-dom": "latest",
+    "simple-icons": "^16.32.0",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "rolldown": "^1.2.9"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "tun-in",
+      "protocol": "tun",
+      "settings": {
+        "name": "ior-xray-test",
+        "desc": "ior Xray test",
+        "mtu": 1500,
+        "gateway": ["172.27.250.1/30"],
+        "dns": ["1.1.1.1"],
+        "autoSystemRoutingTable": ["0.0.0.0/0"],
+        "autoOutboundsInterface": "auto"
+      }
+    }
+  ],
+  "outbounds": [{ "tag": "direct", "protocol": "freedom" }],
+  "routing": { "rules": [] },
+  "dns": { "servers": ["1.1.1.1"], "queryStrategy": "UseIPv4" }
+}

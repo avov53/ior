@@ -17,4 +17,7 @@
   <ItemGroup>
     <ProjectReference Include="..\HappBox.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <Content Include="..\ior-core\fixtures\start-v1.json" Link="start-v1.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

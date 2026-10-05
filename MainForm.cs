@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.IO.Compression;
+using System.Net;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using Microsoft.Win32;
@@ -11,7 +12,7 @@ using System.Text.Json.Serialization.Metadata;
 
 namespace HappBox;
 
-public sealed class MainForm : Form
+public sealed partial class MainForm : Form
 {
     private const string AppVersion = "1.2.2";
     private const string GitHubRepositoryUrl = "https://github.com/avov53/ior";
@@ -44,15 +45,22 @@ public sealed class MainForm : Form
     private static Color TextColor = Color.White;
     private static Color Muted = Color.FromArgb(170, 170, 178);
     private static Color Line = Color.FromArgb(77, 78, 86);
-    private static readonly string[] DefaultNavItemOrder = ["servers", "settings", "config", "logs", "info"];
+    private static readonly string[] DefaultNavItemOrder = ["servers", "settings", "config", "logs"];
 
     private readonly string _appDir = Environment.GetEnvironmentVariable("IOR_APPDATA_DIR") ??
                                       Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ior");
     private readonly string _statePath;
     private readonly string _configPath;
-    private readonly AppState _state;
+    private AppState _state;
     private readonly List<string> _logs = [];
-    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _pendingProcessLogs = new();
+    private readonly List<string> _webLogDelta = [];
+    private readonly ConnectionLoadMonitor _loadMonitor = new();
+    private readonly ProcessLogLimiter _processLogLimiter = new();
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(string Line, long Generation)> _pendingProcessLogs = new();
+    private long _processLogGeneration;
+    private string? _runtimeConnectionWarning;
+    private readonly TunLoopGuard _tunLoopGuard = new();
+    private int _tunLoopStopScheduled;
     private readonly System.Windows.Forms.Timer _logFlushTimer = new() { Interval = 50 };
     private LogViewer? _activeLogViewer;
     private int _logFlushScheduled;
@@ -66,6 +74,8 @@ public sealed class MainForm : Form
     private readonly Panel _inlineImportPanel = new();
     private readonly TextBox _inlineImportBox = new();
     private readonly HttpClient _httpClient = new();
+    private HttpClient _serviceProbeClient = new(new SocketsHttpHandler { UseProxy = false,
+        ConnectTimeout = TimeSpan.FromSeconds(3), PooledConnectionLifetime = TimeSpan.FromSeconds(30) });
     private readonly Label _selectedName = new();
     private readonly Label _selectedProtocol = new();
     private readonly Label _selectedServer = new();
@@ -92,11 +102,17 @@ public sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _profileDragHoldTimer = new() { Interval = 220 };
     private readonly System.Windows.Forms.Timer _navResponsiveTimer = new() { Interval = 120 };
     private readonly NotifyIcon _trayIcon = new();
-    private readonly ContextMenuStrip _trayMenu = new();
+    private TrayPopupForm? _trayPopup;
     private ToolStripDropDown? _serviceEditorDropDown;
 
     private DateTime? _connectedAt;
-    private bool _startupUpdatePromptShown;
+    private UpdateRelease? _availableUpdate;
+    private UpdateUiState _updateUiState = UpdateUiState.NotChecked;
+    private int? _updatePercent;
+    private string? _updateError;
+    private string? _stagedUpdatePath;
+    private string? _stagedUpdateRoot;
+    private bool _updateDownloadRunning;
     private long _lastReceivedBytes;
     private long _lastSentBytes;
     private bool _serviceCheckRunning;
@@ -135,7 +151,6 @@ public sealed class MainForm : Form
     private SideNavButton? _settingsNavButton;
     private SideNavButton? _configNavButton;
     private SideNavButton? _logsNavButton;
-    private SideNavButton? _infoNavButton;
     private AppView _currentView = AppView.Servers;
     private AppView _previousView = AppView.Servers;
     private SettingsSection _selectedSettingsSection = SettingsSection.General;
@@ -152,6 +167,9 @@ public sealed class MainForm : Form
         _statePath = Path.Combine(_appDir, "state.json");
         _configPath = Path.Combine(_appDir, "config.generated.json");
         _state = LoadState(_statePath);
+        // Earlier versions saved preview engines as a cosmetic preference while
+        // always launching sing-box. Normalize that legacy value explicitly.
+        if (!CoreEngineService.CanSelect(_state.SelectedCore)) _state.SelectedCore = CoreKind.SingBox;
         _faviconCache = new ServiceFaviconCache(Path.Combine(_appDir, "favicons"), _httpClient);
         ApplyPackageCompatibilityDefaults(_state);
         ApplyAppearanceSettings();
@@ -161,6 +179,7 @@ public sealed class MainForm : Form
         {
             _state.SingBoxPath = BundledSingBoxPath();
         }
+        SaveState();
 
         Text = "ior";
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -212,6 +231,7 @@ public sealed class MainForm : Form
             UpdateServerListColumnWidth();
         };
         BuildUi();
+        _ = InitializeWebUiAsync();
         ConfigureTrayIcon();
         RefreshProfiles();
         RefreshMainPreview();
@@ -219,17 +239,19 @@ public sealed class MainForm : Form
         _ = LoadServiceIconsAsync();
         ResetTrafficCounters();
         RecoverConnectionState();
+        RegisterXrayNetworkRecovery();
         QueueCountryLookups(_state.Profiles);
         _latencyMonitor.SetProfiles(_state.Profiles, _state.SelectedProfileId);
+        ApplyPowerSavingMode();
         _latencyMonitor.Start();
         _trafficTimer.Start();
         _ = UpdatePingAndServicesAsync(force: true);
         Shown += async (_, _) =>
         {
             var skipStartupNetwork = string.Equals(Environment.GetEnvironmentVariable("IOR_SKIP_STARTUP_NETWORK"), "1", StringComparison.Ordinal);
+            if (!skipStartupNetwork) _ = CheckForStartupUpdateAsync();
             if (!skipStartupNetwork)
-                await RefreshAllSubscriptionsAsync(startup: true);
-            if (!skipStartupNetwork) await CheckForStartupUpdateAsync();
+                await RefreshDueSubscriptionsAsync();
         };
     }
 
@@ -242,13 +264,20 @@ public sealed class MainForm : Form
             return;
         }
 
+        if (!_shutdownComplete)
+        {
+            e.Cancel = true;
+            if (!_shutdownRequested) _ = ShutdownAsync();
+            return;
+        }
         _trayIcon.Visible = false;
+        UnregisterXrayNetworkRecovery();
+        _trayPopup?.Close();
         _serviceEditorDropDown?.Close();
         _serviceEditorDropDown?.Dispose();
-        _trayIcon.ContextMenuStrip = null;
-        _trayMenu.Dispose();
         _trayIcon.Dispose();
-        StopSingBox();
+        _statusProbeCts?.Cancel();
+        _serviceProbeClient.Dispose();
         FlushPendingProcessLogs();
         _logFlushTimer.Stop();
         _logFlushTimer.Dispose();
@@ -268,69 +297,43 @@ public sealed class MainForm : Form
         _trayIcon.Text = "ior";
         _trayIcon.Icon = Icon ?? SystemIcons.Application;
         _trayIcon.Visible = _state.MinimizeToTray;
-        _trayMenu.BackColor = CardBg2;
-        _trayMenu.ForeColor = TextColor;
-        _trayMenu.ShowImageMargin = false;
-        _trayMenu.Padding = new Padding(6);
-        _trayMenu.Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors());
-        _trayMenu.Opening += (_, _) => RebuildTrayMenu();
-        _trayIcon.ContextMenuStrip = _trayMenu;
+        _trayIcon.MouseUp += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Right) ShowTrayPopup();
+        };
         _trayIcon.MouseDoubleClick += (_, e) =>
         {
             if (e.Button == MouseButtons.Left) RestoreFromTray();
         };
     }
 
-    private void RebuildTrayMenu()
+    private void ShowTrayPopup(Point? anchor = null)
     {
-        var previousItems = _trayMenu.Items.Cast<ToolStripItem>().ToArray();
-        _trayMenu.Items.Clear();
-        foreach (var item in previousItems) item.Dispose();
+        _trayPopup?.Close();
         var ru = _state.Language == AppLanguage.Russian;
         var selected = SelectedProfile();
-        var connected = IsConnectionActive();
-
-        _trayMenu.Items.Add(new ToolStripMenuItem(ru ? "Открыть ior" : "Open ior", null, (_, _) => RestoreFromTray())
-        {
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold)
-        });
-        _trayMenu.Items.Add(new ToolStripSeparator());
-        _trayMenu.Items.Add(new ToolStripMenuItem(selected is null
-            ? (ru ? "Сервер не выбран" : "No server selected")
-            : $"{(ru ? "Выбран" : "Selected")}: {selected.Name}")
-        {
-            Enabled = false
-        });
-
-        if (selected?.SubscriptionId is { Length: > 0 } subscriptionId &&
-            _state.Subscriptions.Any(x => x.Id == subscriptionId))
-        {
-            var switchItem = new ToolStripMenuItem(ru ? "Сменить сервер" : "Switch server");
-            foreach (var profile in _state.Profiles.Where(x => x.SubscriptionId == subscriptionId))
+        var workspace = _state.ConnectionProfiles.FirstOrDefault(profile => profile.Id == _state.SelectedConnectionProfileId);
+        var available = workspace is null ? _state.Profiles : _state.Profiles.Where(profile =>
+            profile.SubscriptionId == workspace.SubscriptionId || workspace.ConfigIds.Contains(profile.Id));
+        var servers = available.Select(profile => new TrayServerOption(
+            profile.Id, profile.Name, ProtocolLabel(profile), profile.Id == selected?.Id)).ToArray();
+        var popup = new TrayPopupForm(_state.Theme, anchor ?? Cursor.Position, ru,
+            selected?.Name, selected is null ? null : ProtocolLabel(selected),
+            IsConnectionActive(), _connectionTransitionInProgress, servers,
+            RestoreFromTray, () => _ = ToggleConnectionAsync(),
+            () => { _allowExit = true; Close(); },
+            id =>
             {
-                var profileItem = new ToolStripMenuItem($"{profile.Name} · {ProtocolLabel(profile)} · {profile.Server}:{profile.Port}")
-                {
-                    Checked = profile.Id == selected.Id,
-                    Enabled = !_connectionTransitionInProgress
-                };
-                profileItem.Click += (_, _) => SwitchServerFromTray(profile);
-                switchItem.DropDownItems.Add(profileItem);
-            }
-            _trayMenu.Items.Add(switchItem);
-        }
-
-        _trayMenu.Items.Add(new ToolStripSeparator());
-        _trayMenu.Items.Add(new ToolStripMenuItem(connected ? T("tray.disconnect") : T("tray.connect"), null, (_, _) => _ = ToggleConnectionAsync())
+                var profile = _state.Profiles.FirstOrDefault(item => item.Id == id);
+                if (profile is not null) SwitchServerFromTray(profile);
+            });
+        _trayPopup = popup;
+        popup.FormClosed += (_, _) =>
         {
-            Enabled = !_connectionTransitionInProgress && selected is not null
-        });
-        _trayMenu.Items.Add(new ToolStripSeparator());
-        _trayMenu.Items.Add(new ToolStripMenuItem(ru ? "Выйти" : "Exit", null, (_, _) =>
-        {
-            _allowExit = true;
-            _trayIcon.Visible = false;
-            Close();
-        }));
+            if (ReferenceEquals(_trayPopup, popup)) _trayPopup = null;
+            popup.Dispose();
+        };
+        popup.ShowAtAnchor();
     }
 
     private void HideToTray()
@@ -350,6 +353,7 @@ public sealed class MainForm : Form
 
     private async void SwitchServerFromTray(ProxyProfile profile)
     {
+        if (_shutdownRequested) return;
         if (_connectionTransitionInProgress || profile.Id == _state.SelectedProfileId) return;
         _connectionTransitionInProgress = true;
         _powerButton.Enabled = false;
@@ -359,7 +363,7 @@ public sealed class MainForm : Form
             if (connected)
             {
                 SetConnectionVisualState(ConnectionVisualState.Disconnecting);
-                await StopSingBoxAsync();
+                if (!await StopSingBoxAsync()) return;
             }
             SelectProfile(profile, save: true);
             if (connected)
@@ -383,7 +387,7 @@ public sealed class MainForm : Form
     {
         var hasTrackedProcess = TryGetTrackedSingBoxProcess(out var trackedProcess);
         trackedProcess?.Dispose();
-        return _process is { HasExited: false } || hasTrackedProcess;
+        return ProcessLifetime.IsRunning(_process) || hasTrackedProcess;
     }
 
     protected override void OnDpiChanged(DpiChangedEventArgs e)
@@ -419,7 +423,6 @@ public sealed class MainForm : Form
         _settingsNavButton = null;
         _configNavButton = null;
         _logsNavButton = null;
-        _infoNavButton = null;
 
         var isTop = _state.NavPanelPosition == NavPanelPosition.Top;
         var root = new TableLayoutPanel
@@ -706,9 +709,7 @@ public sealed class MainForm : Form
         var visibleItems = _state.NavItemOrder
             .Where(id => !_state.HiddenNavItems.Contains(id, StringComparer.OrdinalIgnoreCase))
             .ToList();
-        var separatorCount = _state.ShowNavSeparators
-            ? 1 + (visibleItems.Contains("info", StringComparer.OrdinalIgnoreCase) ? 1 : 0)
-            : 0;
+        var separatorCount = _state.ShowNavSeparators ? 1 : 0;
         var slotCount = visibleItems.Count + 2 + separatorCount;
         var nav = new TableLayoutPanel
         {
@@ -740,10 +741,6 @@ public sealed class MainForm : Form
         if (_state.ShowNavSeparators) AddNavButton(nav, new NavSeparator { PanelPosition = _state.NavPanelPosition }, index++, isTop);
         foreach (var id in visibleItems)
         {
-            if (_state.ShowNavSeparators && id == "info")
-            {
-                AddNavButton(nav, new NavSeparator { PanelPosition = _state.NavPanelPosition }, index++, isTop);
-            }
             AddNavButton(nav, BuildNavItemButton(id), index++, isTop);
         }
         return nav;
@@ -757,7 +754,6 @@ public sealed class MainForm : Form
 
         foreach (var id in visibleItems)
         {
-            if (_state.ShowNavSeparators && id == "info") nav.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 18));
             nav.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, TopNavSlotWidth(NavItemTitle(id), showLabels)));
         }
     }
@@ -818,7 +814,6 @@ public sealed class MainForm : Form
 
         foreach (var id in visibleItems)
         {
-            if (_state.ShowNavSeparators && id == "info") required += 18;
             required += TopNavSlotWidth(NavItemTitle(id), showLabel: true);
         }
 
@@ -868,9 +863,6 @@ public sealed class MainForm : Form
             case "logs":
                 _logsNavButton = button;
                 break;
-            case "info":
-                _infoNavButton = button;
-                break;
         }
 
         return button;
@@ -884,7 +876,6 @@ public sealed class MainForm : Form
             "settings" => ("⚙", "Settings", AppView.Settings),
             "config" => ("config-box", "Config", AppView.Config),
             "logs" => ("logs-list", "Logs", AppView.Logs),
-            "info" => ("i", "Info", AppView.Info),
             _ => ("◎", "Servers", AppView.Servers)
         };
     }
@@ -897,7 +888,6 @@ public sealed class MainForm : Form
             "settings" => T("nav.settings"),
             "config" => T("nav.config"),
             "logs" => T("nav.logs"),
-            "info" => T("nav.info"),
             _ => T("nav.servers")
         };
     }
@@ -911,7 +901,6 @@ public sealed class MainForm : Form
             "nav.settings" => ru ? "Настройки" : "Settings",
             "nav.config" => ru ? "Конфиг" : "Config",
             "nav.logs" => ru ? "Логи" : "Logs",
-            "nav.info" => ru ? "Информация" : "Info",
             "nav.back" => ru ? "Назад" : "Back",
             "nav.import" => ru ? "Импорт" : "Import",
             "servers.title" => ru ? "Серверы" : "Servers",
@@ -1480,7 +1469,13 @@ public sealed class MainForm : Form
         };
         modeSwitch.ModeChanged += async (_, tunEnabled) =>
         {
-            await ApplyConnectionModeAsync(tunEnabled);
+            if (!await ApplyConnectionModeAsync(tunEnabled))
+            {
+                var reason = CoreEngineService.CanRun(_state, SelectedProfile(), out var capabilityReason)
+                    ? "Не удалось переключить режим; прежнее подключение восстановлено."
+                    : capabilityReason;
+                MessageBox.Show(reason, "Режим подключения", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
             modeSwitch.IsTun = _state.TunEnabled;
         };
 
@@ -1903,7 +1898,6 @@ public sealed class MainForm : Form
             AppView.Settings => _settingsNavButton,
             AppView.Config => _configNavButton,
             AppView.Logs => _logsNavButton,
-            AppView.Info => _infoNavButton,
             _ => null
         };
         if (button is not null) SetActiveSideButton(button);
@@ -1940,9 +1934,6 @@ public sealed class MainForm : Form
             case AppView.Logs:
                 ShowEmbeddedPage(BuildToolPage(T("logs.title"), BuildLogSection()));
                 break;
-            case AppView.Info:
-                ShowEmbeddedPage(BuildToolPage(T("info.title"), BuildInformationSection()));
-                break;
         }
     }
 
@@ -1962,9 +1953,6 @@ public sealed class MainForm : Form
                 break;
             case AppView.Logs:
                 ShowEmbeddedPage(BuildToolPage(T("logs.title"), BuildLogSection()));
-                break;
-            case AppView.Info:
-                ShowEmbeddedPage(BuildToolPage(T("info.title"), BuildInformationSection()));
                 break;
         }
     }
@@ -3160,7 +3148,7 @@ public sealed class MainForm : Form
             BorderStyle = BorderStyle.None,
             BackColor = Color.FromArgb(20, 22, 22),
             ForeColor = Color.FromArgb(200, 200, 200),
-            Text = SelectedProfile() is null ? "" : SingBoxConfigBuilder.Build(_state, SelectedProfile()!)
+            Text = SafeLegacyConfigPreview()
         };
         panel.Controls.Add(SettingsTextInput(configBox, height: 420), 0, 1);
         return panel;
@@ -3292,109 +3280,17 @@ public sealed class MainForm : Form
         return panel;
     }
 
-    private Control BuildInformationSection()
-    {
-        var panel = new TableLayoutPanel
-        {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            BackColor = Bg,
-            ColumnCount = 1,
-            RowCount = 5,
-            Padding = new Padding(0, 8, 0, 0)
-        };
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
-
-        var githubLink = new LinkLabel
-        {
-            Text = GitHubRepositoryUrl,
-            Dock = DockStyle.Fill,
-            LinkColor = Color.FromArgb(168, 157, 255),
-            ActiveLinkColor = Color.White,
-            VisitedLinkColor = Color.FromArgb(168, 157, 255),
-            BackColor = Bg,
-            Font = new Font("Segoe UI", 11f, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleLeft
-        };
-        githubLink.LinkClicked += (_, _) => OpenExternalUrl(GitHubRepositoryUrl);
-        panel.Controls.Add(githubLink, 0, 0);
-
-        panel.Controls.Add(new Label
-        {
-            Text = $"{T("info.current.version")}: {AppVersion}",
-            Dock = DockStyle.Fill,
-            ForeColor = TextColor,
-            BackColor = Bg,
-            Font = new Font("Segoe UI", 10f),
-            TextAlign = ContentAlignment.MiddleLeft
-        }, 0, 1);
-
-        var updateStatus = new Label
-        {
-            Text = T("update.checking"),
-            Dock = DockStyle.Fill,
-            ForeColor = Muted,
-            BackColor = Bg,
-            Font = new Font("Segoe UI", 9.5f),
-            TextAlign = ContentAlignment.MiddleLeft
-        };
-        panel.Controls.Add(updateStatus, 0, 2);
-
-        var updateButton = LightButton(T("update.button"), () => { }, primary: true);
-        updateButton.Visible = false;
-        panel.Controls.Add(updateButton, 0, 3);
-
-        _ = CheckForUpdatesAsync(updateStatus, updateButton);
-        return panel;
-    }
-
-    private async Task CheckForUpdatesAsync(Label statusLabel, Button updateButton)
-    {
-        try
-        {
-            var release = await GetLatestReleaseAsync();
-            if (release is null)
-            {
-                statusLabel.Text = T("update.none");
-                return;
-            }
-
-            var latestVersion = NormalizeVersion(release.Tag);
-            if (IsNewerVersion(latestVersion, AppVersion))
-            {
-                statusLabel.Text = $"{T("update.available")}: {release.Tag}";
-                updateButton.Visible = true;
-                updateButton.Click += async (_, _) => await ShowUpdateDialogAsync(release);
-            }
-            else
-            {
-                statusLabel.Text = T("update.latest");
-            }
-        }
-        catch (Exception ex)
-        {
-            statusLabel.Text = GetUpdateCheckFailureMessage(ex);
-            Log($"Update check failed: {FormatExceptionChain(ex)}");
-        }
-    }
-
     private async Task CheckForStartupUpdateAsync()
     {
-        if (_startupUpdatePromptShown) return;
-        _startupUpdatePromptShown = true;
-
         try
         {
             var release = await GetLatestReleaseAsync();
             if (release is null) return;
-            if (IsNewerVersion(NormalizeVersion(release.Tag), AppVersion))
+            if (IsNewerVersion(release.Tag, AppVersion))
             {
-                await ShowUpdateDialogAsync(release);
+                _availableUpdate = release;
+                _updateUiState = UpdateUiState.Available;
+                PushWebSnapshot(includeLogs: false);
             }
         }
         catch (Exception ex)
@@ -3452,7 +3348,7 @@ public sealed class MainForm : Form
         return string.Join(" -> ", parts);
     }
 
-    private async Task<ReleaseInfo?> GetLatestReleaseAsync()
+    private async Task<UpdateRelease?> GetLatestReleaseAsync()
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, GitHubLatestReleaseApiUrl);
         request.Headers.UserAgent.ParseAdd($"ior/{AppVersion}");
@@ -3461,73 +3357,30 @@ public sealed class MainForm : Form
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         var root = doc.RootElement;
-        var latestTag = root.TryGetProperty("tag_name", out var tag) ? tag.GetString() : null;
-        if (string.IsNullOrWhiteSpace(latestTag)) return null;
-
-        var releaseUrl = root.TryGetProperty("html_url", out var url)
-            ? url.GetString() ?? GitHubRepositoryUrl + "/releases/latest"
-            : GitHubRepositoryUrl + "/releases/latest";
-        var asset = FindUpdateAsset(root);
-        return new ReleaseInfo(latestTag, releaseUrl, asset.Name, asset.DownloadUrl);
+        return UpdateReleasePolicy.Parse(root, GitHubRepositoryUrl + "/releases/latest", IsWindows10Package());
     }
 
-    private static (string? Name, string? DownloadUrl) FindUpdateAsset(JsonElement releaseRoot)
+    private async Task DownloadUpdateAsync()
     {
-        if (!releaseRoot.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
+        var release = _availableUpdate ?? throw new InvalidOperationException("Сведения об обновлении отсутствуют.");
+        if (string.IsNullOrWhiteSpace(release.AssetDownloadUrl))
         {
-            return (null, null);
+            OpenExternalUrl(release.ReleaseUrl);
+            return;
         }
-
-        var packageKeywords = IsWindows10Package()
-            ? new[] { "windows-10", "win10" }
-            : new[] { "windows-11", "win11" };
-
-        foreach (var keyword in packageKeywords)
-        {
-            foreach (var asset in assets.EnumerateArray())
-            {
-                var name = asset.TryGetProperty("name", out var nameValue) ? nameValue.GetString() : null;
-                var downloadUrl = asset.TryGetProperty("browser_download_url", out var downloadValue) ? downloadValue.GetString() : null;
-                if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(downloadUrl)) continue;
-                if (!name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) continue;
-                if (name.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-                {
-                    return (name, downloadUrl);
-                }
-            }
-        }
-
-        return (null, null);
-    }
-
-    private Task ShowUpdateDialogAsync(ReleaseInfo release)
-    {
-        using var dialog = new UpdateDialog(release.Tag, release.AssetName is not null, _state.Language);
-        dialog.UpdateRequested += async (_, _) =>
-        {
-            if (string.IsNullOrWhiteSpace(release.AssetDownloadUrl))
-            {
-                OpenExternalUrl(release.ReleaseUrl);
-                dialog.Close();
-                return;
-            }
-
-            await DownloadAndInstallUpdateAsync(release, dialog);
-        };
-        dialog.ShowDialog(this);
-        return Task.CompletedTask;
-    }
-
-    private async Task DownloadAndInstallUpdateAsync(ReleaseInfo release, UpdateDialog dialog)
-    {
+        if (_updateDownloadRunning) return;
+        _updateDownloadRunning = true;
         var updateRoot = Path.Combine(Path.GetTempPath(), "ior-update-" + Guid.NewGuid().ToString("N"));
         var zipPath = Path.Combine(updateRoot, release.AssetName ?? "ior-update.zip");
         var extractPath = Path.Combine(updateRoot, "files");
-        Directory.CreateDirectory(updateRoot);
 
         try
         {
-            dialog.SetBusy(T("update.downloading"));
+            Directory.CreateDirectory(updateRoot);
+            _updateUiState = UpdateUiState.Downloading;
+            _updateError = null;
+            _updatePercent = 0;
+            PushWebSnapshot(includeLogs: false);
             using var response = await _httpClient.GetAsync(release.AssetDownloadUrl, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
 
@@ -3545,12 +3398,12 @@ public sealed class MainForm : Form
                     readTotal += read;
                     if (total is > 0)
                     {
-                        dialog.SetBusy($"{T("update.downloading")} {readTotal * 100 / total.Value}%");
+                        var percent = UpdateReleasePolicy.ProgressPercent(readTotal, total);
+                        if (_updatePercent != percent) { _updatePercent = percent; PushWebSnapshot(includeLogs: false); }
                     }
                 }
             }
 
-            dialog.SetBusy(T("update.preparing"));
             ZipFile.ExtractToDirectory(zipPath, extractPath, overwriteFiles: true);
             var sourcePath = ResolveExtractedUpdateRoot(extractPath);
             if (!File.Exists(Path.Combine(sourcePath, "ior.exe")))
@@ -3558,14 +3411,32 @@ public sealed class MainForm : Form
                 throw new InvalidOperationException(T("update.exe.missing"));
             }
 
-            StartUpdateScript(sourcePath);
-            Application.Exit();
+            _stagedUpdatePath = sourcePath;
+            _stagedUpdateRoot = updateRoot;
+            _updatePercent = 100;
+            _updateUiState = UpdateUiState.Ready;
         }
         catch (Exception ex)
         {
-            dialog.SetError($"{T("update.install.failed")}: {ex.Message}");
+            _updateError = ex.Message;
+            _updateUiState = UpdateUiState.Failed;
+            try { if (Directory.Exists(updateRoot)) Directory.Delete(updateRoot, recursive: true); } catch { }
             Log($"Update failed: {ex.Message}");
         }
+        finally
+        {
+            _updateDownloadRunning = false;
+            PushWebSnapshot(includeLogs: false);
+        }
+    }
+
+    private void ApplyStagedUpdate()
+    {
+        if (_updateUiState != UpdateUiState.Ready || string.IsNullOrWhiteSpace(_stagedUpdatePath))
+            throw new InvalidOperationException("Обновление ещё не подготовлено.");
+        if (string.IsNullOrWhiteSpace(_stagedUpdateRoot)) throw new InvalidOperationException("Не найдена папка подготовленного обновления.");
+        StartUpdateScript(_stagedUpdatePath, _stagedUpdateRoot);
+        Application.Exit();
     }
 
     private static string ResolveExtractedUpdateRoot(string extractPath)
@@ -3591,7 +3462,7 @@ public sealed class MainForm : Form
         return nestedExe is null ? extractPath : Path.GetDirectoryName(nestedExe) ?? extractPath;
     }
 
-    private static void StartUpdateScript(string sourcePath)
+    private static void StartUpdateScript(string sourcePath, string updateRoot)
     {
         var appDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var scriptPath = Path.Combine(Path.GetTempPath(), "ior-update-" + Guid.NewGuid().ToString("N") + ".cmd");
@@ -3601,6 +3472,7 @@ public sealed class MainForm : Form
 setlocal
 set "SRC={sourcePath}"
 set "DST={appDir}"
+set "UPDATEROOT={updateRoot}"
 set "PID={pid}"
 :wait
 tasklist /FI "PID eq %PID%" | find "%PID%" >nul
@@ -3609,6 +3481,7 @@ if not errorlevel 1 (
     goto wait
 )
 robocopy "%SRC%" "%DST%" /E /R:3 /W:1 /NFL /NDL /NJH /NJS >nul
+rmdir /S /Q "%UPDATEROOT%" >nul 2>&1
 start "" "%DST%\ior.exe"
 endlocal
 del "%~f0"
@@ -3623,17 +3496,7 @@ del "%~f0"
         });
     }
 
-    private static string NormalizeVersion(string value)
-    {
-        return value.Trim().TrimStart('v', 'V');
-    }
-
-    private static bool IsNewerVersion(string latest, string current)
-    {
-        return Version.TryParse(latest, out var latestVersion) &&
-               Version.TryParse(current, out var currentVersion) &&
-               latestVersion > currentVersion;
-    }
+    private static bool IsNewerVersion(string latest, string current) => UpdateReleasePolicy.IsNewer(latest, current);
 
     private static void OpenExternalUrl(string url)
     {
@@ -3724,7 +3587,7 @@ del "%~f0"
             BorderStyle = BorderStyle.None,
             BackColor = Color.FromArgb(20, 22, 22),
             ForeColor = Color.FromArgb(200, 200, 200),
-            Text = SelectedProfile() is null ? "" : SingBoxConfigBuilder.Build(_state, SelectedProfile()!)
+            Text = SafeLegacyConfigPreview()
         };
         panel.Controls.Add(SettingsTextInput(configBox, height: 420), 0, 1);
         page.Controls.Add(panel);
@@ -4705,10 +4568,10 @@ del "%~f0"
         return "UN";
     }
 
-    private async Task<bool> ImportProfilesFromTextAsync(string text, string? requestedSubscriptionName = null)
+    private async Task<bool> ImportProfilesFromTextAsync(string text, string? requestedSubscriptionName = null, bool importAsProfile = false)
     {
         var importText = text.Trim();
-        if (LooksLikeSubscriptionUrl(importText))
+        if (!importAsProfile && LooksLikeSubscriptionUrl(importText))
         {
             try
             {
@@ -4723,10 +4586,12 @@ del "%~f0"
             }
         }
 
-        var parsed = ProfileParser.ParseManyDetailed(importText).Profiles;
+        var importResult = ProfileParser.ParseManyDetailed(importText);
+        var parsed = importResult.Profiles;
+        if (importResult.RemovedProtocolCount > 0) Log(RemovedProtocolPolicy.Message);
         if (parsed.Count == 0)
         {
-            MessageBox.Show(T("import.none"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(importResult.RemovedProtocolCount > 0 ? RemovedProtocolPolicy.Message : T("import.none"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
             return false;
         }
 
@@ -4762,6 +4627,7 @@ del "%~f0"
 
     private bool CommitSubscription(string url, string? requestedName, SubscriptionFetchResult fetched)
     {
+        url = SubscriptionService.NormalizeUrl(url);
         if (fetched.Profiles.Count == 0)
         {
             MessageBox.Show(T("import.none"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -4786,6 +4652,9 @@ del "%~f0"
         try
         {
             var merged = SubscriptionService.Apply(_state, subscription, fetched);
+            // An explicit import also activates an existing subscription in the current workspace.
+            ConnectionWorkspaceService.AttachSubscription(_state, subscription);
+            ValidateSelectedConfigIfEnabled();
             if (!string.IsNullOrWhiteSpace(merged.Warning)) Log(merged.Warning);
             RefreshProfiles();
             RefreshMainPreview();
@@ -4803,12 +4672,16 @@ del "%~f0"
     private async Task RefreshSubscriptionAsync(ProxySubscription subscription, bool showErrors = false)
     {
         if (!_subscriptionsRefreshing.Add(subscription.Id)) return;
+        var stopwatch = Stopwatch.StartNew();
         subscription.LastError = null;
         RefreshProfiles();
         try
         {
             var fetched = await SubscriptionService.FetchAsync(_httpClient, subscription.Url);
+            subscription.LastResponseMs = stopwatch.ElapsedMilliseconds;
+            var previousSelectedId = _state.SelectedProfileId;
             var merged = SubscriptionService.Apply(_state, subscription, fetched);
+            ConnectionWorkspaceService.ReconcileAfterRefresh(_state, subscription, previousSelectedId);
             if (!string.IsNullOrWhiteSpace(merged.Warning)) Log(merged.Warning);
             Log($"Subscription {subscription.Name} refreshed: +{merged.Added}, updated {merged.Updated}, removed {merged.Removed}.");
         }
@@ -4822,6 +4695,7 @@ del "%~f0"
         finally
         {
             _subscriptionsRefreshing.Remove(subscription.Id);
+            SubscriptionRefreshSchedule.ScheduleNext(subscription, DateTime.UtcNow);
             RefreshProfiles();
             RefreshMainPreview();
             SaveState();
@@ -4854,7 +4728,7 @@ del "%~f0"
     private static bool LooksLikeSubscriptionUrl(string text)
     {
         return Uri.TryCreate(text, UriKind.Absolute, out var uri) &&
-               (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+               (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == "clash");
     }
 
     private static SubscriptionInfo? ParseSubscriptionInfo(HttpResponseMessage response)
@@ -4919,9 +4793,11 @@ del "%~f0"
         SaveState();
     }
 
-    private async Task ToggleConnectionAsync()
+    private async Task<bool> ToggleConnectionAsync()
     {
-        if (_connectionTransitionInProgress) return;
+        if (_shutdownRequested) return false;
+        if (IsNativeTunValidationRunning()) { Log("Дождитесь завершения базовой проверки Reality TUN."); return false; }
+        if (_connectionTransitionInProgress) return false;
 
         _connectionTransitionInProgress = true;
         _powerButton.Enabled = false;
@@ -4932,12 +4808,22 @@ del "%~f0"
             if (_process is { HasExited: false } || hasTrackedProcess)
             {
                 SetConnectionVisualState(ConnectionVisualState.Disconnecting);
-                await StopSingBoxAsync();
+                if (!await StopSingBoxAsync())
+                {
+                    SetConnectionVisualState(ConnectionVisualState.Connected);
+                    return false;
+                }
+                return true;
             }
             else
             {
                 SetConnectionVisualState(ConnectionVisualState.Connecting);
-                if (!await StartSingBoxAsync()) await ShowConnectionFailedAsync();
+                if (!await StartSingBoxAsync())
+                {
+                    await ShowConnectionFailedAsync();
+                    return false;
+                }
+                return true;
             }
         }
         finally
@@ -4970,31 +4856,58 @@ del "%~f0"
                Path.GetFileName(baseDir).Equals("windows-10", StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task ApplyConnectionModeAsync(bool tunEnabled)
+    private async Task<bool> ApplyConnectionModeAsync(bool tunEnabled)
     {
-        if (_connectionTransitionInProgress) return;
+        if (_shutdownRequested) return false;
+        if (IsNativeTunValidationRunning()) return false;
+        if (_connectionTransitionInProgress) return false;
+        if (_state.TunEnabled == tunEnabled) return true;
+        var wasRunning = IsConnectionRunning();
+        var runningProfile = wasRunning
+            ? _state.RunningProfileSnapshot ?? _state.Profiles.FirstOrDefault(profile => profile.Id == _state.RunningServerId)
+            : null;
+        var previousTun = _state.TunEnabled;
+        var previousMixedProxy = _state.MixedProxyEnabled;
+        _state.TunEnabled = tunEnabled;
+        _state.MixedProxyEnabled = true;
+        var supported = !wasRunning || CoreEngineService.CanRun(_state, runningProfile, out _);
+        _state.TunEnabled = previousTun;
+        _state.MixedProxyEnabled = previousMixedProxy;
+        if (!supported) return false;
         _connectionTransitionInProgress = true;
         _powerButton.Enabled = false;
         try
         {
-        var wasRunning = _process is { HasExited: false };
         if (wasRunning)
         {
             SetConnectionVisualState(ConnectionVisualState.Disconnecting);
-            await StopSingBoxAsync();
+            if (!await StopSingBoxAsync())
+            {
+                SetConnectionVisualState(ConnectionVisualState.Connected);
+                return false;
+            }
         }
 
         _state.TunEnabled = tunEnabled;
         _state.MixedProxyEnabled = true;
         SaveState();
         RefreshMainPreview();
-        Log(tunEnabled ? "Mode changed: TUN" : "Mode changed: Proxy");
-
         if (wasRunning)
         {
             SetConnectionVisualState(ConnectionVisualState.Connecting);
-            if (!await StartSingBoxAsync()) await ShowConnectionFailedAsync();
+            if (!await StartSingBoxAsync(runningProfile))
+            {
+                _state.TunEnabled = previousTun;
+                _state.MixedProxyEnabled = previousMixedProxy;
+                SaveState();
+                RefreshMainPreview();
+                if (!await StartSingBoxAsync(runningProfile)) await ShowConnectionFailedAsync();
+                else Log("Previous connection mode restored after startup failure.");
+                return false;
+            }
         }
+        Log(tunEnabled ? "Mode changed: TUN" : "Mode changed: Proxy");
+        return true;
         }
         finally
         {
@@ -5005,12 +4918,20 @@ del "%~f0"
 
     private void RecoverConnectionState()
     {
+        try { _xrayTunRouteLease = XrayTunRouteLease.LoadForRecovery(_appDir); }
+        catch (Exception ex) { Log($"TUN network journal cannot be read: {ex.Message}"); }
         if (TryGetTrackedSingBoxProcess(out var trackedProcess))
         {
             trackedProcess.Dispose();
             SetConnected();
-            Log($"Recovered active sing-box process: PID {_state.ActiveProcessId}.");
+            Log($"Recovered active {CoreEngineService.ActiveBackend(_state, true)} process: PID {_state.ActiveProcessId}.");
             return;
+        }
+
+        if (_xrayTunRouteLease is not null)
+        {
+            try { Task.Run(ReleaseXrayTunRoutesAsync).GetAwaiter().GetResult(); Log("TUN: предыдущее состояние сети восстановлено."); }
+            catch (Exception ex) { Log($"TUN network recovery failed: {ex.Message}"); }
         }
 
         if (_state.ActiveProcessId is not null || _state.SystemProxyApplied)
@@ -5029,6 +4950,7 @@ del "%~f0"
     private bool TryGetTrackedSingBoxProcess(out Process process)
     {
         process = null!;
+        var expectedName = _state.RunningCore switch { CoreKind.XrayCore => "xray", CoreKind.IorCore => "ior-core", _ => "sing-box" };
         if (_state.ActiveProcessId is not { } processId)
         {
             return TryGetSingBoxProcessByListeningPort(out process);
@@ -5043,7 +4965,7 @@ del "%~f0"
                 return TryGetSingBoxProcessByListeningPort(out process);
             }
 
-            if (!candidate.ProcessName.Contains("sing-box", StringComparison.OrdinalIgnoreCase))
+            if (!candidate.ProcessName.Contains(expectedName, StringComparison.OrdinalIgnoreCase))
             {
                 candidate.Dispose();
                 return TryGetSingBoxProcessByListeningPort(out process);
@@ -5061,6 +4983,7 @@ del "%~f0"
     private bool TryGetSingBoxProcessByListeningPort(out Process process)
     {
         process = null!;
+        var expectedName = _state.RunningCore switch { CoreKind.XrayCore => "xray", CoreKind.IorCore => "ior-core", _ => "sing-box" };
         try
         {
             var startInfo = new ProcessStartInfo
@@ -5091,7 +5014,7 @@ del "%~f0"
 
                 var candidate = Process.GetProcessById(portProcessId);
                 if (candidate.HasExited ||
-                    !candidate.ProcessName.Contains("sing-box", StringComparison.OrdinalIgnoreCase))
+                    !candidate.ProcessName.Contains(expectedName, StringComparison.OrdinalIgnoreCase))
                 {
                     candidate.Dispose();
                     continue;
@@ -5117,20 +5040,43 @@ del "%~f0"
         _ = StartSingBoxAsync();
     }
 
-    private Task<bool> StartSingBoxAsync()
+    private Task<bool> StartSingBoxAsync(ProxyProfile? overrideProfile = null)
     {
-        return StartSingBoxCoreAsync(allowStartupRetry: true);
+        Interlocked.Increment(ref _processLogGeneration);
+        _runtimeConnectionWarning = null;
+        return _state.SelectedCore switch
+        {
+            CoreKind.SingBox => StartSingBoxCoreAsync(allowStartupRetry: true, overrideProfile),
+            CoreKind.XrayCore => StartXrayAsync(overrideProfile),
+            CoreKind.IorCore => StartIorCoreAsync(overrideProfile),
+            _ => RejectUnavailableCoreAsync()
+        };
     }
 
-    private async Task<bool> StartSingBoxCoreAsync(bool allowStartupRetry)
+    private Task<bool> RejectUnavailableCoreAsync()
     {
+        var reason = CoreEngineService.ConnectionUnavailableReason(_state.SelectedCore);
+        Log(reason);
+        MessageBox.Show(reason, "ior", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        return Task.FromResult(false);
+    }
+
+    private async Task<bool> StartSingBoxCoreAsync(bool allowStartupRetry, ProxyProfile? overrideProfile = null)
+    {
+        Interlocked.Increment(ref _processLogGeneration);
+        if (!CoreEngineService.CanConnect(_state.SelectedCore))
+        {
+            Log($"The selected engine {_state.SelectedCore} is not ready for connections.");
+            MessageBox.Show(CoreEngineService.ConnectionUnavailableReason(_state.SelectedCore), "ior", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
         if (_process is { HasExited: false })
         {
             Log("sing-box is already running.");
             return true;
         }
 
-        var profile = SelectedProfile();
+        var profile = overrideProfile ?? SelectedProfile();
         if (profile is null)
         {
             MessageBox.Show(T("start.select.profile"), T("start.title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -5138,8 +5084,42 @@ del "%~f0"
         }
 
         SaveSettings();
-        if (!TryWriteConfig(profile)) return false;
-        if (!ValidateSingBoxConfig()) return false;
+        _tunLoopGuard.Reset();
+        Interlocked.Exchange(ref _tunLoopStopScheduled, 0);
+        string? resolvedServer = null;
+        if (_state.TunEnabled && !System.Net.IPAddress.TryParse(profile.Server, out _))
+        {
+            try
+            {
+                resolvedServer = (await BootstrapDnsResolver.ResolveIpv4Async(profile.Server, _state.BootstrapDnsServer)).ToString();
+                Log($"Bootstrap DNS: {profile.Server} → {resolvedServer}");
+            }
+            catch (Exception ex)
+            {
+                Log(ex.Message);
+                MessageBox.Show(ex.Message, "Не удалось подготовить TUN", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+        }
+        string? outboundInterface = null;
+        if (_state.TunEnabled)
+        {
+            try
+            {
+                var endpoint = System.Net.IPAddress.Parse(resolvedServer ?? profile.Server);
+                outboundInterface = PhysicalInterfaceResolver.ForIpv4(endpoint);
+                Log($"TUN outbound interface: {outboundInterface}");
+            }
+            catch (Exception ex)
+            {
+                Log($"TUN interface preflight failed: {ex.Message}");
+                MessageBox.Show(ex.Message, "Не удалось подготовить TUN", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+        }
+
+        if (!TryWriteConfig(profile, resolvedServer, outboundInterface) || !ValidateSingBoxConfig())
+        {  return false; }
 
         var startInfo = new ProcessStartInfo
         {
@@ -5154,18 +5134,25 @@ del "%~f0"
         try
         {
             _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-            _process.OutputDataReceived += (_, e) => LogFromProcess(e.Data);
-            _process.ErrorDataReceived += (_, e) => LogFromProcess(e.Data);
+            var logGeneration = Interlocked.Read(ref _processLogGeneration);
+            _process.OutputDataReceived += (sender, e) => { if (ReferenceEquals(sender, _process)) LogFromProcess(e.Data, logGeneration); };
+            _process.ErrorDataReceived += (sender, e) => { if (ReferenceEquals(sender, _process)) LogFromProcess(e.Data, logGeneration); };
             var startedProcess = _process;
             _process.Exited += (_, _) => BeginInvoke(new Action(() =>
             {
                 if (!ReferenceEquals(_process, startedProcess)) return;
                 var exitCode = TryGetExitCode(startedProcess);
+                RestoreSystemProxyIfNeeded();
                 SetDisconnected();
                 Log($"sing-box exited with code {exitCode}.");
+
             }));
             _process.Start();
             _state.ActiveProcessId = _process.Id;
+            _state.RunningCore = CoreKind.SingBox;
+            _state.RunningServerId = profile.Id;
+            _state.RunningServerName = profile.Name;
+            _state.RunningProfileSnapshot = JsonSerializer.Deserialize<ProxyProfile>(JsonSerializer.Serialize(profile));
             _state.ActiveConnectionStartedUtc = DateTime.UtcNow;
             SaveState();
             _process.BeginOutputReadLine();
@@ -5190,17 +5177,19 @@ del "%~f0"
                 SetDisconnected();
                 Log($"sing-box startup did not become ready ({exitCode}).");
 
+
                 if (allowStartupRetry && _state.TunEnabled)
                 {
                     Log("Retrying TUN startup once.");
                     SetConnectionVisualState(ConnectionVisualState.Connecting);
                     await Task.Delay(SingBoxStartupRetryDelayMs);
-                    return await StartSingBoxCoreAsync(allowStartupRetry: false);
+                    return await StartSingBoxCoreAsync(allowStartupRetry: false, overrideProfile);
                 }
 
                 MessageBox.Show(T("connection.not.ready"), T("connection.failed"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return false;
             }
+
 
             ApplySystemProxyIfNeeded();
             SetConnected();
@@ -5209,7 +5198,7 @@ del "%~f0"
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
     }
@@ -5255,6 +5244,14 @@ del "%~f0"
 
     private void StopSingBox()
     {
+
+        if (_iorControlClient is { } nativeClient)
+        {
+            _iorControlClient = null;
+            if(ReferenceEquals(_process,nativeClient.Process))_process=null;
+            Task.Run(async () => await nativeClient.DisposeAsync()).GetAwaiter().GetResult();
+            _process = null;
+        }
         try
         {
             if (_process is { HasExited: false })
@@ -5279,13 +5276,26 @@ del "%~f0"
         }
         finally
         {
+            try { Task.Run(ReleaseXrayTunRoutesAsync).GetAwaiter().GetResult(); }
+            catch (Exception ex) { Log($"Xray TUN route cleanup failed: {ex.Message}"); }
             RestoreSystemProxyIfNeeded();
             SetDisconnected();
         }
     }
 
-    private async Task StopSingBoxAsync()
+    private async Task<bool> StopSingBoxAsync()
     {
+
+        if (_iorControlClient is { } nativeClient)
+        {
+            _iorControlClient = null;
+            if(ReferenceEquals(_process,nativeClient.Process))_process=null;
+            await nativeClient.DisposeAsync();
+            _process = null;
+            await ReleaseXrayTunRoutesAsync();
+            RestoreSystemProxyIfNeeded(); SetDisconnected();
+            return true;
+        }
         string? stoppedMessage = null;
         string? errorMessage = null;
         var trackedByPort = false;
@@ -5302,9 +5312,10 @@ del "%~f0"
                 await Task.Run(() =>
                 {
                     process.Kill(entireProcessTree: true);
-                    process.WaitForExit(3000);
+                    if (!process.WaitForExit(3000)) throw new TimeoutException("Ядро не завершилось за 3 секунды.");
                 });
-                stoppedMessage = trackedByPort ? "tracked sing-box process stopped." : "sing-box stopped.";
+                var coreName = CoreEngineService.ActiveBackend(_state, true) ?? "core";
+                stoppedMessage = trackedByPort ? $"tracked {coreName} process stopped." : $"{coreName} stopped.";
             }
         }
         catch (Exception ex)
@@ -5316,10 +5327,13 @@ del "%~f0"
             if (trackedByPort) process?.Dispose();
         }
 
-        if (errorMessage is not null) Log(errorMessage);
-        else if (stoppedMessage is not null) Log(stoppedMessage);
+        if (errorMessage is not null) { Log(errorMessage); return false; }
+        if (stoppedMessage is not null) Log(stoppedMessage);
+        try { await ReleaseXrayTunRoutesAsync(); }
+        catch (Exception ex) { errorMessage = $"Xray TUN route cleanup failed: {ex.Message}"; Log(errorMessage); }
         RestoreSystemProxyIfNeeded();
         SetDisconnected();
+        return errorMessage is null;
     }
 
     private void ApplySystemProxyIfNeeded()
@@ -5340,7 +5354,8 @@ del "%~f0"
             _state.SystemProxyApplied = true;
 
             key.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
-            key.SetValue("ProxyServer", $"http=127.0.0.1:{_state.MixedProxyPort};https=127.0.0.1:{_state.MixedProxyPort};socks=127.0.0.1:{_state.MixedProxyPort}", RegistryValueKind.String);
+            var socksPort = _state.RunningCore == CoreKind.XrayCore ? _state.MixedProxyPort + 1 : _state.MixedProxyPort;
+            key.SetValue("ProxyServer", $"http=127.0.0.1:{_state.MixedProxyPort};https=127.0.0.1:{_state.MixedProxyPort};socks=127.0.0.1:{socksPort}", RegistryValueKind.String);
             key.SetValue("ProxyOverride", "<local>", RegistryValueKind.String);
             RefreshWindowsProxy();
             SaveState();
@@ -5483,17 +5498,43 @@ del "%~f0"
         _connectTimer.Start();
         SetConnectionVisualState(ConnectionVisualState.Connected);
         UpdateConnectionTimer();
+        RefreshServiceProbeClient(connected: true);
     }
 
     private void SetDisconnected()
     {
+        _state.NativeTunReadiness=null;
+        _runtimeConnectionWarning = null;
         _connectedAt = null;
         _state.ActiveProcessId = null;
+        _state.RunningCore = null;
+        _state.RunningServerId = null;
+        _state.RunningServerName = null;
+        _state.RunningProfileSnapshot = null;
         _state.ActiveConnectionStartedUtc = null;
         SaveState();
         _connectTimer.Stop();
         _timerLabel.Text = "00:00:00";
         SetConnectionVisualState(ConnectionVisualState.Disconnected);
+        RefreshServiceProbeClient(connected: false);
+    }
+
+    private void RefreshServiceProbeClient(bool connected)
+    {
+        _statusProbeCts?.Cancel();
+        var previous = _serviceProbeClient;
+        var useProxy = connected && !_state.TunEnabled && _state.MixedProxyEnabled;
+        _serviceProbeClient = new HttpClient(new SocketsHttpHandler
+        {
+            UseProxy = useProxy,
+            Proxy = useProxy ? new System.Net.WebProxy("127.0.0.1", _state.MixedProxyPort) : null,
+            ConnectTimeout = TimeSpan.FromSeconds(3),
+            PooledConnectionLifetime = TimeSpan.FromSeconds(30)
+        });
+        previous.Dispose();
+        _lastServiceCheckUtc = DateTime.MinValue;
+        foreach (var target in _state.ServiceMonitorTargets) _serviceStatusStrip.ResetStatus(target.Id);
+        _ = UpdatePingAndServicesAsync(force: true);
     }
 
     private void UpdateConnectionTimer()
@@ -5573,14 +5614,32 @@ del "%~f0"
         TryWriteConfig(profile);
     }
 
-    private bool TryWriteConfig(ProxyProfile profile)
+    private string SafeLegacyConfigPreview()
     {
-        File.WriteAllText(_configPath, SingBoxConfigBuilder.Build(_state, profile));
-        Log($"Config written: {_configPath}");
-        return true;
+        var profile = SelectedProfile();
+        if (profile is null) return "";
+        try { return SingBoxConfigBuilder.Build(_state, profile); }
+        catch (Exception ex) when (ex is FormatException or NotSupportedException)
+        { return "Конфигурация sing-box недоступна для выбранного профиля: " + ex.Message; }
     }
 
-    private bool ValidateSingBoxConfig()
+    private bool TryWriteConfig(ProxyProfile profile, string? resolvedServer = null, string? outboundInterface = null)
+    {
+        try
+        {
+            var generated = SingBoxConfigBuilder.Build(_state, profile, resolvedServer, outboundInterface);
+            File.WriteAllText(_configPath, generated);
+            Log($"Config written: {_configPath}");
+            return true;
+        }
+        catch (Exception ex) when (ex is FormatException or NotSupportedException)
+        {
+            Log($"Routing configuration rejected: {ex.Message}");
+            return false;
+        }
+    }
+
+    private bool ValidateSingBoxConfig(bool showErrors = true)
     {
         try
         {
@@ -5601,7 +5660,7 @@ del "%~f0"
             if (!process.WaitForExit(10000))
             {
                 process.Kill(entireProcessTree: true);
-                MessageBox.Show(T("config.check.timeout"), T("config.check.failed"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+                if (showErrors) MessageBox.Show(T("config.check.timeout"), T("config.check.failed"), MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Log("sing-box check timed out.");
                 return false;
             }
@@ -5613,12 +5672,12 @@ del "%~f0"
 
             if (process.ExitCode == 0) return true;
 
-            MessageBox.Show(T("config.rejected"), T("config.check.failed"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (showErrors) MessageBox.Show(T("config.rejected"), T("config.check.failed"), MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.Message, T("config.check.cannot.run"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (showErrors) MessageBox.Show(ex.Message, T("config.check.cannot.run"), MessageBoxButtons.OK, MessageBoxIcon.Error);
             Log($"sing-box check failed: {ex.Message}");
             return false;
         }
@@ -5694,7 +5753,7 @@ del "%~f0"
             _statusProbeCts?.Cancel();
         }
 
-        if (!force && (DateTime.UtcNow - _lastServiceCheckUtc).TotalSeconds < 4) return;
+        if (!force && (DateTime.UtcNow - _lastServiceCheckUtc).TotalSeconds < (_state.PowerSavingMode ? 30 : 4)) return;
         _serviceCheckRunning = true;
         _lastServiceCheckUtc = DateTime.UtcNow;
         var version = Interlocked.Increment(ref _statusProbeVersion);
@@ -5714,7 +5773,7 @@ del "%~f0"
 
             _healthyServiceCount = 0;
             _checkedServiceCount = 0;
-            var targets = _state.ServiceMonitorTargets.Take(3).ToArray();
+            var targets = _state.ServiceMonitorTargets.ToArray();
             await Task.WhenAll(targets.Select(target => UpdateServiceStatusAsync(target, token)));
             if (token.IsCancellationRequested || version != _statusProbeVersion) return;
             UpdateConnectionQuality(profile);
@@ -5769,14 +5828,15 @@ del "%~f0"
 
     private async Task<bool> ProbeServiceAsync(string url, CancellationToken cancellationToken)
     {
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(2200));
-        if (await TryProbeServiceAsync(HttpMethod.Head, url, timeoutCts.Token) is { } headResult)
+        using (var headTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
         {
-            if (headResult) return true;
+            headTimeout.CancelAfter(TimeSpan.FromSeconds(4));
+            if (await TryProbeServiceAsync(HttpMethod.Head, url, headTimeout.Token) == true) return true;
         }
-
-        return await TryProbeServiceAsync(HttpMethod.Get, url, timeoutCts.Token) ?? false;
+        cancellationToken.ThrowIfCancellationRequested();
+        using var getTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        getTimeout.CancelAfter(TimeSpan.FromSeconds(4));
+        return await TryProbeServiceAsync(HttpMethod.Get, url, getTimeout.Token) ?? false;
     }
 
     private async Task<bool?> TryProbeServiceAsync(HttpMethod method, string url, CancellationToken cancellationToken)
@@ -5785,7 +5845,8 @@ del "%~f0"
         {
             using var request = new HttpRequestMessage(method, url);
             request.Headers.TryAddWithoutValidation("User-Agent", $"ior/{AppVersion}");
-            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            using var response = await _serviceProbeClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            if (method == HttpMethod.Head && response.StatusCode == System.Net.HttpStatusCode.MethodNotAllowed) return false;
             return (int)response.StatusCode < 500;
         }
         catch
@@ -5912,6 +5973,7 @@ del "%~f0"
             SaveState();
             _profiles.Invalidate();
             _serverTree.Invalidate();
+            PushWebSnapshot();
         }
         catch (Exception ex)
         {
@@ -5933,6 +5995,13 @@ del "%~f0"
         _serverIdentity.SetProfile(profile);
         _latencyChart.SetSnapshot(_latencyMonitor.SnapshotFor(profile));
         Invalidate(true);
+    }
+
+    private void ApplyPowerSavingMode()
+    {
+        _trafficTimer.Interval = _state.PowerSavingMode ? 3000 : 750;
+        _webUiSnapshotTimer.Interval = _state.PowerSavingMode ? 2000 : 1000;
+        _latencyMonitor.LowPowerMode = _state.PowerSavingMode;
     }
 
     private void RefreshLatencyUi()
@@ -6103,7 +6172,10 @@ del "%~f0"
 
     private static string SubscriptionPreviewText(SubscriptionFetchResult result)
     {
-        return ProfilePreviewText(result.Profiles, result.RejectedCount);
+        var preview = ProfilePreviewText(result.Profiles, result.RejectedCount);
+        if (result.IsClashYaml && result.ClashRouting is { } routing)
+            preview += $"{Environment.NewLine}Маршрут Clash: {routing.ClashOrderedRules.Count} правил. Поддержка групп и провайдеров проверяется отдельно до подключения.";
+        return preview;
     }
 
     private static string ProfilePreviewText(IReadOnlyList<ProxyProfile> profiles, int rejectedCount)
@@ -6484,12 +6556,20 @@ del "%~f0"
     {
         try
         {
+            if (File.Exists(path) && !File.Exists(path + ".pre-webui.backup"))
+            {
+                File.Copy(path, path + ".pre-webui.backup", overwrite: false);
+            }
             var state = File.Exists(path)
                 ? JsonSerializer.Deserialize<AppState>(File.ReadAllText(path), JsonOptions()) ?? new AppState()
                 : new AppState();
+            if (File.Exists(path) && state.Profiles.Any(RemovedProtocolPolicy.IsRemoved) && !File.Exists(path + ".pre-amnezia-removal.backup"))
+                File.Copy(path, path + ".pre-amnezia-removal.backup", overwrite: false);
+            RemovedProtocolPolicy.Migrate(state);
             SeedDefaultRoutingSites(state);
             NormalizeSubscriptions(state);
             NormalizeHappRoutingProfiles(state);
+            MigrateWebUiState(state);
             ServiceMonitorCatalog.NormalizeTargets(state);
             return state;
         }
@@ -6499,9 +6579,62 @@ del "%~f0"
             SeedDefaultRoutingSites(state);
             NormalizeSubscriptions(state);
             NormalizeHappRoutingProfiles(state);
+            MigrateWebUiState(state);
             ServiceMonitorCatalog.NormalizeTargets(state);
             return state;
         }
+    }
+
+    private static void MigrateWebUiState(AppState state)
+    {
+        state.ConnectionProfiles ??= [];
+        state.HappRoutingProfiles ??= [];
+        foreach (var route in state.HappRoutingProfiles)
+        {
+            route.Source = route.Links.Count > 0 ? RoutingProfileSource.Happ : route.Source;
+            route.ProxySites ??= [];
+            route.DirectSites ??= [];
+            route.BlockSites ??= [];
+            route.ProxyIp ??= [];
+            route.DirectIp ??= [];
+            route.BlockIp ??= [];
+        }
+
+        if (state.HappRoutingProfiles.Count == 0)
+        {
+            var localRoute = new HappRoutingProfile
+            {
+                Name = "Умный маршрут",
+                Source = RoutingProfileSource.Ior,
+                GlobalProxy = true,
+                ProxySites = state.RoutingProxySites.Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                DirectSites = state.RoutingBypassSites.Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+            };
+            state.HappRoutingProfiles.Insert(0, localRoute);
+            state.SelectedHappRoutingProfileId ??= localRoute.Id;
+        }
+
+        if (state.ConnectionProfiles.Count == 0)
+        {
+            var selected = state.Profiles.FirstOrDefault(profile => profile.Id == state.SelectedProfileId) ?? state.Profiles.FirstOrDefault();
+            state.ConnectionProfiles.Add(new ConnectionWorkspaceProfile
+            {
+                Name = "Основной",
+                SubscriptionId = selected?.SubscriptionId,
+                RoutingProfileId = state.SelectedHappRoutingProfileId,
+                DefaultServerId = selected?.Id,
+                ConfigIds = state.Profiles.Where(profile => string.IsNullOrWhiteSpace(profile.SubscriptionId)).Select(profile => profile.Id).ToList()
+            });
+        }
+
+        state.SelectedConnectionProfileId = state.ConnectionProfiles.Any(profile => profile.Id == state.SelectedConnectionProfileId)
+            ? state.SelectedConnectionProfileId
+            : state.ConnectionProfiles.FirstOrDefault()?.Id;
+        foreach (var subscription in state.Subscriptions)
+        {
+            SubscriptionRefreshSchedule.Normalize(subscription, DateTime.UtcNow);
+        }
+        state.SchemaVersion = 2;
     }
 
     private static void SeedDefaultRoutingSites(AppState state)
@@ -6523,6 +6656,26 @@ del "%~f0"
             if (string.IsNullOrWhiteSpace(profile.Id)) profile.Id = Guid.NewGuid().ToString("N");
             if (string.IsNullOrWhiteSpace(profile.Name)) profile.Name = "Happ routing";
             profile.Links = ParseRoutingLinks(string.Join(Environment.NewLine, profile.Links ?? []));
+        }
+
+        // One routing link may have arrived from several subscriptions or old imports.
+        // Keep a single profile and redirect subscription/workspace references to it.
+        var duplicates = state.HappRoutingProfiles
+            .Where(profile => profile.Source == RoutingProfileSource.Happ)
+            .GroupBy(profile => (profile.ManagedBySubscriptionId is null ? "user:" : "managed:") +
+                string.Join('\n', profile.Links.OrderBy(link => link, StringComparer.OrdinalIgnoreCase)), StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Key.Length > 0 && group.Count() > 1);
+        foreach (var group in duplicates)
+        {
+            var keep = group.FirstOrDefault(profile => profile.Id == state.SelectedHappRoutingProfileId) ?? group.First();
+            foreach (var duplicate in group.Where(profile => profile.Id != keep.Id).ToList())
+            {
+                foreach (var subscription in state.Subscriptions.Where(item => item.RoutingProfileId == duplicate.Id))
+                    subscription.RoutingProfileId = keep.Id;
+                foreach (var workspace in state.ConnectionProfiles.Where(profile => profile.RoutingProfileId == duplicate.Id))
+                    workspace.RoutingProfileId = keep.Id;
+                state.HappRoutingProfiles.Remove(duplicate);
+            }
         }
 
         if (state.HappRoutingProfiles.Count == 0 && state.HappRoutingLinks.Count > 0)
@@ -6643,11 +6796,60 @@ del "%~f0"
         };
     }
 
-    private void LogFromProcess(string? line)
+    private void LogFromProcess(string? line, long? generation = null)
     {
+        var logGeneration = generation ?? Interlocked.Read(ref _processLogGeneration);
+        if (logGeneration != Interlocked.Read(ref _processLogGeneration)) return;
         if (string.IsNullOrWhiteSpace(line) || IsDisposed || Disposing) return;
 
-        _pendingProcessLogs.Enqueue(line);
+        _loadMonitor.RecordProcessLine(line);
+        var tunObservation = _state.RunningCore == CoreKind.SingBox && _state.TunEnabled
+            ? _tunLoopGuard.Record(line, DateTime.UtcNow) : TunLoopObservation.None;
+        if (_state.RunningCore == CoreKind.XrayCore && _state.TunEnabled && _xrayDirectHelper is { } directHelper &&
+            XrayTunFlowParser.TryParseTcp(line, out var directSource, out var directDestination) && directHelper.IsOwnTcpFlow(directSource!, directDestination!))
+        {
+            tunObservation = TunLoopObservation.ConfirmedRouteLoop;
+            Diagnostics.Record("egress", "DIRECT_SOCKET_REENTERED_TUN", ("destination", directDestination!.ToString()));
+        }
+        if (tunObservation == TunLoopObservation.UnconfirmedBurst)
+        {
+            const string destinationMarker = "outbound connection to ";
+            var markerIndex = line.IndexOf(destinationMarker, StringComparison.OrdinalIgnoreCase);
+            if (markerIndex >= 0)
+            {
+                var endpoint = line[(markerIndex + destinationMarker.Length)..].Trim();
+                var separator = endpoint.LastIndexOf(':');
+                if (separator > 0 && IPAddress.TryParse(endpoint[..separator], out var destination) &&
+                    PhysicalInterfaceResolver.IsIorTunBestRouteForIpv4(destination))
+                    tunObservation = TunLoopObservation.ConfirmedRouteLoop;
+            }
+        }
+        if (tunObservation == TunLoopObservation.UnconfirmedBurst && IsHandleCreated)
+            BeginInvoke(new Action(() => Log("TUN: частые direct-подключения к одному адресу; это ещё не подтверждает сетевую петлю.")));
+        if ((tunObservation is TunLoopObservation.SocketExhausted or TunLoopObservation.ConfirmedRouteLoop) && IsHandleCreated &&
+            Interlocked.Exchange(ref _tunLoopStopScheduled, 1) == 0)
+        {
+            BeginInvoke(new Action(async () =>
+            {
+                try
+                {
+                    if (_state.RunningCore is not (CoreKind.SingBox or CoreKind.XrayCore) || !_state.TunEnabled) return;
+                    Log(tunObservation == TunLoopObservation.ConfirmedRouteLoop
+                        ? "TUN direct socket re-entered the ior adapter; stopping the core to protect the system."
+                        : "TUN direct socket exhaustion detected; stopping the core to protect the system.");
+                    await StopSingBoxAsync();
+                    MessageBox.Show(tunObservation == TunLoopObservation.ConfirmedRouteLoop
+                            ? "Подтверждена сетевая петля: DIRECT-трафик возвращается в адаптер ior. Подключение остановлено до перегрузки компьютера."
+                            : "Исчерпаны сокетные ресурсы при работе TUN. Подключение остановлено, чтобы не перегружать компьютер. Проверьте журнал и сетевые маршруты.",
+                        "Подключение остановлено", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                catch (Exception ex) { Log($"TUN loop shutdown failed: {ex.Message}"); }
+            }));
+        }
+        var keep = _processLogLimiter.TryAccept(line, out var summary);
+        if (summary is not null) _pendingProcessLogs.Enqueue((summary, logGeneration));
+        if (keep) _pendingProcessLogs.Enqueue((line, logGeneration));
+        if (!keep && summary is null) return;
         if (IsHandleCreated && Interlocked.Exchange(ref _logFlushScheduled, 1) == 0)
         {
             BeginInvoke(new Action(() =>
@@ -6660,10 +6862,19 @@ del "%~f0"
     private void FlushPendingProcessLogs()
     {
         var flushed = 0;
-        while (flushed < 200 && _pendingProcessLogs.TryDequeue(out var line))
+        while (flushed < 200 && _pendingProcessLogs.TryDequeue(out var entry))
         {
-            Log(line);
             flushed++;
+            if (entry.Generation != Interlocked.Read(ref _processLogGeneration)) continue;
+            var line = entry.Line;
+            Log(line);
+            if (RuntimeConnectionWarningPolicy.IsRealityFailure(entry.Generation, Interlocked.Read(ref _processLogGeneration),
+                _state.RunningCore, _state.RunningProfileSnapshot, line) &&
+                _runtimeConnectionWarning is null)
+            {
+                _runtimeConnectionWarning = "sing-box не смог проверить Reality-соединение с этим сервером. Выберите xray-core для этого VLESS-профиля; ядро не будет переключено автоматически.";
+                Log(_runtimeConnectionWarning);
+            }
         }
 
         if (!_pendingProcessLogs.IsEmpty) return;
@@ -6678,9 +6889,15 @@ del "%~f0"
 
     private void Log(string message)
     {
+        message = ConnectionDiagnostics.Redact(message, DiagnosticSecrets());
         var line = $"[{DateTime.Now:HH:mm:ss}] {AnsiEscapeRegex.Replace(message, "")}";
         _logs.Add(line);
         if (_logs.Count > 600) _logs.RemoveRange(0, _logs.Count - 600);
+        if (_webUiReady)
+        {
+            _webLogDelta.Add(line);
+            if (_webLogDelta.Count > 500) _webLogDelta.RemoveRange(0, _webLogDelta.Count - 500);
+        }
         if (_activeLogViewer is { IsDisposed: false } viewer)
         {
             viewer.Append(line);
@@ -6715,9 +6932,10 @@ del "%~f0"
         Servers,
         Settings,
         Config,
-        Logs,
-        Info
+        Logs
     }
+
+    private enum UpdateUiState { NotChecked, Available, Downloading, Ready, Failed }
 
     private enum SettingsSection
     {
@@ -6740,7 +6958,6 @@ del "%~f0"
 
     private sealed record SubscriptionInfo(long UploadBytes, long DownloadBytes, long TotalBytes, DateTime? ExpireUtc);
 
-    private sealed record ReleaseInfo(string Tag, string ReleaseUrl, string? AssetName, string? AssetDownloadUrl);
 
     private sealed class LogViewer : Control
     {
@@ -7595,7 +7812,7 @@ del "%~f0"
         public int AccentColorArgb { get; set; } = unchecked((int)0xFF7C69FF);
         public NavPanelPosition NavPanelPosition { get; set; } = NavPanelPosition.Left;
         public NavIconSize NavIconSize { get; set; } = NavIconSize.Normal;
-        public List<string> NavItemOrder { get; set; } = ["servers", "settings", "config", "logs", "info"];
+        public List<string> NavItemOrder { get; set; } = ["servers", "settings", "config", "logs"];
         public List<string> HiddenNavItems { get; set; } = [];
         public bool ShowNavTooltips { get; set; } = true;
         public bool ShowNavSeparators { get; set; } = true;

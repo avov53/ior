@@ -40,8 +40,8 @@ public static class ServiceMonitorCatalog
     public static void NormalizeTargets(AppState state)
     {
         state.ServiceMonitorTargets ??= [];
-        var normalized = new List<ServiceMonitorTarget>(3);
-        foreach (var target in state.ServiceMonitorTargets.Take(3))
+        var normalized = new List<ServiceMonitorTarget>(8);
+        foreach (var target in state.ServiceMonitorTargets.Take(8))
         {
             if (!TryNormalizeUrl(target.Url, out var uri)) continue;
             target.Id = string.IsNullOrWhiteSpace(target.Id) ? Guid.NewGuid().ToString("N") : target.Id;
@@ -50,13 +50,10 @@ public static class ServiceMonitorCatalog
             normalized.Add(target);
         }
 
-        foreach (var fallback in Defaults())
+        if (normalized.Count == 0)
         {
-            if (normalized.Count == 3) break;
-            if (normalized.Any(x => x.PresetId == fallback.PresetId)) continue;
-            normalized.Add(fallback);
+            normalized.AddRange(Defaults());
         }
-        while (normalized.Count < 3) normalized.Add(Defaults()[normalized.Count]);
         state.ServiceMonitorTargets = normalized;
     }
 
@@ -110,7 +107,7 @@ public sealed class ServiceFaviconCache
     {
         if (!ServiceMonitorCatalog.TryNormalizeUrl(targetUrl, out var target)) return null;
         Directory.CreateDirectory(_directory);
-        var cachePath = Path.Combine(_directory, Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(target.IdnHost))).ToLowerInvariant() + ".ico");
+        var cachePath = CachePath(target);
         var cached = await ReadValidAsync(cachePath, cancellationToken);
         if (cached is not null) return cached;
 
@@ -140,6 +137,26 @@ public sealed class ServiceFaviconCache
             return null;
         }
     }
+
+    public byte[]? TryGetCached(string targetUrl)
+    {
+        if (!ServiceMonitorCatalog.TryNormalizeUrl(targetUrl, out var target)) return null;
+        var cachePath = CachePath(target);
+        try
+        {
+            if (!File.Exists(cachePath)) return null;
+            var bytes = File.ReadAllBytes(cachePath);
+            return bytes.Length is > 0 and <= MaximumBytes && IsImage(bytes) ? bytes : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string CachePath(Uri target) => Path.Combine(
+        _directory,
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(target.IdnHost))).ToLowerInvariant() + ".ico");
 
     private async Task<byte[]?> DownloadImageAsync(Uri uri, CancellationToken token)
     {

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+set -e
+
+# for branch coverage support, which is unstable
+export RUSTC_BOOTSTRAP=1
+OPTIONS=--branch
+
+source <(cargo llvm-cov show-env --export-prefix $OPTIONS "$@")
+cargo llvm-cov clean --workspace
+
+cargo build --locked --all-targets --all-features
+cargo test --locked --all-features # this presumably enables `fips`
+cargo test -p rustls-ring --locked
+cargo test -p rustls-aws-lc-rs --locked
+cargo test -p rustls-test --locked --features aws-lc-rs # aws-lc-rs, but no fips
+
+# ensure both zlib and brotli are tested, irrespective of their order
+cargo test --locked $(admin/all-features-except zlib rustls)
+cargo test --locked $(admin/all-features-except brotli rustls)
+
+## bogo
+cargo test --locked --test bogo -- --ignored --test-threads 1
+
+cargo llvm-cov report --ignore-filename-regex "(bogo|rustls-test)/" $OPTIONS "$@"

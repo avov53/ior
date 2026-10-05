@@ -18,6 +18,30 @@ public sealed class ServiceMonitoringTests
         Assert.Equal(3, state.ServiceMonitorTargets.Select(x => x.Id).Distinct().Count());
     }
 
+    [Fact]
+    public void HiddenTargetRemainsInListAfterNormalization()
+    {
+        var state = new AppState
+        {
+            ServiceMonitorTargets =
+            [
+                new ServiceMonitorTarget
+                {
+                    Name = "YouTube",
+                    Url = "https://www.youtube.com",
+                    PresetId = "youtube",
+                    Visible = false
+                }
+            ]
+        };
+
+        ServiceMonitorCatalog.NormalizeTargets(state);
+
+        var target = Assert.Single(state.ServiceMonitorTargets);
+        Assert.False(target.Visible);
+        Assert.Equal("youtube", target.PresetId);
+    }
+
     [Theory]
     [InlineData("example.com", "https://example.com/", "Example")]
     [InlineData("http://status.example.com/path", "http://status.example.com/path", "Status")]

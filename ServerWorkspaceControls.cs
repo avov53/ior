@@ -577,6 +577,11 @@ internal sealed class ServiceStatusStrip : Control
         Invalidate();
     }
 
+    public IReadOnlyDictionary<string, string> StatusSnapshot()
+    {
+        return _statuses.ToDictionary(item => item.Key, item => item.Value.ToString().ToLowerInvariant(), StringComparer.OrdinalIgnoreCase);
+    }
+
     public void ResetStatus(string targetId)
     {
         _statuses.Remove(targetId);

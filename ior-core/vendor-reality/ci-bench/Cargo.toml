@@ -1,0 +1,27 @@
+[package]
+name = "rustls-ci-bench"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0 OR ISC OR MIT"
+description = "Rustls CPU instruction counting benchmarks."
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+byteorder = { workspace = true }
+clap = { workspace = true }
+itertools = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+rustls = { path = "../rustls" }
+rustls-aws-lc-rs = { path = "../rustls-aws-lc-rs" }
+rustls-ring = { path = "../rustls-ring" }
+rustls-test = { workspace = true, default-features = false }
+rustls-fuzzing-provider = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+crabgrind = { workspace = true }
+
+[lints]
+workspace = true

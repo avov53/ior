@@ -1,0 +1,68 @@
+[package]
+name = "rustls"
+version = "0.24.0-dev.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0 OR ISC OR MIT"
+readme = "../README.md"
+description = "Rustls is a modern TLS library written in Rust."
+homepage = "https://github.com/rustls/rustls"
+repository = "https://github.com/rustls/rustls"
+categories = ["network-programming", "cryptography"]
+autobenches = false
+autotests = false
+exclude = ["src/testdata", "tests/**"]
+
+[features]
+default = ["log", "webpki"]
+brotli = ["dep:brotli", "dep:brotli-decompressor"]
+log = ["dep:log"]
+webpki = ["dep:webpki"]
+zlib = ["dep:zlib-rs"]
+
+[dependencies]
+brotli = { workspace = true, optional = true }
+brotli-decompressor = { workspace = true, optional = true }
+hashbrown = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+# only required for no-std
+once_cell = { workspace = true, features = ["std"] }
+subtle = { workspace = true }
+webpki = { workspace = true, optional = true }
+pki-types = { workspace = true, features = ["std"] }
+zeroize = { workspace = true }
+zlib-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+bencher = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+rcgen = { workspace = true }
+rustls-test = { workspace = true, default-features = false }
+time = { workspace = true }
+webpki-roots = { workspace = true }
+
+[target.'cfg(any(target_arch = "aarch64", target_arch = "x86_64"))'.dev-dependencies]
+graviola = { workspace = true }
+
+[[example]]
+name = "test_ca"
+path = "examples/internal/test_ca.rs"
+
+[package.metadata.docs.rs]
+# all non-default features except fips (cannot build on docs.rs environment)
+features = ["brotli", "hashbrown", "log", "std", "zlib"]
+rustdoc-args = ["--cfg", "rustls_docsrs"]
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+  # ---
+  "rustls_pki_types",
+  "rustls_pki_types::*",
+]
+
+[package.metadata.cargo-semver-checks.lints]
+enum_no_repr_variant_discriminant_changed = "warn"
+
+[lints]
+workspace = true

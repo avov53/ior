@@ -1,0 +1,73 @@
+name: "REALITY smoke tests"
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - "**"
+    tags-ignore: ["*"]
+  pull_request:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: "--deny warnings"
+  AWS_LC_SYS_NO_JITTER_ENTROPY: 1
+
+jobs:
+  reality-smoke:
+    name: "REALITY smoke (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install NASM for aws-lc-rs on Windows
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install ninja-build tool for aws-lc-fips-sys on Windows
+        if: runner.os == 'Windows'
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - run: cargo fmt --all -- --check
+
+      - run: cargo clippy -- -D warnings
+
+      - name: Run REALITY smoke test
+        shell: bash
+        run: python3 ./admin/reality_smoke.py --build-with-cargo
+
+      - name: Run REALITY UDP smoke test
+        shell: bash
+        run: python3 ./admin/reality_smoke_udp.py
+
+      - name: Upload REALITY smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reality-smoke-logs-${{ matrix.os }}
+          path: target/tmp/
+          if-no-files-found: ignore

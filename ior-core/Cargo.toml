@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/ior-core", "vendor-netstack"]
+default-members = ["crates/ior-core"]
+exclude = ["vendor-reality", "vendor-vmess", "vendor-hysteria", "vendor-smoltcp"]
+resolver = "2"
+
+
+[patch.crates-io]
+netstack-smoltcp = { path = "vendor-netstack" }
+smoltcp = { path = "vendor-smoltcp" }

@@ -16,15 +16,20 @@ public static class ProfileParser
     {
         var text = input.Trim();
         var profiles = new List<ProxyProfile>();
+        if(ClashSubscriptionParser.LooksLikeClash(text))
+        { var clash=ClashSubscriptionParser.Parse(text);return new ProfileParseResult(clash.Profiles,clash.RejectedCount,clash.RemovedProtocolCount); }
+        if(text.StartsWith('{') || text.StartsWith('[') && !text.StartsWith("[Interface]",StringComparison.OrdinalIgnoreCase))
+            return JsonSubscriptionParser.Parse(text);
 
         if (text.Contains("[Interface]", StringComparison.OrdinalIgnoreCase))
         {
             var wg = TryParseWireGuardConfig(text, "WireGuard");
             if (wg is not null) profiles.Add(wg);
-            return new ProfileParseResult(profiles, wg is null ? 1 : 0);
+            return new ProfileParseResult(profiles, wg is null ? 1 : 0, wg is null && HasRemovedConfiguration(text) ? 1 : 0);
         }
 
         var rejected = 0;
+        var removed = 0;
         foreach (var line in ExpandSubscription(text))
         {
             var profile = TryParseLine(line.Trim());
@@ -35,10 +40,20 @@ public static class ProfileParser
             else
             {
                 rejected++;
+                if (IsRemovedLine(line.Trim())) removed++;
             }
         }
 
-        return new ProfileParseResult(profiles, rejected);
+        return new ProfileParseResult(profiles, rejected, removed);
+    }
+
+    private static bool HasRemovedConfiguration(string text) => text.Split(['\r', '\n']).Any(line => RemovedProtocolPolicy.IsParameter(line.Split('=', 2)[0].Trim()));
+    private static bool IsRemovedLine(string line)
+    {
+        if (line.StartsWith("awg://", StringComparison.OrdinalIgnoreCase) || line.StartsWith("amneziawg://", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!(line.StartsWith("vpn://", StringComparison.OrdinalIgnoreCase) || line.StartsWith("wireguard://", StringComparison.OrdinalIgnoreCase))) return false;
+        var decoded = TryBase64Decode(Uri.UnescapeDataString(line[(line.IndexOf("://", StringComparison.Ordinal)+3)..].Split('#',2)[0]));
+        return decoded is not null && HasRemovedConfiguration(decoded);
     }
 
     private static IEnumerable<string> ExpandSubscription(string text)
@@ -62,6 +77,11 @@ public static class ProfileParser
             if (line.StartsWith("hysteria2://", StringComparison.OrdinalIgnoreCase) ||
                 line.StartsWith("hy2://", StringComparison.OrdinalIgnoreCase)) return ParseHysteria2(line);
             if (line.StartsWith("wireguard://", StringComparison.OrdinalIgnoreCase)) return ParseWireGuardLink(line);
+            if (line.StartsWith("vpn://", StringComparison.OrdinalIgnoreCase)) return ParseWireGuardLink(line);
+            if (line.StartsWith("awg://", StringComparison.OrdinalIgnoreCase) || line.StartsWith("amneziawg://", StringComparison.OrdinalIgnoreCase)) return null;
+            if (line.StartsWith("socks://", StringComparison.OrdinalIgnoreCase) || line.StartsWith("socks5://", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || line.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                return ParseForwardProxy(line);
         }
         catch
         {
@@ -69,6 +89,23 @@ public static class ProfileParser
         }
 
         return null;
+    }
+
+    private static ProxyProfile ParseForwardProxy(string line)
+    {
+        var uri = new Uri(line);
+        if (string.IsNullOrWhiteSpace(uri.Host) || uri.AbsolutePath is not ("" or "/") || !string.IsNullOrEmpty(uri.Query))
+            throw new FormatException("Forward proxy URLs require a host and port, without a path or query.");
+        var auth = uri.UserInfo.Split(':', 2);
+        var socks = uri.Scheme is "socks" or "socks5";
+        var port = uri.Port > 0 ? uri.Port : socks ? 1080 : uri.Scheme == "https" ? 443 : 80;
+        return new ProxyProfile
+        {
+            Name = NameFromUri(uri, uri.Host), Protocol = socks ? ProxyProtocol.Socks : ProxyProtocol.Http,
+            Server = uri.IdnHost, Port = port, TlsEnabled = uri.Scheme == "https", ServerName = uri.IdnHost,
+            Username = auth[0].Length == 0 ? null : Uri.UnescapeDataString(auth[0]),
+            Password = auth.Length > 1 ? Uri.UnescapeDataString(auth[1]) : null
+        };
     }
 
     private static ProxyProfile ParseVless(string line)
@@ -127,7 +164,9 @@ public static class ProfileParser
             Network = JsonString(root, "net"),
             Host = JsonString(root, "host"),
             Path = JsonString(root, "path"),
-            ServiceName = JsonString(root, "serviceName")
+            ServiceName = JsonString(root, "serviceName"),
+            UnsupportedParameters = root.EnumerateObject().Where(field=>field.Name is not ("v" or "ps" or "add" or "server" or "port" or "id" or "aid" or "scy" or "security" or "tls" or "sni" or "net" or "host" or "path" or "serviceName" or "type"))
+                .Select(field=>field.Name).Concat(JsonString(root,"type") is not (null or "" or "none") ? ["type"] : Array.Empty<string>()).ToList()
         };
     }
 
@@ -151,7 +190,8 @@ public static class ProfileParser
             Network = Get(q, "type") ?? Get(q, "network"),
             Host = Get(q, "host"),
             Path = Get(q, "path"),
-            ServiceName = Get(q, "serviceName")
+            ServiceName = Get(q, "serviceName"),
+            UnsupportedParameters = q.Keys.Where(key=>key is not ("security" or "allowInsecure" or "insecure" or "sni" or "serverName" or "fp" or "type" or "network" or "host" or "path" or "serviceName")).ToList()
         };
     }
 
@@ -162,6 +202,8 @@ public static class ProfileParser
         var name = hashIndex >= 0 ? WebUtility.UrlDecode(withoutScheme[(hashIndex + 1)..]) : "Shadowsocks";
         var body = hashIndex >= 0 ? withoutScheme[..hashIndex] : withoutScheme;
         var queryIndex = body.IndexOf('?');
+        var query = queryIndex >= 0 ? Query(new Uri("https://localhost/" + body[queryIndex..])) : new Dictionary<string,string>();
+        var plugin = Get(query,"plugin");
         if (queryIndex >= 0) body = body[..queryIndex];
 
         string userInfo;
@@ -181,11 +223,13 @@ public static class ProfileParser
         }
 
         var credentials = userInfo.Split(':', 2);
-        var endpoint = SplitHostPort(hostPort);
+        var endpoint = SplitHostPort(hostPort.TrimEnd('/'));
         return new ProxyProfile
         {
             Name = string.IsNullOrWhiteSpace(name) ? endpoint.host : name,
             Protocol = ProxyProtocol.Shadowsocks,
+            Plugin = plugin,
+            UnsupportedParameters = query.Keys.Where(key=>key!="plugin").ToList(),
             Server = endpoint.host,
             Port = endpoint.port,
             Method = credentials[0],
@@ -214,14 +258,19 @@ public static class ProfileParser
 
     private static ProxyProfile? ParseWireGuardLink(string line)
     {
-        var uri = new Uri(line);
-        var decoded = TryBase64Decode(uri.Host + uri.AbsolutePath.TrimStart('/'));
-        return decoded is null ? null : TryParseWireGuardConfig(decoded, NameFromUri(uri, "WireGuard"));
+        // Base64 is case-sensitive; Uri.Host normalizes case and corrupts keys.
+        var parts=line[(line.IndexOf("://",StringComparison.Ordinal)+3)..].Split('#',2);
+        var decoded=TryBase64Decode(Uri.UnescapeDataString(parts[0]));
+        var name=parts.Length==2?WebUtility.UrlDecode(parts[1]):"WireGuard";
+        return decoded is null ? null : TryParseWireGuardConfig(decoded,string.IsNullOrWhiteSpace(name)?"WireGuard":name);
     }
 
     private static ProxyProfile? TryParseWireGuardConfig(string text, string name)
     {
         var map = ParseWireGuardSections(text);
+        if (map.Keys.Any(key => RemovedProtocolPolicy.IsParameter(key[(key.IndexOf('.') + 1)..]))) return null;
+        var known = new HashSet<string>(["Interface.PrivateKey", "Interface.Address", "Interface.DNS", "Interface.MTU", "Peer.PublicKey", "Peer.PresharedKey", "Peer.Endpoint", "Peer.AllowedIPs", "Peer.PersistentKeepalive"], StringComparer.OrdinalIgnoreCase);
+        var unknown = map.Keys.Where(key => !known.Contains(key) && !(key.StartsWith("Interface.",StringComparison.OrdinalIgnoreCase) && AwgParameterNames.ContainsKey(key[10..]))).ToList();
         if (!map.TryGetValue("Interface.PrivateKey", out var privateKey) ||
             !map.TryGetValue("Peer.PublicKey", out var publicKey) ||
             !map.TryGetValue("Peer.Endpoint", out var endpoint))
@@ -234,6 +283,9 @@ public static class ProfileParser
         {
             Name = name,
             Protocol = ProxyProtocol.WireGuard,
+            UnsupportedParameters = unknown,
+            TunnelDns = map.GetValueOrDefault("Interface.DNS"),
+            ServerName = hostPort.host,
             Server = hostPort.host,
             Port = hostPort.port,
             PrivateKey = privateKey,
@@ -250,6 +302,7 @@ public static class ProfileParser
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var section = "";
+        var peerSeen = false;
         foreach (var raw in text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             if (raw.StartsWith('#') || raw.StartsWith(';')) continue;
@@ -257,15 +310,25 @@ public static class ProfileParser
             if (header.Success)
             {
                 section = header.Groups[1].Value.Trim();
+                if (section.Equals("Peer", StringComparison.OrdinalIgnoreCase)) { if (peerSeen) throw new FormatException("Несколько WireGuard пиров в одном профиле пока не поддерживаются."); peerSeen = true; }
                 continue;
             }
 
             var parts = raw.Split('=', 2);
-            if (parts.Length == 2) result[$"{section}.{parts[0].Trim()}"] = parts[1].Trim();
+            if (parts.Length == 2 && !result.TryAdd($"{section}.{parts[0].Trim()}", parts[1].Trim())) throw new FormatException("Повторный параметр WireGuard: " + parts[0].Trim());
         }
 
         return result;
     }
+
+    public static readonly IReadOnlyDictionary<string,string> AwgParameterNames = new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Jc"]="jc",["Jmin"]="jmin",["Jmax"]="jmax",["S1"]="s1",["S2"]="s2",["S3"]="s3",["S4"]="s4",
+        ["H1"]="h1",["H2"]="h2",["H3"]="h3",["H4"]="h4",["I1"]="i1",["I2"]="i2",["I3"]="i3",["I4"]="i4",["I5"]="i5",
+        ["HeaderProtectionKey"]="header_protection_key",["ContentPaddingAddition"]="content_padding_addition",
+        ["RekeyAfterTime"]="rekey_after_time",["RekeyTimeout"]="rekey_timeout",["RejectAfterTime"]="reject_after_time",
+        ["KeepaliveTimeout"]="keepalive_timeout",["MaxHandshakeAttempts"]="max_handshake_attempts",["RandomTrailers"]="random_trailers",["DisableCookies"]="disable_cookies"
+    };
 
     private static Dictionary<string, string> Query(Uri uri)
     {
@@ -317,4 +380,4 @@ public static class ProfileParser
     }
 }
 
-public sealed record ProfileParseResult(List<ProxyProfile> Profiles, int RejectedCount);
+public sealed record ProfileParseResult(List<ProxyProfile> Profiles, int RejectedCount, int RemovedProtocolCount = 0);

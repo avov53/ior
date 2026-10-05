@@ -1,0 +1,26 @@
+[package]
+name = "rustls-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+clap = { workspace = true }
+rustls = { path = "../rustls" }
+rustls-aws-lc-rs = { path = "../rustls-aws-lc-rs", optional = true }
+rustls-ring = { path = "../rustls-ring", optional = true }
+rustls-graviola = { workspace = true, optional = true }
+rustls-test = { workspace = true, default-features = false }
+
+[features]
+default = []
+aws-lc-rs = ["rustls-aws-lc-rs"]
+fips = ["rustls-aws-lc-rs/fips", "aws-lc-rs"]
+graviola = ["dep:rustls-graviola"]
+ring = ["dep:rustls-ring"]
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+[lints]
+workspace = true
