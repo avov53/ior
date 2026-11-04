@@ -12,7 +12,7 @@ node macos/scripts/build-ui.mjs
 cli="$(pwd)/.local/tauri-cli/node_modules/.bin/tauri"
 (cd macos/src-tauri && "$cli" build --target "$target" --bundles app -- --locked)
 app="macos/src-tauri/target/$target/release/bundle/macos/ior.app"
-lipo -verify_arch "$mach_arch" "$app/Contents/MacOS/ior-macos"
+lipo "$app/Contents/MacOS/ior-macos" -verify_arch "$mach_arch"
 codesign --force --sign - "$app/Contents/Resources/resources/ior-core"
 codesign --force --deep --sign - "$app"
 codesign --verify --deep --strict "$app"
