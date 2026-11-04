@@ -15,7 +15,7 @@ Invoke-GitHubCli @('auth','status') | Out-Null
 $remoteConfig=Join-Path (Get-Location) '.local/macos-remote.json'
 $config=$null
 if(Test-Path -LiteralPath $remoteConfig){
- $config=Get-Content -LiteralPath $remoteConfig -Raw | ConvertFrom-Json
+ $config=Get-Content -LiteralPath $remoteConfig -Encoding UTF8 -Raw | ConvertFrom-Json
  foreach($file in $config.files){$path=Join-Path (Get-Location) $file.path;if(!(Test-Path -LiteralPath $path) -or (Get-FileHash -LiteralPath $path).Hash -ne $file.hash){throw "macOS input changed: $($file.path). Push updated sources before building."}}
 }
 $sha=if($config){$config.commit}else{(& git rev-parse HEAD).Trim()}

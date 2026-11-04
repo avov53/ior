@@ -9,7 +9,8 @@ cargo build --manifest-path ior-core/Cargo.toml -p ior-core --release --locked -
 mkdir -p macos/src-tauri/resources
 cp "ior-core/target/$target/release/ior-core" macos/src-tauri/resources/ior-core
 node macos/scripts/build-ui.mjs
-(cd macos/src-tauri && cargo tauri build --target "$target" --bundles app -- --locked)
+cli="$(pwd)/.local/tauri-cli/node_modules/.bin/tauri"
+(cd macos/src-tauri && "$cli" build --target "$target" --bundles app -- --locked)
 app="macos/src-tauri/target/$target/release/bundle/macos/ior.app"
 lipo -verify_arch "$(case "$arch" in arm64) echo arm64;; x64) echo x86_64;; esac)" "$app/Contents/MacOS/ior-macos"
 codesign --force --sign - "$app/Contents/Resources/resources/ior-core"

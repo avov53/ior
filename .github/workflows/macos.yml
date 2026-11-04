@@ -41,7 +41,7 @@ jobs:
       - name: Build interface
         run: npm ci --prefix design --no-audit --no-fund && npm run build --prefix design
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version 2.9.3 --locked
+        run: npm install --prefix .local/tauri-cli --no-package-lock --no-audit --no-fund @tauri-apps/cli@2.9.3
       - name: Verify macOS lockfile
         run: test -f macos/src-tauri/Cargo.lock
       - name: Build without changing system networking
