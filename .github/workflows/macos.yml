@@ -38,6 +38,15 @@ jobs:
           node-version: '22.14.0'
       - name: Rust
         run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0 && rustup target add ${{ matrix.target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ior-core/target
+            macos/src-tauri/target
+          key: macos-build-v1-${{ matrix.arch }}-${{ hashFiles('ior-core/Cargo.lock', 'macos/src-tauri/Cargo.lock') }}
+          restore-keys: macos-build-v1-${{ matrix.arch }}-
       - name: Build interface
         run: npm ci --prefix design --no-audit --no-fund && npm run build --prefix design
       - name: Install Tauri CLI
