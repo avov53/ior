@@ -7,6 +7,15 @@ use crate::{
 };
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
+pub(crate) fn validate_obfs(profile: &WireProfile) -> Result<(), &'static str> {
+ let kind=profile.options.obfs.as_deref().unwrap_or("");
+ let password=profile.options.obfs_password.as_deref().unwrap_or("");
+ if kind.is_empty() || kind=="none" {return if password.is_empty(){Ok(())}else{Err("HYSTERIA2_OBFS_PASSWORD_WITHOUT_TYPE")};}
+ if profile.protocol!="hysteria2" || kind!="salamander" {return Err("HYSTERIA2_OBFS_UNSUPPORTED");}
+ if !(4..=4096).contains(&password.len()){return Err("HYSTERIA2_OBFS_PASSWORD_INVALID");}
+ Ok(())
+}
+
 pub struct Hysteria2Connector {
     client: Arc<rsteria2::ReconnectableClient>,
 }
@@ -32,6 +41,7 @@ impl Hysteria2Connector {
                 "invalid Hysteria2 profile",
             ));
         }
+        validate_obfs(profile).map_err(|code|io::Error::new(io::ErrorKind::InvalidInput,code))?;
         let address =
             dns_engine::resolve_server_ip_bound(&profile.server, bootstrap, &network).await?;
         let start = std::time::Instant::now();
@@ -65,6 +75,7 @@ impl Hysteria2Connector {
             server_name: profile.server_name.clone(),
             auth: profile.credential.clone(),
             insecure: false,
+            obfs_password: profile.options.obfs_password.clone().unwrap_or_default(),
             // Some upstreams defer TCPResponse until the application sends data.
             // Do not deadlock HTTP CONNECT / TLS / WebSocket clients waiting for it.
             // DuplexStream still validates and strips the response on first read.
@@ -251,4 +262,11 @@ mod tests {
         );
         connector.close().await;
     }
+}
+
+#[cfg(test)] mod obfs_options_tests {
+ #[test] fn salamander_validation(){
+ let mut p:crate::ipc_contract::WireProfile=serde_json::from_value(serde_json::json!({"protocol":"hysteria2","server":"edge.example","port":443,"credential":"test","serverName":"edge.example","publicKey":null,"shortId":null,"options":{"obfs":"salamander","obfsPassword":"test-obfs"}})).unwrap();
+ assert!(super::validate_obfs(&p).is_ok());p.options.obfs_password=Some("ab".into());assert_eq!(super::validate_obfs(&p),Err("HYSTERIA2_OBFS_PASSWORD_INVALID"));p.options.obfs=Some("unknown".into());assert_eq!(super::validate_obfs(&p),Err("HYSTERIA2_OBFS_UNSUPPORTED"));
+ }
 }

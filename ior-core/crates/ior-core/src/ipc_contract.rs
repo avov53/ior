@@ -69,6 +69,8 @@ pub struct WireProfile {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProtocolOptions {
+    pub obfs: Option<String>,
+    pub obfs_password: Option<String>,
     pub awg_engine:Option<String>,
     pub awg_routing_mode: Option<String>,
     pub awg: Option<std::collections::BTreeMap<String,String>>,
@@ -123,6 +125,7 @@ pub struct WireRule {
 
 impl StartRequest {
     pub fn validate_shape(&self) -> Result<(), &'static str> {
+        crate::hysteria2::validate_obfs(&self.profile)?;
         if let Some(engine)=self.profile.options.awg_engine.as_deref(){if self.profile.protocol!="amneziawg" || !matches!(engine,"go"|"rust"){return Err("AWG_ENGINE_INVALID");}}
         if let Some(mode)=self.profile.options.awg_routing_mode.as_deref(){
             if self.profile.protocol!="amneziawg" || !matches!(mode,"rules"|"fullProxy"){return Err("AWG_ROUTING_MODE_INVALID");}
