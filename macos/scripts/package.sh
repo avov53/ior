@@ -19,5 +19,5 @@ codesign --verify --deep --strict "$app"
 mkdir -p "macos-output/$arch"
 cp macos/README.md "macos-output/$arch/README.md"
 ditto "$app" "macos-output/$arch/ior.app"
-printf '{"commit":"%s","architecture":"%s","version":"1.2.9","vpnAvailable":false}\n' "$GITHUB_SHA" "$arch" > "macos-output/$arch/build.json"
+printf '{"commit":"%s","architecture":"%s","version":"1.2.10","vpnAvailable":false}\n' "$GITHUB_SHA" "$arch" > "macos-output/$arch/build.json"
 (cd "macos-output/$arch" && ditto -c -k --sequesterRsrc --keepParent ior.app "ior-macos-$arch.zip" && shasum -a 256 "ior-macos-$arch.zip" > SHA256SUMS.txt)
