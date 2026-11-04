@@ -12,3 +12,6 @@ serde_json = "1"
 tauri-runtime = "=2.9.2"
 tauri-runtime-wry = "=2.9.3"
 wry = { version = "=0.53.4", default-features = false }
+tauri-macros = "=2.5.1"
+tauri-codegen = "=2.5.2"
+tauri-utils = "=2.8.1"
