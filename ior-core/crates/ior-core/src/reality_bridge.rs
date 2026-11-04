@@ -65,6 +65,7 @@ fn would_block(error: &std::io::Error) -> bool {
 /// bounded backpressure.
 #[derive(Default)]
 struct FlushState {
+    flow:Option<crate::trace::Flow>,
     accepted: std::sync::atomic::AtomicU64,
     flushed: std::sync::atomic::AtomicU64,
     closed: std::sync::atomic::AtomicBool,
@@ -75,7 +76,7 @@ struct FlushState {
 struct WorkerExit(std::sync::Arc<FlushState>);
 impl Drop for WorkerExit {
     fn drop(&mut self) {
-        eprintln!("{{\"stage\":\"relay\",\"code\":\"REALITY_BRIDGE_METRICS\",\"sentBytes\":{},\"sendWaitUs\":{},\"receiveWaitUs\":{}}}",self.0.flushed.load(std::sync::atomic::Ordering::Acquire),self.0.send_wait_us.load(std::sync::atomic::Ordering::Relaxed),self.0.receive_wait_us.load(std::sync::atomic::Ordering::Relaxed));
+        crate::trace::emit_with_flow(serde_json::json!({"stage":"relay","code":"REALITY_BRIDGE_METRICS","sentBytes":self.0.flushed.load(std::sync::atomic::Ordering::Acquire),"sendWaitUs":self.0.send_wait_us.load(std::sync::atomic::Ordering::Relaxed),"receiveWaitUs":self.0.receive_wait_us.load(std::sync::atomic::Ordering::Relaxed)}),self.0.flow.as_ref());
         self.0
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -102,7 +103,7 @@ where
 {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(INBOUND_CHANNEL_CAP);
     let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_CAP);
-    let flush_state = std::sync::Arc::new(FlushState::default());
+    let flush_state = std::sync::Arc::new(FlushState{flow:crate::trace::current(),..Default::default()});
     let worker_state = flush_state.clone();
     std::thread::spawn(move || {
         let _exit = WorkerExit(worker_state.clone());
@@ -169,7 +170,7 @@ where
     carrier.tls.sock.tcp.set_write_timeout(Some(SOCKET_POLL))?;
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CHANNEL_CAP);
     let (outbound_tx, mut outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAP);
-    let flush_state = std::sync::Arc::new(FlushState::default());
+    let flush_state = std::sync::Arc::new(FlushState{flow:crate::trace::current(),..Default::default()});
     let worker_state = flush_state.clone();
     std::thread::spawn(move || {
         let _exit = WorkerExit(worker_state.clone());
@@ -188,10 +189,7 @@ where
                 }
             },
         ) {
-            eprintln!(
-                "{{\"stage\":\"relay\",\"code\":\"REALITY_RELAY_FAILED\",\"kind\":\"{:?}\"}}",
-                error.kind()
-            );
+            crate::trace::emit_with_flow(serde_json::json!({"stage":"relay","code":if inbound_tx.is_closed(){"REALITY_RELAY_CLOSED"}else{"REALITY_RELAY_FAILED"},"kind":format!("{:?}",error.kind())}),worker_state.flow.as_ref());
         }
         carrier.tls.conn.send_close_notify();
         let _ = carrier.tls.flush();

@@ -1,0 +1,78 @@
+{
+  "engine": "LinkeDOM; no pixels or layout",
+  "checks": [
+    "three tabs without profiles",
+    "custom dropdown selection and Escape focus return",
+    "unknown subscription usage preserved",
+    "demo subscription usage and announcements",
+    "app routing immediate persistence",
+    "app search and selected/system filters",
+    "app category grouping",
+    "empty allow-list enable guard",
+    "routing events in existing journal",
+    "safe connected server switch and cancellation",
+    "configuration structural report",
+    "invalid import rejection",
+    "corrupted saved configuration connect guard",
+    "empty state",
+    "isolated storage",
+    "link import",
+    "stable import sheet",
+    "drafts",
+    "QR and copy",
+    "demo connection error/success",
+    "groups/search",
+    "context menu",
+    "copy",
+    "route editor",
+    "themes",
+    "reduced motion",
+    "logs",
+    "unavailable native actions",
+    "Escape",
+    "viewport inputs",
+    "desktop files unchanged",
+    "no core selector",
+    "legacy core ignored",
+    "grouped surfaces",
+    "editor header actions",
+    "flat navigation indicator",
+    "no glass setting",
+    "Motion scheduling",
+    "no idle or repeated animations",
+    "swipe close event handler",
+    "fixed import frame",
+    "anchored menus for all objects",
+    "menu arrow keys and focus restoration",
+    "icon-only capsule",
+    "aurora off/on states",
+    "fixed orb size while scrolling",
+    "three aurora ribbons",
+    "ambient preference",
+    "menu open/close animation scheduling"
+  ],
+  "viewportInputs": [
+    [
+      360,
+      800
+    ],
+    [
+      393,
+      852
+    ],
+    [
+      412,
+      915
+    ]
+  ],
+  "notVerified": [
+    "real viewport geometry",
+    "Android keyboard",
+    "Android Back button",
+    "touch long press on device",
+    "screenreader",
+    "visual screenshots",
+    "real rendering and GPU load",
+    "physical animation smoothness"
+  ]
+}

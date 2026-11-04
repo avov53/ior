@@ -21,9 +21,13 @@ struct Entry {
     created: Instant,
     expires: Instant,
 }
-#[derive(Default)]
 pub struct DnsResponseCache {
     entries: Mutex<HashMap<Key, Entry>>,
+    max_entries: usize,
+    max_bytes: usize,
+}
+impl Default for DnsResponseCache {
+    fn default()->Self {Self{entries:Default::default(),max_entries:MAX_ENTRIES,max_bytes:MAX_BYTES}}
 }
 
 fn key(packet: &[u8], target: &str, tcp: bool) -> Option<Key> {
@@ -32,9 +36,14 @@ fn key(packet: &[u8], target: &str, tcp: bool) -> Option<Key> {
     }
     Some(Key {
         query: packet[2..].to_vec(),
-        target: target.into(),
+        target: canonical_scope(target),
         tcp,
     })
+}
+fn canonical_scope(scope:&str)->String {
+    let Some((route,resolver))=scope.split_once('|') else{return scope.to_owned();};
+    let endpoint=resolver.parse::<std::net::SocketAddr>().ok().or_else(||resolver.parse::<std::net::IpAddr>().ok().map(|ip|std::net::SocketAddr::new(ip,53)));
+    endpoint.map(|address|format!("{route}|{address}")).unwrap_or_else(||scope.to_owned())
 }
 fn word(packet: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_be_bytes(
@@ -80,6 +89,8 @@ fn ttl_fields(response: &[u8]) -> Option<(Vec<(usize, u32)>, u32)> {
     Some((fields, lifetime))
 }
 impl DnsResponseCache {
+    /// Preserve the former combined limits of the two separate AWG caches.
+    pub fn shared_awg()->Self {Self{entries:Default::default(),max_entries:2*MAX_ENTRIES,max_bytes:2*MAX_BYTES}}
     pub fn get(&self, query: &[u8], target: &str, tcp: bool) -> Option<Vec<u8>> {
         self.get_at(query, target, tcp, Instant::now())
     }
@@ -129,12 +140,12 @@ impl DnsResponseCache {
                 expires: now + Duration::from_secs(lifetime as u64),
             },
         );
-        while entries.len() > MAX_ENTRIES
+        while entries.len() > self.max_entries
             || entries
                 .iter()
                 .map(|(key, entry)| key.query.len() + key.target.len() + entry.response.len())
                 .sum::<usize>()
-                > MAX_BYTES
+                > self.max_bytes
         {
             let oldest = entries
                 .iter()
@@ -168,6 +179,26 @@ mod tests {
         reply.extend(ttl.to_be_bytes());
         reply.extend([0, 4, 203, 0, 113, 7]);
         (query, reply)
+    }
+    #[test]
+    fn awg_resolver_scope_normalizes_default_port_but_preserves_route_options_and_order() {
+        let cache=DnsResponseCache::default();let (query,mut reply)=packets(30);
+        reply[7]=2;reply.extend([0xc0,0x0c,0,1,0,1,0,0,0,30,0,4,203,0,113,2]);
+        cache.insert(&query,"PROXY|8.8.8.8",false,&reply);
+        let hit=cache.get(&query,"PROXY|8.8.8.8:53",false).unwrap();assert_eq!(hit,reply);
+        assert!(cache.get(&query,"DIRECT|8.8.8.8",false).is_none());
+        assert!(cache.get(&query,"PROXY|8.8.8.8:5353",false).is_none());
+        assert!(cache.get(&query,"PROXY|1.1.1.1",false).is_none());
+        assert!(cache.get(&query,"PROXY|8.8.8.8",true).is_none());
+        let mut flags=query.clone();flags[3]|=0x10;assert!(cache.get(&flags,"PROXY|8.8.8.8",false).is_none());
+        let mut aaaa=query.clone();let len=aaaa.len();aaaa[len-3]=28;assert!(cache.get(&aaaa,"PROXY|8.8.8.8",false).is_none());
+    }
+    #[test]
+    fn awg_shared_cache_keeps_the_former_combined_memory_and_entry_limits() {
+        let cache=DnsResponseCache::shared_awg();let (query,reply)=packets(30);
+        for index in 0..600 {cache.insert(&query,&format!("PROXY|10.0.{}.{}",index/250,index%250),false,&reply);}
+        let entries=cache.entries.lock().unwrap();assert_eq!(entries.len(),512);
+        assert!(entries.iter().map(|(key,value)|key.query.len()+key.target.len()+value.response.len()).sum::<usize>()<=1024*1024);
     }
     #[test]
     fn cache_preserves_route_and_options_changes_id_ages_ttl_and_expires() {

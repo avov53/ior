@@ -48,14 +48,14 @@ pub async fn resolve_server_ipv4_bound(
     getrandom::getrandom(&mut id)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "DNS query ID unavailable"))?;
     let question = encode_ipv4_question(host, id)?;
-    let socket = if network.is_some() {
-        if !resolver.is_ipv4() {
+    let socket = if network.is_some() || cfg!(target_os = "android") {
+        if !resolver.is_ipv4() && !cfg!(target_os = "android") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "BOOTSTRAP_IPV6_BIND_UNAVAILABLE",
             ));
         }
-        UdpSocket::from_std(crate::native_router::bound_socket(true, network)?.into())?
+        UdpSocket::from_std(crate::native_router::bound_socket_family(true, network, resolver.is_ipv6())?.into())?
     } else {
         UdpSocket::bind(if resolver.is_ipv4() {
             "0.0.0.0:0"
@@ -127,6 +127,11 @@ pub async fn resolve_addresses(
     let mut id = [0; 2];
     getrandom::getrandom(&mut id).map_err(io::Error::other)?;
     let query = encode_address_question(host, id, kind)?;
+    let response = query_address_response(&query, resolver, network).await?;
+    decode_address_answers(&response, &query)
+}
+
+async fn query_address_response(query: &[u8], resolver: SocketAddr, network: &Option<crate::ipc_contract::WireNetwork>) -> io::Result<Vec<u8>> {
     let socket = UdpSocket::from_std(
         crate::native_router::bound_socket_family(true, network, resolver.is_ipv6())?.into(),
     )?;
@@ -137,7 +142,42 @@ pub async fn resolve_addresses(
     let length = timeout(Duration::from_secs(4), socket.recv(&mut response))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "BOOTSTRAP_DNS_TIMEOUT"))??;
-    decode_address_answers(&response[..length], &query)
+    response.truncate(length);
+    Ok(response)
+}
+
+/// One connector/network lifetime. Positive responses retain DNS TTLs; a
+/// shared lock merges simultaneous cold lookups without caching failures.
+#[derive(Default)]
+pub(crate) struct ServerIpv4Resolver {
+    cache: crate::dns_response_cache::DnsResponseCache,
+    lookup: tokio::sync::Mutex<()>,
+}
+impl ServerIpv4Resolver {
+    pub(crate) async fn resolve(&self, host: &str, resolver: SocketAddr, network: &Option<crate::ipc_contract::WireNetwork>) -> io::Result<Ipv4Addr> {
+        if let Ok(ip) = host.parse::<Ipv4Addr>() { return Ok(ip); }
+        if host.parse::<IpAddr>().is_ok() { return Err(io::ErrorKind::Unsupported.into()); }
+        let started = std::time::Instant::now();
+        let mut id = [0; 2];
+        getrandom::getrandom(&mut id).map_err(io::Error::other)?;
+        let query = encode_address_question(host, id, 1)?;
+        let scope = format!("SERVER|{resolver}");
+        // This resolver belongs to an immutable connector/network. Never share
+        // its cache across a physical-network change.
+        let _lookup = self.lookup.lock().await;
+        let (response, reason) = match self.cache.get(&query, &scope, false) {
+            Some(response) => (response, "cache_hit"),
+            None => {
+                let response = query_address_response(&query, resolver, network).await?;
+                decode_address_answers(&response, &query)?;
+                self.cache.insert(&query, &scope, false, &response);
+                (response, "resolved")
+            }
+        };
+        let ip = decode_address_answers(&response, &query)?.into_iter().find_map(|ip| match ip {IpAddr::V4(ip)=>Some(ip), _=>None}).ok_or(io::ErrorKind::NotFound)?;
+        crate::trace::emit(serde_json::json!({"stage":"dns","code":"SERVER_DNS_COMPLETE","phase":"server_resolution","durationMs":started.elapsed().as_millis() as u64,"reason":reason}));
+        Ok(ip)
+    }
 }
 pub(crate) fn encode_address_question(host: &str, id: [u8; 2], kind: u16) -> io::Result<Vec<u8>> {
     let mut query = encode_ipv4_question(host, id)?;
@@ -147,15 +187,9 @@ pub(crate) fn encode_address_question(host: &str, id: [u8; 2], kind: u16) -> io:
 }
 pub(crate) fn decode_address_answers(response: &[u8], query: &[u8]) -> io::Result<Vec<IpAddr>> {
     let question = crate::tun_names::question(query)?;
-    if !crate::tun_names::matches_response(response, &question)
-        || response[3] & 15 != 0
-        || response[2] & 2 != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS_ADDRESS_RESPONSE_INVALID",
-        ));
-    }
+    if !crate::tun_names::matches_response(response,&question){return Err(io::Error::new(io::ErrorKind::InvalidData,"DNS_ADDRESS_RESPONSE_MISMATCH"));}
+    if response[2]&2!=0{return Err(io::Error::new(io::ErrorKind::InvalidData,"DNS_ADDRESS_TRUNCATED"));}
+    if response[3]&15!=0{return Err(io::Error::new(io::ErrorKind::InvalidData,match response[3]&15{3=>"DNS_ADDRESS_NXDOMAIN",2|5=>"DNS_ADDRESS_SERVER_FAILURE",_=>"DNS_ADDRESS_RESPONSE_INVALID"}));}
     let mut offset = crate::tun_names::name(response, 12)?.1 + 4;
     let mut result = Vec::new();
     for _ in 0..u16::from_be_bytes([response[6], response[7]]) {
@@ -326,7 +360,69 @@ pub(crate) fn decode_ipv4_answer(packet: &[u8], id: [u8; 2]) -> io::Result<Ipv4A
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resource_dns_rcodes_and_nodata_remain_errors_without_rewriting_replies(){
+        let query=encode_address_question("images.example.test",[1,2],1).unwrap();
+        for (rcode,expected) in [(0,"DNS_ADDRESS_NODATA"),(3,"DNS_ADDRESS_NXDOMAIN"),(2,"DNS_ADDRESS_SERVER_FAILURE"),(5,"DNS_ADDRESS_SERVER_FAILURE")] {
+            let mut reply=query.clone();reply[2]=0x81;reply[3]=0x80|rcode;let original=reply.clone();
+            assert_eq!(decode_address_answers(&reply,&query).unwrap_err().to_string(),expected);assert_eq!(reply,original);
+        }
+        let mut reply=query.clone();reply[2]=0x83;reply[3]=0x80;assert_eq!(decode_address_answers(&reply,&query).unwrap_err().to_string(),"DNS_ADDRESS_TRUNCATED");
+    }
     use super::*;
+
+    #[tokio::test]
+    async fn server_cache_merges_parallel_queries_and_expires_at_dns_ttl() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = socket.local_addr().unwrap();
+        let queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = queries.clone();
+        let server = tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            loop {
+                let (len, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                let ordinal = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut response = buffer[..len].to_vec();
+                response[2]=0x81;response[3]=0x80;response[7]=1;
+                response.extend_from_slice(&[0xc0,0x0c,0,1,0,1,0,0,0,1,0,4,203,0,113,8 + ordinal as u8]);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                socket.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let resolver = std::sync::Arc::new(ServerIpv4Resolver::default());
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let resolver = resolver.clone();
+            workers.spawn(async move {resolver.resolve("server.test",endpoint,&None).await.unwrap()});
+        }
+        while let Some(result) = workers.join_next().await {assert_eq!(result.unwrap(),Ipv4Addr::new(203,0,113,8));}
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst),1);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(resolver.resolve("server.test",endpoint,&None).await.unwrap(),Ipv4Addr::new(203,0,113,9));
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst),2);
+        // A new connector/network must resolve independently of the warm cache.
+        assert_eq!(ServerIpv4Resolver::default().resolve("server.test",endpoint,&None).await.unwrap(),Ipv4Addr::new(203,0,113,10));
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst),3);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn server_cache_never_retains_dns_failure_or_zero_ttl() {
+        let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();let endpoint=socket.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            let mut buffer=[0;512];
+            for index in 0..3 {
+                let(len,peer)=socket.recv_from(&mut buffer).await.unwrap();
+                let mut response=buffer[..len].to_vec();response[2]=0x81;response[3]=if index==0{0x82}else{0x80};
+                if index>0 {response[7]=1;response.extend_from_slice(&[0xc0,0x0c,0,1,0,1,0,0,0,0,0,4,203,0,113,index]);}
+                socket.send_to(&response,peer).await.unwrap();
+            }
+        });
+        let resolver=ServerIpv4Resolver::default();
+        assert!(resolver.resolve("server.test",endpoint,&None).await.is_err());
+        assert_eq!(resolver.resolve("server.test",endpoint,&None).await.unwrap(),Ipv4Addr::new(203,0,113,1));
+        assert_eq!(resolver.resolve("server.test",endpoint,&None).await.unwrap(),Ipv4Addr::new(203,0,113,2));
+        server.await.unwrap();
+    }
 
     #[test]
     fn parses_a_record_after_cname_and_rejects_wrong_id() {

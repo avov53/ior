@@ -1,0 +1,14 @@
+{
+  "subscriptionReadOnly": true,
+  "dirtyGuard": true,
+  "contextCopy": true,
+  "rename": true,
+  "delete": true,
+  "filters": true,
+  "reconnectConfirm": true,
+  "activeProtocolLabel": true,
+  "menuKeyboard": true,
+  "focusRestore": true,
+  "dialogFocus": true,
+  "shortWindowFallback": true
+}

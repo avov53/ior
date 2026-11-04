@@ -88,9 +88,16 @@ impl Hysteria2Connector {
         crate::trace::emit(
             serde_json::json!({"stage":"handshake","code":"HYSTERIA2_HANDSHAKE_AUTHENTICATED","durationMs":start.elapsed().as_millis() as u64}),
         );
-        Ok(Self {
-            client: Arc::new(client),
-        })
+        let client=Arc::new(client);
+        let weak=Arc::downgrade(&client);
+        let metrics_flow=crate::trace::new_flow();
+        tokio::spawn(crate::trace::FLOW.scope(metrics_flow,async move {loop{
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let Some(client)=weak.upgrade() else{return};
+            if let Some((rtt,cwnd,lost,sent,generation))=client.transport_metrics(){crate::trace::emit(serde_json::json!({"stage":"transport","code":"HYSTERIA2_TRANSPORT_METRICS","rttEstimateMs":rtt.as_millis() as u64,"cwndBytes":cwnd,"lostPackets":lost,"sentPackets":sent,"count":generation}));}
+            if let Some((queued,bytes,wait,drops))=client.udp_metrics(){crate::trace::emit(serde_json::json!({"stage":"transport","code":"HYSTERIA2_UDP_QUEUE_METRICS","queuedDatagrams":queued,"queuedBytes":bytes,"sendWaitUs":wait,"receiveQueueDrops":drops,"proxyQueueDrops":crate::proxy_inbound::UDP_QUEUE_DROPS.load(std::sync::atomic::Ordering::Relaxed),"tunQueueDrops":crate::tunnel_metrics::TUN_UDP_DROPPED.load(std::sync::atomic::Ordering::Relaxed)}));}
+        }}));
+        Ok(Self { client })
     }
 
     pub async fn udp_session(&self) -> io::Result<rsteria2::UdpSession> {
@@ -108,6 +115,7 @@ impl Hysteria2Connector {
 }
 
 impl OutboundConnector for Hysteria2Connector {
+    fn named_tun_destination(&self)->bool {true}
     fn udp(&self, host: String, port: u16) -> crate::udp_relay::UdpFuture {
         let client = self.client.clone();
         Box::pin(async move {
@@ -139,12 +147,15 @@ impl OutboundConnector for Hysteria2Connector {
             } else {
                 format!("{host}:{port}")
             };
+            let started=std::time::Instant::now();
             let stream = client.tcp_connect(&address).await.map_err(|_| {
+                crate::trace::code("handshake","HYSTERIA2_TCP_OPEN_FAILED");
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "HYSTERIA2_TCP_CONNECT_FAILED",
                 )
             })?;
+            crate::trace::emit(serde_json::json!({"stage":"handshake","code":"HYSTERIA2_TCP_STREAM_OPENED","durationMs":started.elapsed().as_millis() as u64,"count":client.try_connect_count()}));
             Ok(Box::new(stream) as Box<dyn RelayStream>)
         })
     }

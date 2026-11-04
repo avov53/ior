@@ -1,0 +1,25 @@
+{
+  "sessionComposition": true,
+  "composerImport": true,
+  "explicitTestResults": true,
+  "pendingBlocked": true,
+  "currentSessionOnly": true,
+  "readingPositionPreserved": true,
+  "latestJump": true,
+  "libraryForms": true,
+  "keyboard": true,
+  "widths": [
+    1389,
+    900,
+    460
+  ],
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "mobilePane": true,
+  "reducedMotion": true,
+  "noProductionCalls": true,
+  "productionUnchanged": true,
+  "pageErrors": []
+}

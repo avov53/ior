@@ -250,7 +250,8 @@ mod tests {
         let mut request: crate::ipc_contract::StartRequest =
             serde_json::from_str(include_str!("../../../fixtures/start-v1.json")).unwrap();
         request.profile.protocol = "amneziawg".into();
-        assert!(request.validate_shape().is_err());
+        assert!(request.validate_shape().is_ok());
+        assert!(crate::tunnel_outbound::TunnelConnector::validate_profile(&request.profile).is_err());
     }
 
     #[test]

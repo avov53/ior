@@ -7,4 +7,4 @@ if not exist "node_modules" (
   if errorlevel 1 pause & exit /b 1
 )
 
-call npm run dev -- --host 127.0.0.1 --port 4173 --open /app.html
+call npm run dev -- --host 127.0.0.1 --port 4173 --open /index.html

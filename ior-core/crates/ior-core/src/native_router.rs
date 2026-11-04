@@ -11,6 +11,9 @@ use std::{
 };
 
 pub struct NativeRouter {
+    route_dns: Option<Arc<crate::ipc_contract::WireDns>>,
+    route_dns_cache: Arc<crate::dns_response_cache::DnsResponseCache>,
+    reject_unsupported_packet_family: bool,
     proxy: Arc<dyn OutboundConnector>,
     rules: Arc<Vec<WireRule>>,
     bootstrap: SocketAddr,
@@ -89,8 +92,57 @@ impl IpSet {
     }
 }
 impl NativeRouter {
-    /// A raw SYN has no TLS name. Admit only a route whose target cannot
-    /// change for ANY domain name, including encrypted/cached DNS cases.
+    pub fn with_route_dns(mut self,dns:&crate::ipc_contract::WireDns)->Self{self.route_dns=Some(Arc::new(dns.clone()));self}
+    pub fn with_full_awg_family_policy(mut self, enabled:bool)->Self {self.reject_unsupported_packet_family=enabled;self}
+    pub fn reject_packet_family(&self,destination:IpAddr)->bool {self.reject_unsupported_packet_family && ((destination.is_ipv6()&&self.proxy.ipv4_only())||(destination.is_ipv4()&&self.proxy.ipv6_only()))}
+    pub fn packet_path_enabled(&self)->bool {self.proxy.packet_path_enabled()}
+    pub fn named_tun_targets(&self)->bool {self.proxy.named_tun_destination()}
+    pub fn raw_packet(&self,source:SocketAddr,destination:SocketAddr,protocol:u8)->Result<crate::awg_packets::OpenFuture,&'static str> {
+        if !self.packet_route_is_proxy(destination.ip(), &[]) {return Err("route_requires_name_or_nonproxy");}
+        self.proxy.raw_packet(source,destination,protocol).ok_or("packet_path_unavailable")
+    }
+    /// Resolve only observed DNS names. Conflicting CDN observations stay on the name-inspecting stack.
+    pub fn raw_packet_observed(&self, source:SocketAddr, destination:SocketAddr, protocol:u8, names:&[String])->Result<crate::awg_packets::OpenFuture,&'static str> {
+        if !self.packet_route_is_proxy(destination.ip(), names) {
+            return Err(if names.is_empty(){"route_requires_name_or_nonproxy"}else{"dns_route_conflict_or_nonproxy"});
+        }
+        self.proxy.raw_packet(source,destination,protocol).ok_or("packet_path_unavailable")
+    }
+    pub(crate) fn packet_route_is_proxy(&self, destination:IpAddr, names:&[String])->bool {
+        if !names.is_empty() {
+            return names.iter().all(|name| self.packet_named_target(destination, name)==Some("PROXY"));
+        }
+        // Without a DNS observation, every possible name must select PROXY.
+        for (index,rule) in self.rules.iter().enumerate(){
+            let matched=match rule.kind.as_str(){
+                "IP-CIDR"=>contains(&rule.value,destination).unwrap_or(false),
+                "IP-SET"=>self.ip_sets[&index].contains(destination),
+                "MATCH"=>true,
+                _=>{if rule.target!="PROXY" {return false;} continue;}
+            };
+            if matched {return rule.target=="PROXY";}
+        }
+        false
+    }
+    fn packet_named_target(&self, destination:IpAddr, host:&str)->Option<&str> {
+        for (index, rule) in self.rules.iter().enumerate() {
+            let matched=match rule.kind.as_str() {
+                "IP-CIDR"=>contains(&rule.value,destination).unwrap_or(false),
+                "IP-SET"=>self.ip_sets[&index].contains(destination),
+                "MATCH"=>true,
+                "DOMAIN"=>host.eq_ignore_ascii_case(rule.value.trim_end_matches('.')),
+                "DOMAIN-SUFFIX"=>{
+                    let value=rule.value.trim_end_matches('.');
+                    host.eq_ignore_ascii_case(value) || host.len()>value.len() && host.as_bytes()[host.len()-value.len()-1]==b'.' && host.get(host.len()-value.len()..).is_some_and(|suffix|suffix.eq_ignore_ascii_case(value))
+                },
+                "DOMAIN-KEYWORD"=>rule.value.is_empty() || host.as_bytes().windows(rule.value.len()).any(|part|part.eq_ignore_ascii_case(rule.value.as_bytes())),
+                "REGEXP"=>self.regexes[&index].is_match(host),
+                _=>return None,
+            };
+            if matched {return Some(rule.target.as_str());}
+        }
+        None
+    }
 
     pub fn proxy_dns_hedge_delay(&self) -> std::time::Duration {
         self.proxy.dns_hedge_delay()
@@ -98,6 +150,8 @@ impl NativeRouter {
     pub fn proxy_ipv4_only(&self) -> bool {
         self.proxy.ipv4_only()
     }
+    pub fn proxy_dns_observations(&self)->Option<Arc<crate::tun_names::NameCache>> {self.proxy.dns_observations()}
+    pub fn proxy_dns_response_cache(&self)->Option<Arc<crate::dns_response_cache::DnsResponseCache>> {self.proxy.dns_response_cache()}
     pub fn proxy_ipv6_only(&self) -> bool {
         self.proxy.ipv6_only()
     }
@@ -142,6 +196,9 @@ impl NativeRouter {
             }
         }
         Ok(Self {
+            route_dns: None,
+            route_dns_cache: proxy.dns_response_cache().unwrap_or_else(||Arc::new(crate::dns_response_cache::DnsResponseCache::default())),
+            reject_unsupported_packet_family:false,
             proxy,
             rules: Arc::new(rules),
             bootstrap,
@@ -152,6 +209,9 @@ impl NativeRouter {
     }
     fn owned(&self) -> Self {
         Self {
+            route_dns: self.route_dns.clone(),
+            route_dns_cache: self.route_dns_cache.clone(),
+            reject_unsupported_packet_family:self.reject_unsupported_packet_family,
             proxy: self.proxy.clone(),
             rules: self.rules.clone(),
             bootstrap: self.bootstrap,
@@ -217,11 +277,7 @@ impl NativeRouter {
                 "IP-SET" => {
                     if ip.is_none() && !rule.no_resolve {
                         ip = Some(
-                            dns_engine::resolve_server_ipv4_bound(
-                                &host,
-                                self.bootstrap,
-                                &self.network,
-                            )
+                            self.resolve_route_ip(&host)
                             .await?
                             .into(),
                         );
@@ -231,11 +287,7 @@ impl NativeRouter {
                 "IP-CIDR" => {
                     if ip.is_none() && !rule.no_resolve {
                         ip = Some(
-                            dns_engine::resolve_server_ipv4_bound(
-                                &host,
-                                self.bootstrap,
-                                &self.network,
-                            )
+                            self.resolve_route_ip(&host)
                             .await?
                             .into(),
                         );
@@ -257,6 +309,52 @@ impl NativeRouter {
             "ROUTE_FINAL_MISSING",
         ))
     }
+    /// DNS has a name, not a destination address yet. Resolving it through the
+    /// physical bootstrap to choose its resolver creates a circular dependency.
+    /// Apply name/final rules here; enforce IP rules when the resolved flow opens.
+    pub fn decide_dns(&self,host:&str)->io::Result<RouteDecision> {
+        let host=host.trim_end_matches('.').to_ascii_lowercase();
+        for (index,rule) in self.rules.iter().enumerate(){
+            if matches!(rule.kind.as_str(),"IP-CIDR"|"IP-SET"){continue;}
+            let value=rule.value.trim_end_matches('.').to_ascii_lowercase();
+            let matched=match rule.kind.as_str(){
+                "IP-CIDR"|"IP-SET"=>continue,
+                "MATCH"=>true,
+                "DOMAIN"=>host==value,
+                "DOMAIN-SUFFIX"=>host==value||host.ends_with(&format!(".{value}")),
+                "DOMAIN-KEYWORD"=>host.contains(&value),
+                "REGEXP"=>self.regexes[&index].is_match(&host),
+                _=>return Err(io::ErrorKind::Unsupported.into()),
+            };
+            if matched{return Ok(RouteDecision{target:rule.target.clone(),index,source:rule.source.clone()});}
+        }
+        Err(io::Error::new(io::ErrorKind::InvalidInput,"ROUTE_FINAL_MISSING"))
+    }
+    async fn resolve_route_ip(&self,host:&str)->io::Result<std::net::Ipv4Addr> {
+        let Some(dns)=&self.route_dns else{return dns_engine::resolve_server_ipv4_bound(host,self.bootstrap,&self.network).await;};
+        let route=self.decide_dns(host)?;
+        match route.target.as_str(){
+            "DIRECT"=>return dns_engine::resolve_server_ipv4_bound(host,self.bootstrap,&self.network).await,
+            "REJECT"=>return Err(io::Error::new(io::ErrorKind::PermissionDenied,"DNS_ROUTE_REJECTED")),
+            "PROXY"=>(),_=>return Err(io::ErrorKind::Unsupported.into()),
+        }
+        let servers=if dns.upstreams.is_empty(){vec![dns.upstream.clone()]}else{dns.upstreams.clone()};
+        let servers=servers.iter().map(|value|value.parse::<IpAddr>().map(|ip|SocketAddr::new(ip,53).to_string()).map_err(|_|io::ErrorKind::InvalidInput)).collect::<Result<Vec<_>,_>>()?;
+        let mut id=[0;2];getrandom::getrandom(&mut id).map_err(io::Error::other)?;let query=dns_engine::encode_address_question(host,id,1)?;
+        let answer=tokio::time::timeout(std::time::Duration::from_secs(8),crate::dns_exchange::hedged_with_delay(&servers,self.proxy_dns_hedge_delay(),|server|{
+            let query=&query;
+            async move{
+                let scope=format!("PROXY|{server}");if let Some(reply)=self.route_dns_cache.get(query,&scope,false){return Ok(reply);}
+                let endpoint:SocketAddr=server.parse().map_err(|_|io::ErrorKind::InvalidInput)?;
+                let mut relay=self.proxy.udp(endpoint.ip().to_string(),53).await?;relay.send(query).await?;
+                let mut reply=relay.receive().await?;let question=crate::tun_names::question(query)?;
+                if !crate::tun_names::matches_response(&reply,&question){return Err(io::ErrorKind::InvalidData.into());}
+                if reply[2]&2!=0 {use tokio::io::{AsyncReadExt,AsyncWriteExt};let mut tcp=self.proxy.connect(endpoint.ip().to_string(),53).await?;tcp.write_u16(query.len() as u16).await?;tcp.write_all(query).await?;tcp.flush().await?;let len=tcp.read_u16().await? as usize;if len<12{return Err(io::ErrorKind::InvalidData.into());}reply.resize(len,0);tcp.read_exact(&mut reply).await?;}
+                dns_engine::decode_address_answers(&reply,query)?;self.route_dns_cache.insert(query,&scope,false,&reply);Ok(reply)
+            }
+        })).await.map_err(|_|io::ErrorKind::TimedOut)??;
+        dns_engine::decode_address_answers(&answer,&query)?.into_iter().find_map(|ip|if let IpAddr::V4(ip)=ip{Some(ip)}else{None}).ok_or_else(||io::ErrorKind::NotFound.into())
+    }
     async fn direct_address(&self, host: &str, port: u16) -> io::Result<SocketAddr> {
         let ip = dns_engine::resolve_server_ip_bound(host, self.bootstrap, &self.network).await?;
         Ok(SocketAddr::new(ip.into(), port))
@@ -266,11 +364,27 @@ impl NativeRouter {
         address: SocketAddr,
         domain: Option<String>,
     ) -> ConnectFuture {
+        self.connect_destination_policy(address,domain,false)
+    }
+    pub fn connect_sniffed_destination(&self,address:SocketAddr,domain:Option<String>)->ConnectFuture {
+        self.connect_destination_policy(address,domain,true)
+    }
+    fn connect_destination_policy(&self,address:SocketAddr,domain:Option<String>,sniffed:bool)->ConnectFuture {
         let this = self.owned();
         Box::pin(async move {
             let host = domain.unwrap_or_else(|| address.ip().to_string());
             let decision = this.decide(&host, Some(address.ip())).await?;
             emit_decision(&host, address.port(), &decision, "tcp");
+            if decision.target=="PROXY" && this.reject_packet_family(address.ip()) {
+                crate::trace::emit(serde_json::json!({"stage":"routing","code":"AWG_PROXY_FAMILY_REJECTED","destinationName":host,"transport":"tcp","addressFamily":if address.is_ipv6(){"ipv6"}else{"ipv4"},"reason":"address_family"}));
+                return Err(io::Error::new(io::ErrorKind::Unsupported,"AWG_PROXY_ADDRESS_FAMILY_UNSUPPORTED"));
+            }
+            // Route against the original IP/SNI first. A stream proxy can resolve
+            // the name at its exit, avoiding unusable locally cached IPv6/CDN IPs.
+            if sniffed && decision.target=="PROXY" && this.proxy.named_tun_destination() && host.parse::<IpAddr>().is_err(){
+                crate::trace::code("routing","TUN_PROXY_NAMED_DESTINATION");
+                return this.connect_target("PROXY",&host,address.port()).await;
+            }
             // Keep the original address except for an IPv4-only proxy's named IPv6 flow.
             // Route selection above still uses the original destination and rule order.
             if decision.target == "PROXY"
@@ -299,6 +413,9 @@ impl NativeRouter {
             let host = domain.unwrap_or_else(|| address.ip().to_string());
             let decision = this.decide(&host, Some(address.ip())).await?;
             emit_decision(&host, address.port(), &decision, "udp");
+            if decision.target=="PROXY" && this.reject_packet_family(address.ip()) {
+                return Err(io::Error::new(io::ErrorKind::Unsupported,"AWG_PROXY_ADDRESS_FAMILY_UNSUPPORTED"));
+            }
             if decision.target == "PROXY"
                 && ((this.proxy.ipv4_only() && address.is_ipv6())
                     || (this.proxy.ipv6_only() && address.is_ipv4()))
@@ -437,6 +554,11 @@ pub(crate) fn bound_socket_family(
         None,
     )?;
     socket.set_nonblocking(true)?;
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        crate::android_network::protect(socket.as_raw_fd())?;
+    }
     if let Some(network) = network {
         let ip: IpAddr = if ipv6 {
             network.physical_address6.as_deref().ok_or_else(|| {
@@ -491,6 +613,57 @@ pub(crate) fn bound_socket_family(
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct RoutingDnsProxy;
+    struct RoutingDnsRelay(Option<Vec<u8>>);
+    impl DatagramRelay for RoutingDnsRelay {
+        fn send<'a>(&'a mut self,query:&'a [u8])->SendFuture<'a>{Box::pin(async move{let mut reply=query.to_vec();reply[2]=0x81;reply[3]=0x80;reply[7]=1;reply.extend([0xc0,0x0c,0,1,0,1,0,0,0,30,0,4,198,51,100,7]);self.0=Some(reply);Ok(())})}
+        fn receive(&mut self)->ReceiveFuture<'_>{Box::pin(async move{Ok(self.0.take().unwrap())})}
+    }
+    impl OutboundConnector for RoutingDnsProxy {
+        fn udp(&self,host:String,port:u16)->UdpFuture{assert_eq!((host.as_str(),port),("8.8.8.8",53));Box::pin(async{Ok(Box::new(RoutingDnsRelay(None)) as Box<dyn DatagramRelay>)})}
+        fn connect(&self,host:String,_:u16)->ConnectFuture{Box::pin(async move{Err(io::Error::new(io::ErrorKind::Other,host))})}
+    }
+    #[tokio::test]
+    async fn proxy_ip_rules_use_configured_proxy_dns_without_physical_bootstrap(){
+        let dns=crate::ipc_contract::WireDns{bootstrap:"127.0.0.1".into(),upstream:"8.8.8.8".into(),upstreams:vec![],ipv4_only:false};
+        let mut ip_rule=rule("IP-CIDR","203.0.113.0/24","REJECT");ip_rule.no_resolve=false;
+        let router=NativeRouter::new(Arc::new(RoutingDnsProxy),vec![ip_rule,rule("MATCH","","PROXY")],"127.0.0.1:9".parse().unwrap(),None).unwrap().with_route_dns(&dns);
+        assert_eq!(router.connect("tr.rbxcdn.com".into(),443).await.err().unwrap().to_string(),"tr.rbxcdn.com");
+        let mut ip_rule=rule("IP-CIDR","198.51.100.0/24","REJECT");ip_rule.no_resolve=false;
+        let blocked=NativeRouter::new(Arc::new(RoutingDnsProxy),vec![ip_rule,rule("MATCH","","PROXY")],"127.0.0.1:9".parse().unwrap(),None).unwrap().with_route_dns(&dns);
+        assert_eq!(blocked.connect("tr.rbxcdn.com".into(),443).await.err().unwrap().kind(),io::ErrorKind::PermissionDenied);
+    }
+    #[test]
+    fn dns_name_rules_preserve_direct_reject_and_final_without_ip_resolution(){
+        let router=NativeRouter::new(Arc::new(NeverProxy),vec![rule("IP-CIDR","10.0.0.0/8","DIRECT"),rule("DOMAIN","local.example","DIRECT"),rule("DOMAIN-SUFFIX","blocked.example","REJECT"),rule("MATCH","","PROXY")],"127.0.0.1:9".parse().unwrap(),None).unwrap();
+        assert_eq!(router.decide_dns("local.example").unwrap().target,"DIRECT");
+        assert_eq!(router.decide_dns("cdn.blocked.example").unwrap().target,"REJECT");
+        assert_eq!(router.decide_dns("tr.rbxcdn.com").unwrap().target,"PROXY");
+    }
+    struct NamedRecordingProxy(bool);
+    impl OutboundConnector for NamedRecordingProxy {
+        fn named_tun_destination(&self)->bool{self.0}
+        fn connect(&self,host:String,_:u16)->ConnectFuture {Box::pin(async move{Err(io::Error::new(io::ErrorKind::Other,host))})}
+    }
+    #[tokio::test]
+    async fn sniffed_proxy_names_preserve_rules_and_do_not_change_ip_tunnels_or_dns_only_names(){
+        let address:SocketAddr="[2001:db8::9]:443".parse().unwrap();
+        for named in [false,true]{
+            let router=NativeRouter::new(Arc::new(NamedRecordingProxy(named)),vec![rule("MATCH","","PROXY")],"1.1.1.1:53".parse().unwrap(),None).unwrap();
+            let result=router.connect_sniffed_destination(address,Some("tr.rbxcdn.com".into())).await.err().unwrap().to_string();
+            assert_eq!(result,if named{"tr.rbxcdn.com"}else{"2001:db8::9"});
+            assert_eq!(router.connect_destination(address,Some("tr.rbxcdn.com".into())).await.err().unwrap().to_string(),"2001:db8::9");
+        }
+        let router=NativeRouter::new(Arc::new(NamedRecordingProxy(true)),vec![rule("IP-CIDR","2001:db8::/32","REJECT"),rule("DOMAIN-SUFFIX","rbxcdn.com","PROXY"),rule("MATCH","","PROXY")],"1.1.1.1:53".parse().unwrap(),None).unwrap();
+        assert_eq!(router.connect_sniffed_destination(address,Some("tr.rbxcdn.com".into())).await.err().unwrap().kind(),io::ErrorKind::PermissionDenied);
+    }
+    #[tokio::test]
+    async fn sniffed_direct_name_keeps_original_address(){
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let router=NativeRouter::new(Arc::new(NamedRecordingProxy(true)),vec![rule("DOMAIN-SUFFIX","rbxcdn.com","DIRECT"),rule("MATCH","","PROXY")],"1.1.1.1:53".parse().unwrap(),None).unwrap();
+        let stream=router.connect_sniffed_destination(address,Some("tr.rbxcdn.com".into())).await.unwrap();
+        let(_peer,_)=listener.accept().await.unwrap();drop(stream);
+    }
     #[tokio::test]
     async fn every_resolved_candidate_keeps_its_own_ip_rule() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -576,6 +749,18 @@ mod tests {
         fn udp(&self, host: String, _: u16) -> UdpFuture {
             Box::pin(async move { Err(io::Error::new(io::ErrorKind::Other, host)) })
         }
+    }
+    #[tokio::test]
+    async fn awg_named_family_refusal_does_not_open_a_second_tcp_path_or_bypass_rules(){
+        let router=NativeRouter::new(Arc::new(Ipv4RecordingProxy),vec![rule("DOMAIN","blocked.test","REJECT"),rule("MATCH","","PROXY")],"127.0.0.1:9".parse().unwrap(),None).unwrap().with_full_awg_family_policy(true);
+        let address="[2001:db8::1]:443".parse().unwrap();
+        for sniffed in [false,true]{let result=if sniffed{router.connect_sniffed_destination(address,Some("video.test".into()))}else{router.connect_destination(address,Some("video.test".into()))};assert_eq!(result.await.err().unwrap().to_string(),"AWG_PROXY_ADDRESS_FAMILY_UNSUPPORTED");}
+        assert_eq!(router.udp_destination(address,Some("video.test".into())).await.err().unwrap().to_string(),"AWG_PROXY_ADDRESS_FAMILY_UNSUPPORTED");
+        assert_eq!(router.connect_destination(address,Some("blocked.test".into())).await.err().unwrap().kind(),io::ErrorKind::PermissionDenied);
+        assert_eq!(router.connect_destination("192.0.2.1:443".parse().unwrap(),Some("video.test".into())).await.err().unwrap().to_string(),"192.0.2.1");
+        let direct=NativeRouter::new(Arc::new(Ipv4RecordingProxy),vec![rule("DOMAIN","local.test","DIRECT"),rule("MATCH","","PROXY")],"127.0.0.1:9".parse().unwrap(),None).unwrap().with_full_awg_family_policy(true);
+        let listener=tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        assert!(direct.connect_destination(listener.local_addr().unwrap(),Some("local.test".into())).await.is_ok());
     }
     #[tokio::test]
     async fn ipv4_only_proxy_uses_known_name_for_ipv6_without_changing_rule_selection() {
@@ -866,6 +1051,7 @@ impl OutboundConnector for NativeRouter {
     }
 }
 pub fn emit_decision(host: &str, port: u16, decision: &RouteDecision, transport: &str) {
+    if crate::resource_diagnostics::enabled(host){crate::resource_diagnostics::emit(host,"RESOURCE_ROUTE",serde_json::json!({"stage":"routing","target":decision.target,"ruleIndex":decision.index,"transport":transport}));}
     let destination = if host.len() <= 255
         && host
             .bytes()

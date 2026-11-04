@@ -1,0 +1,20 @@
+{
+  "emptyState": true,
+  "groupedRows": true,
+  "search": true,
+  "selection": true,
+  "editor": true,
+  "keyboard": true,
+  "pendingState": true,
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "widths": [
+    1389,
+    900,
+    460
+  ],
+  "reducedMotion": true,
+  "errors": []
+}

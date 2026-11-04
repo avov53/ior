@@ -146,6 +146,7 @@ fn trojan_header(password: &str, command: u8, host: &str, port: u16) -> io::Resu
     Ok(header)
 }
 impl OutboundConnector for NativeProtocolConnector {
+    fn named_tun_destination(&self)->bool {true}
     fn connect(&self, host: String, port: u16) -> ConnectFuture {
         let this = self.clone();
         Box::pin(async move {

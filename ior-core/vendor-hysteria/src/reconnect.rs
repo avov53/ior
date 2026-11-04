@@ -16,6 +16,25 @@ pub struct ReconnectableClient {
     inner: Mutex<State>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn stale_failure_cannot_invalidate_replacement_generation() {
+        let (old_endpoint,_old_server,old_conn,_old_remote)=crate::test_support::pair().await;
+        let (endpoint,_server,conn,_remote)=crate::test_support::pair().await;
+        let old=Arc::new(crate::HysteriaClient::new(old_conn,old_endpoint,true,false,0));
+        let fresh=Arc::new(crate::HysteriaClient::new(conn,endpoint,true,false,0));
+        let client=ReconnectableClient::new(Config::default());
+        client.inner.lock().await.client=Some(fresh.clone());
+        client.invalidate_if_current(&old).await;
+        assert!(Arc::ptr_eq(&client.current().await.unwrap(),&fresh));
+        drop(old);assert!(fresh.connection().close_reason().is_none());
+        client.invalidate_if_current(&fresh).await;
+        assert!(client.inner.lock().await.client.is_none());
+    }
+}
+
 #[derive(Default)]
 struct State {
     client: Option<Arc<crate::HysteriaClient>>,
@@ -46,6 +65,10 @@ impl ReconnectableClient {
     pub async fn connect_count(&self) -> u64 {
         self.inner.lock().await.count
     }
+    /// Diagnostics must never wait behind a reconnect holding the state lock.
+    pub fn try_connect_count(&self) -> Option<u64> {
+        self.inner.try_lock().ok().map(|state| state.count)
+    }
 
     /// Get a live client, reconnecting if there is none or the existing one's
     /// QUIC connection has closed.
@@ -75,6 +98,14 @@ impl ReconnectableClient {
         state.client = None;
     }
 
+    // An old failed stream must not tear down a replacement connection.
+    async fn invalidate_if_current(&self, failed: &Arc<crate::HysteriaClient>) {
+        let mut state = self.inner.lock().await;
+        if state.client.as_ref().is_some_and(|current| Arc::ptr_eq(current, failed)) {
+            state.client = None;
+        }
+    }
+
     /// Open a proxied TCP connection, reconnecting once if the connection was
     /// found to be closed.
     pub async fn tcp_connect(&self, address: &str) -> Result<DuplexStream> {
@@ -84,7 +115,7 @@ impl ReconnectableClient {
             Err(e) => {
                 // If the connection died, drop it and try a fresh one once.
                 if client.connection().close_reason().is_some() {
-                    self.invalidate().await;
+                    self.invalidate_if_current(&client).await;
                     self.current().await?.tcp_connect(address).await
                 } else {
                     Err(e)
@@ -104,4 +135,12 @@ impl ReconnectableClient {
         state.closed = true;
         state.client = None;
     }
+    /// Observation only: never opens or restarts a connection.
+    pub fn transport_metrics(&self)->Option<(std::time::Duration,u64,u64,u64,u64)> {
+        let state=self.inner.try_lock().ok()?;
+        let client=state.client.as_ref()?;
+        let stats=client.connection().stats();
+        Some((stats.path.rtt,stats.path.cwnd,stats.path.lost_packets,stats.path.sent_packets,state.count))
+    }
+    pub fn udp_metrics(&self)->Option<(u64,u64,u64,u64)>{self.inner.try_lock().ok()?.client.as_ref()?.udp_metrics()}
 }

@@ -44,6 +44,18 @@ pub fn udp_unreachable(
 ) -> Option<Vec<u8>> {
     udp_unreachable_quote(&udp_quote(source, destination, data)?)
 }
+/// Refuse a new unsupported TCP SYN before creating any TCP stack state.
+pub fn tcp_syn_reset(packet:&[u8])->Option<Vec<u8>> {
+    let tuple=crate::awg_packets::tuple(packet)?;
+    if tuple.protocol!=6 || tuple.flags&0x17!=2{return None;}
+    let offset=if tuple.source.is_ipv6(){40}else{(packet[0]&15) as usize*4};
+    let seq=u32::from_be_bytes(packet.get(offset+4..offset+8)?.try_into().ok()?);
+    let mut reply=header(tuple.destination.ip(),tuple.source.ip(),6,20)?;
+    let mut tcp=vec![0;20];tcp[..2].copy_from_slice(&tuple.destination.port().to_be_bytes());tcp[2..4].copy_from_slice(&tuple.source.port().to_be_bytes());
+    tcp[8..12].copy_from_slice(&seq.wrapping_add(1).to_be_bytes());tcp[12]=0x50;tcp[13]=0x14;
+    let mut pseudo=if tuple.source.is_ipv6(){let mut p=reply[8..40].to_vec();p.extend(20u32.to_be_bytes());p.extend([0,0,0,6]);p}else{let mut p=reply[12..20].to_vec();p.extend([0,6]);p.extend(20u16.to_be_bytes());p};
+    pseudo.extend(&tcp);tcp[16..18].copy_from_slice(&checksum(&pseudo).to_be_bytes());reply.extend(tcp);Some(reply)
+}
 /// Keep the original datagram length and checksum in the ICMP quotation.
 /// Windows uses them to associate a rejection with the outstanding UDP flow.
 pub fn udp_quote(source: SocketAddr, destination: SocketAddr, data: &[u8]) -> Option<Vec<u8>> {

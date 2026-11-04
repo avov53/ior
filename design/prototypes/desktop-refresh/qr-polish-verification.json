@@ -1,0 +1,17 @@
+{
+  "engine": "LinkeDOM; no pixels",
+  "languageSingle": true,
+  "languagePersistence": true,
+  "defaultCoreSelect": true,
+  "invalidCoreMigration": true,
+  "activeCoreUntouched": true,
+  "viewOnlyNoFooters": true,
+  "editActionsRetained": true,
+  "qrToggleSameNode": true,
+  "qrCache": true,
+  "qrPendingGuard": true,
+  "lateQrIgnored": true,
+  "qrErrorRetry": true,
+  "escapeAndFocus": true,
+  "visualWhitePanelAndWindowSizes": "not checked in browser"
+}

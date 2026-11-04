@@ -10,3 +10,21 @@ test-shots*/
 
 __pycache__/
 *.py[cod]
+.local/
+android-output/
+distandroid/
+android/.gradle/
+android/**/build/
+android/local.properties
+android/app/src/main/jniLibs/
+android/app/src/main/assets/geodata/
+*.jks
+*.keystore
+
+macos/web/
+macos/src-tauri/target/
+macos/src-tauri/resources/
+macos-output/
+
+# Local desktop release packages
+windows-output/

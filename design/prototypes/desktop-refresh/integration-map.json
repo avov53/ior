@@ -1,0 +1,88 @@
+{
+  "prototypeOnly": true,
+  "productionEntryPointUnchanged": true,
+  "backendConnection": "disabled until explicit transfer decision",
+  "futureBindings": [
+    {
+      "ui": "Connection state and toggle",
+      "existingCommands": [
+        "state.get",
+        "connection.toggle",
+        "connection.mode"
+      ]
+    },
+    {
+      "ui": "Server library, import and edits",
+      "existingCommands": [
+        "server.select",
+        "server.import",
+        "server.rename",
+        "server.save",
+        "server.delete"
+      ]
+    },
+    {
+      "ui": "Profiles",
+      "existingCommands": [
+        "connectionProfile.save",
+        "connectionProfile.select",
+        "connectionProfile.delete"
+      ]
+    },
+    {
+      "ui": "Routing",
+      "existingCommands": [
+        "route.save",
+        "route.select",
+        "route.delete"
+      ]
+    },
+    {
+      "ui": "Settings",
+      "existingCommands": [
+        "settings.update"
+      ]
+    },
+    {
+      "ui": "Journal",
+      "existingCommands": [
+        "state.get",
+        "logs.clear",
+        "diagnostics.export"
+      ]
+    },
+    {
+      "ui": "Window controls",
+      "existingCommands": [
+        "window.minimize",
+        "window.maximize",
+        "window.close",
+        "window.drag"
+      ]
+    }
+  ],
+  "currentPrototypeCapabilities": [
+    "local VLESS decoding and encoding with preserved query parameters",
+    "table search, protocol/source filters and sorting",
+    "read-only subscription configuration viewing",
+    "personal configuration editing",
+    "masked UUID/password/private key fields",
+    "copy saved link and export prototype JSON",
+    "unsaved-change confirmation",
+    "keyboard navigation and reduced motion"
+  ],
+  "unavailableInPrototype": [
+    "VPN connection",
+    "network measurements",
+    "real subscription fetching",
+    "Windows settings",
+    "native window controls"
+  ],
+  "visualStructure": {
+    "shell": "56px icon rail + 260px collapsible subscriptions pane",
+    "home": "configuration table with filters",
+    "editor": "explicit edit button, 360px inline at 1320px+, overlay below",
+    "settings": "reference screenshot category pane and grouped parameters",
+    "background": "flat surfaces, no animated gradients"
+  }
+}

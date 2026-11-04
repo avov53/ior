@@ -17,3 +17,7 @@ Exact versions and checksums are recorded in Cargo.lock. Git dependencies are pi
 
 
 Cryptography is supplied by rustls, AWS-LC, ring and their pinned dependencies. No custom cryptographic primitives are implemented. The patched Reality library passed HTTPS, Discord Gateway WebSocket and XUDP DNS on the available remote server. This does not imply complete Vision optimization, Windows TUN recovery validation, or production readiness.
+
+- AmneziaWG packet engine: github.com/amnezia-vpn/amneziawg-go/v3 v3.1.20260828, MIT; LICENSE-amneziawg-3.1.20260828 included. Separate Go process with an in-memory packet device, no extra system adapter. Go 1.27.1 and compiled x/crypto, x/net, x/sys and Wintun license texts are in LICENSE-awg-go-dependencies. Module hashes are pinned in adapters/amneziawg/go.sum; reproducible binary SHA-256 is checked before packaging.
+
+- ior-awg-noise: isolated local BoringTun 0.7.1 fork, BSD-3-Clause (LICENSE-ior-awg-noise). AWG wire-format adaptations follow official amneziawg-go v3.1.20260828, MIT (LICENSE-amneziawg-3.1.20260828). Ordinary WireGuard retains the upstream dependency. Native header protection uses chacha20 0.9.1; authentication, session AEAD and replay validation retain existing audited primitives. Experimental interoperability code; no independent security audit or YouTube-speed claim.

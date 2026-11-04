@@ -1,0 +1,26 @@
+{
+  "isolated": true,
+  "productionUnchanged": true,
+  "noNativeCalls": true,
+  "noInventedMeasurements": true,
+  "smallCaptionControls": [
+    40,
+    32
+  ],
+  "animatedNavigation": true,
+  "dialogsAndMenus": true,
+  "prototypeCrud": true,
+  "copyLogs": true,
+  "keyboard": true,
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "widths": [
+    1280,
+    780,
+    460
+  ],
+  "reducedMotion": true,
+  "pageErrors": []
+}

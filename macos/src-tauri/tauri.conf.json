@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ior",
+  "version": "1.2.9",
+  "identifier": "app.ior.macos",
+  "build": {"frontendDist": "../web"},
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [{"title": "ior · macOS preview", "width": 1100, "height": 760}],
+    "security": {"csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"}
+  },
+  "bundle": {"active": true, "targets": ["app"], "macOS": {"minimumSystemVersion": "13.0"}, "resources": ["resources/ior-core"]}
+}
