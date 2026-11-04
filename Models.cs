@@ -4,6 +4,17 @@ namespace HappBox;
 
 public sealed class AppState
 {
+    public string ServiceAvailableColor {get;set;}="#34c759";
+    public string ServiceUnavailableColor {get;set;}="#ff453a";
+    public JournalPolicy Journal {get;set;}=new();
+    public bool LaunchWithWindows {get;set;}
+    public bool ConnectAtWindowsStartup {get;set;}
+    public string? WindowsStartupProfileId {get;set;}
+    public bool RestoreAfterSleep {get;set;}=true;
+    public bool LanFirewallManaged {get;set;}
+    public bool SubscriptionOptionsMigrated {get;set;}
+    public LanProxySettings Lan {get;set;} = new();
+    public bool SendSubscriptionHwid { get; set; }
     [JsonIgnore]
     public NativeTunReadinessResult? NativeTunReadiness { get; set; }
     public int SchemaVersion { get; set; } = 2;
@@ -33,6 +44,9 @@ public sealed class AppState
     public bool PowerSavingMode { get; set; }
     public bool ExperimentalCoreTesting { get; set; }
     public bool RealityUdp443Enabled { get; set; }
+    public AwgTunRoutingMode AwgTunRoutingMode { get; set; } = AwgTunRoutingMode.Rules;
+    public AwgEngine AwgEngine { get; set; } = AwgEngine.Rust;
+    public bool AwgRustDefaultMigrated { get; set; }
     public bool RoutingDefaultsSeeded { get; set; }
     public List<string> RoutingBypassSites { get; set; } =
     [
@@ -47,6 +61,8 @@ public sealed class AppState
     public List<string> HappRoutingLinks { get; set; } = [];
     public List<HappRoutingProfile> HappRoutingProfiles { get; set; } = [];
     public string? SelectedHappRoutingProfileId { get; set; }
+    public bool RoutingEnabled { get; set; } = true;
+    public bool RoutingToggleMigrated { get; set; }
     public List<ConnectionWorkspaceProfile> ConnectionProfiles { get; set; } = [];
     public string? SelectedConnectionProfileId { get; set; }
     public bool AutoRefreshSubscriptions { get; set; } = true;
@@ -111,6 +127,8 @@ public sealed class ProxyProfile
     public string? Host { get; set; }
     public string? Path { get; set; }
     public string? ServiceName { get; set; }
+    public string[]? Alpn { get; set; }
+    public CoreVlessTransportOptions? VlessTransport { get; set; }
     public string? ObfsType { get; set; }
     public string? ObfsPassword { get; set; }
     public string? PrivateKey { get; set; }
@@ -120,6 +138,9 @@ public sealed class ProxyProfile
     public string? AllowedIps { get; set; }
     public int? PersistentKeepalive { get; set; }
     public int? Mtu { get; set; }
+    public Dictionary<string,string> AwgParameters { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    [JsonIgnore]
+    public Dictionary<string,string> Awg { get => AwgParameters ??= new(StringComparer.OrdinalIgnoreCase); set => AwgParameters=value; }
     public string? TunnelDns { get; set; }
     public string? Plugin { get; set; }
     public List<string> UnsupportedParameters { get; set; } = [];
@@ -193,6 +214,16 @@ public sealed class OrderedRouteRule
 
 public sealed class ProxySubscription
 {
+    public string? ImportWarning {get;set;}
+    public string RouteConsent {get;set;}="legacy";
+    public SubscriptionFetchResult? PendingRoute {get;set;}
+    public SubscriptionHwidMode HwidMode { get; set; }
+    public string? HwidOverride { get; set; }
+    public List<string> HwidApprovedOrigins { get; set; } = [];
+    public bool RequiresHwid { get; set; }
+    public string? HwidRequiredOrigin { get; set; }
+    public string? HwidFailureCode { get; set; }
+    public bool? IsClashYaml { get; set; }
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string Name { get; set; } = "Subscription";
     public bool NameIsCustom { get; set; }
@@ -213,7 +244,13 @@ public sealed class ProxySubscription
     public DateTime? ExpireUtc { get; set; }
     public string? RoutingProfileId { get; set; }
     public bool AutoRefreshEnabled { get; set; } = true;
-    public int RefreshIntervalHours { get; set; } = 12;
+    public int RefreshIntervalHours { get; set; } = 6;
+    public bool RefreshOnStartup {get;set;}
+    public bool PingOnStartup {get;set;}
+    public bool ConnectOnStartup {get;set;}
+    public string StartupSelection {get;set;}="last";
+    public string? LastUsedServerId {get;set;}
+    public int RequestTimeoutMs {get;set;}=10000;
     public int? ServerRefreshIntervalHours { get; set; }
     public bool RefreshIntervalIsCustom { get; set; }
     [System.Text.Json.Serialization.JsonConverter(typeof(UtcTimestampJsonConverter))]
@@ -254,8 +291,12 @@ public enum ProxyProtocol
     Hysteria2,
     WireGuard,
     Socks,
-    Http
+    Http,
+    AmneziaWG = 8
 }
+
+public enum AwgTunRoutingMode { Rules, FullProxy }
+public enum AwgEngine { Go, Rust }
 
 public enum CoreKind
 {
@@ -301,3 +342,5 @@ public enum AppLanguage
     Russian,
     English
 }
+
+public sealed class LanProxySettings {public bool Enabled {get;set;} public List<string>? AllowedClientIps {get;set;} public string InterfaceId {get;set;}="";public int Port {get;set;}=2080;public bool AuthEnabled {get;set;}=true;public string Username {get;set;}="ior";public string Password {get;set;}=Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));}

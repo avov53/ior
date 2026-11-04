@@ -3,6 +3,20 @@ using Xunit;
 namespace HappBox.Tests;
 public sealed class NativeTunReadinessTests
 {
+    [Fact]public async Task RequiredDnsFailureCannotBeReportedAsConnected(){
+        var result=await NativeTunReadiness.CheckAsync(Success,_=>throw new IOException("DNS_FAILED"),Success,default,requireDns:true);
+        Assert.False(result.Ready);Assert.Equal("DNS_FAILED",result.Dns.Code);
+    }
+    [Fact]public async Task RequiredDnsWaitsPastOptionalBudget(){
+        var completion=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var operation=NativeTunReadiness.CheckAsync(Success,_=>completion.Task,Success,default,TimeSpan.FromMilliseconds(10),requireDns:true);
+        await Task.Delay(30);Assert.False(operation.IsCompleted);completion.SetResult();Assert.True((await operation).Ready);
+    }
+    [Fact]public async Task AdapterDiscoveryRequiresOwnedNameAndUpStatus(){
+        var count=0;
+        Assert.True(await TunAdapterDiscovery.WaitAsync("ior-xray",inspect:()=>{count++;return [new("other-vpn",System.Net.NetworkInformation.OperationalStatus.Up),new("ior-xray",count<3?System.Net.NetworkInformation.OperationalStatus.Down:System.Net.NetworkInformation.OperationalStatus.Up)];},limit:TimeSpan.FromSeconds(1)));
+        Assert.False(await TunAdapterDiscovery.WaitAsync("ior-xray",inspect:()=>[new("other-vpn",System.Net.NetworkInformation.OperationalStatus.Up)],limit:TimeSpan.FromMilliseconds(20)));
+    }
     private static Task Success(CancellationToken token)=>Task.CompletedTask;
     private static Task Wait(CancellationToken token)=>Task.Delay(Timeout.Infinite,token);
     [Fact]public async Task FailedUdpDoesNotDisableVerifiedHttpsAndDns()

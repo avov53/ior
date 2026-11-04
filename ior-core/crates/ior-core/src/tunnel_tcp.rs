@@ -3,6 +3,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const BASE_RECEIVE: usize = 128 * 1024;
 pub const LARGE_RECEIVE: usize = 512 * 1024;
+/// Accepted AWG fallback window gate at RTT 200ms / deterministic 0.5% loss.
+pub const AWG_RECEIVE: usize = 2 * 1024 * 1024;
 pub const DEFAULT_RECEIVE: usize = LARGE_RECEIVE;
 pub const DEFAULT_REASSEMBLY_SEGMENTS: usize = 4;
 pub const EXTRA_BUDGET: usize = 64 * 1024 * 1024;

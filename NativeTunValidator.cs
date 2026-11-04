@@ -100,7 +100,7 @@ public static class NativeTunValidator
         string watchdogExecutable, Action<string>? progress = null, Action<string,long,bool>? measured = null, bool performance = false,bool legacy=false,bool fastStartProbeOnly=false,
         bool prepareAddresses=true,bool measurePages=false)
     {
-        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000)) throw new InvalidOperationException("WINDOWS_11_REQUIRED");
+        if (!NativeWindowsPlatform.TunAvailable) throw new InvalidOperationException("WINDOWS_10_1607_OR_NEWER_REQUIRED");
         if (!Supported(profile)) throw new InvalidOperationException("SELECT_SUPPORTED_PROFILE");
         if (!CoreRuntimeContract.TryCreateStart(state, profile, out _, out var reason)) throw new InvalidOperationException(reason);
         if (!IsAdministrator()) throw new InvalidOperationException("ADMINISTRATOR_REQUIRED");

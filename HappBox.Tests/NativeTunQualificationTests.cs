@@ -8,7 +8,7 @@ public sealed class NativeTunQualificationTests
     [Fact]
     public void PassingOnlySmokeChecksDoesNotOpenTunAndChangedBinaryInvalidatesEvidence()
     {
-        if (!OperatingSystem.IsWindowsVersionAtLeast(10,0,22000)) return;
+        if (!NativeWindowsPlatform.TunAvailable) return;
         var directory = Path.Combine(Path.GetTempPath(), "ior-qualification-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory); var binary = Path.Combine(directory,"native.exe");
         try
@@ -37,7 +37,7 @@ public sealed class NativeTunQualificationTests
     [Fact]
     public void ExperimentalRealityTunCanStartWithoutQualificationReport()
     {
-        if (!OperatingSystem.IsWindowsVersionAtLeast(10,0,22000)) return;
+        if (!NativeWindowsPlatform.TunAvailable) return;
         var directory = Path.Combine(Path.GetTempPath(), "ior-gate-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         var binary = Path.Combine(directory,"native.exe");
@@ -53,8 +53,8 @@ public sealed class NativeTunQualificationTests
             Assert.False(File.Exists(NativeTunQualification.ReportPath(binary)));
             Assert.True(CoreEngineService.Capability(CoreKind.IorCore,state).Tun);
             state.ExperimentalCoreTesting = false;
-            Assert.Equal(OperatingSystem.IsWindowsVersionAtLeast(10,0,22000), CoreEngineService.CanRun(state,profile,out _));
-            Assert.Equal(OperatingSystem.IsWindowsVersionAtLeast(10,0,22000), CoreEngineService.Capability(CoreKind.IorCore,state).Tun);
+            Assert.Equal(NativeWindowsPlatform.TunAvailable, CoreEngineService.CanRun(state,profile,out _));
+            Assert.Equal(NativeWindowsPlatform.TunAvailable, CoreEngineService.Capability(CoreKind.IorCore,state).Tun);
             state.ExperimentalCoreTesting = true;
             profile.Flow = "xtls-rprx-vision-udp443";
             Assert.True(CoreEngineService.CanRun(state,profile,out reason),reason);

@@ -193,6 +193,8 @@ $inspected = [System.Collections.Generic.List[object]]::new()
         if (!System.Text.RegularExpressions.Regex.IsMatch(name, "^ior-native-[a-f0-9]{8}$") ||
             dns.AddressFamily != AddressFamily.InterNetwork)
             throw new InvalidOperationException("Некорректные параметры собственного TUN.");
+        if(!await TunAdapterDiscovery.WaitAsync(name,token))
+            throw new IOException("NATIVE_TUN_ADAPTER_NOT_READY: "+TunAdapterDiscovery.DescribeOwnedAdapters());
         var adapter = NetworkInterface.GetAllNetworkInterfaces().SingleOrDefault(item => item.Name == name)
             ?? throw new IOException("Собственный TUN-адаптер не появился.");
         var index = adapter.GetIPProperties().GetIPv4Properties()!.Index;

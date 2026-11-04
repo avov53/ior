@@ -34,12 +34,13 @@ public static class ClashSubscriptionParser
         foreach (var node in nodes.Children)
         {
             if (node is not YamlMappingNode item) { rejected++; continue; }
-            if (RemovedProtocolPolicy.IsYaml(item)) { rejected++; removed++; continue; }
+
             try
             {
+                if(Get(item,"type") is YamlScalarNode type&&type.Value?.ToLowerInvariant() is "vmess" or "ss" or "shadowsocks" or "trojan"){removed++;rejected++;continue;}
                 var profile = ParseProxy(item);
                 if (!names.Add(profile.Name)) throw new FormatException("Повторяющееся имя Clash-сервера.");
-                profiles.Add(profile);
+                if(RemovedProtocolPolicy.IsRemoved(profile)){removed++;rejected++;}else profiles.Add(profile);
             }
             catch (FormatException) { rejected++; }
         }
@@ -112,6 +113,8 @@ public static class ClashSubscriptionParser
                 profile.Protocol = ProxyProtocol.Trojan; profile.Password = Required(item, "password"); profile.TlsEnabled = true;
                 ApplyStreamOptions(item, profile);
                 break;
+            case "awg":
+            case "amneziawg":
             case "wireguard":
                 profile.Protocol = ProxyProtocol.WireGuard;
                 profile.PrivateKey = Required(item, "private-key"); profile.PeerPublicKey = Required(item, "public-key");
@@ -134,7 +137,6 @@ public static class ClashSubscriptionParser
                 profile.Flow = Value(item, "flow");
                 if (profile.Flow is not (null or "xtls-rprx-vision" or "xtls-rprx-vision-udp443"))
                     throw new FormatException("Неподдерживаемый VLESS flow.");
-                ApplyStreamOptions(item, profile);
                 profile.TlsEnabled = Bool(item, "tls") || Get(item, "reality-opts") is not null;
                 if (Get(item, "reality-opts") is not null and not YamlMappingNode)
                     throw new FormatException("Некорректные reality-opts.");
@@ -146,6 +148,7 @@ public static class ClashSubscriptionParser
                     profile.ShortId = Value(reality, "short-id");
                 }
                 profile.Fingerprint = Value(item, "client-fingerprint") ?? "chrome";
+                ApplyStreamOptions(item, profile);
                 break;
             case "hysteria2":
             case "hy2":
@@ -160,7 +163,9 @@ public static class ClashSubscriptionParser
             default:
                 throw new FormatException($"Неподдерживаемый тип Clash-сервера: {type}.");
         }
-        var known=new HashSet<string>(["name","type","server","port","servername","sni","skip-cert-verify","udp","network","tls","client-fingerprint","ws-opts","grpc-opts","username","password","cipher","uuid","alterId","plugin","plugin-opts","flow","reality-opts","private-key","public-key","pre-shared-key","ip","ipv6","allowed-ips","mtu","persistent-keepalive","dns","obfs","obfs-password"],StringComparer.Ordinal);
+        profile.Awg=item.Children.Where(field=>field.Key is YamlScalarNode key && RemovedProtocolPolicy.IsParameter(key.Value??"")).ToDictionary(field=>ProfileParser.AwgParameterNames.First(pair=>pair.Key.Equals(((YamlScalarNode)field.Key).Value,StringComparison.OrdinalIgnoreCase)||pair.Value.Equals(((YamlScalarNode)field.Key).Value,StringComparison.OrdinalIgnoreCase)).Value,field=>((YamlScalarNode)field.Value).Value??"");
+        if(type is "awg" or "amneziawg" || profile.Awg.Count>0)profile.Protocol=ProxyProtocol.AmneziaWG;
+        var known=new HashSet<string>(["name","type","server","port","servername","sni","skip-cert-verify","udp","network","tls","client-fingerprint","ws-opts","grpc-opts","xhttp-opts","httpupgrade-opts","username","password","cipher","uuid","alterId","plugin","plugin-opts","flow","reality-opts","private-key","public-key","pre-shared-key","ip","ipv6","allowed-ips","mtu","persistent-keepalive","dns","obfs","obfs-password"],StringComparer.Ordinal);
         foreach(var pair in ProfileParser.AwgParameterNames){known.Add(pair.Key);known.Add(pair.Value);}
         profile.UnsupportedParameters.AddRange(item.Children.Keys.OfType<YamlScalarNode>().Select(key=>key.Value??"").Where(key=>!known.Contains(key)));
         return profile;
@@ -171,26 +176,42 @@ public static class ClashSubscriptionParser
         profile.Network = Value(item, "network") ?? "tcp";
         switch (profile.Network.ToLowerInvariant())
         {
-            case "tcp": break;
+            case "tcp": case "raw": break;
             case "ws":
                 if (Get(item, "ws-opts") is YamlMappingNode ws)
                 {
                     profile.Path = Value(ws, "path") ?? "/";
                     if (Get(ws, "headers") is YamlMappingNode headers)
                     {
-                        if (headers.Children.Keys.OfType<YamlScalarNode>().Any(key => key.Value?.Equals("Host", StringComparison.OrdinalIgnoreCase) != true))
-                            throw new FormatException("WS: произвольные заголовки пока не представлены в модели.");
+                        profile.VlessTransport ??= new();
+                        foreach(var pair in headers.Children){var key=((YamlScalarNode)pair.Key).Value??"";if(!key.Equals("Host",StringComparison.OrdinalIgnoreCase))profile.VlessTransport.Headers[key]=((YamlScalarNode)pair.Value).Value??"";}
                         profile.Host = headers.Children.FirstOrDefault(pair => (pair.Key as YamlScalarNode)?.Value?.Equals("Host", StringComparison.OrdinalIgnoreCase) == true).Value is YamlScalarNode host ? host.Value : null;
                     }
                     if (Get(ws, "max-early-data") is not null) throw new FormatException("WS early data пока не поддерживается.");
                 }
                 break;
             case "grpc":
-                if (Get(item, "grpc-opts") is YamlMappingNode grpc) profile.ServiceName = Value(grpc, "grpc-service-name");
+                if (Get(item, "grpc-opts") is YamlMappingNode grpc){profile.ServiceName = Value(grpc, "grpc-service-name");profile.Host=Value(grpc,"authority");profile.VlessTransport=new(){MultiMode=Bool(grpc,"multi-mode")};}
+                break;
+            case "httpupgrade": case "xhttp":
+                if(Get(item,profile.Network.ToLowerInvariant()+"-opts") is YamlMappingNode options){
+                    profile.Path=Value(options,"path")??"/";profile.Host=Value(options,"host");
+                    var query=new Dictionary<string,string>{{"type",profile.Network.ToLowerInvariant()}};
+                    if(Value(options,"mode") is {} mode)query["mode"]=mode;
+                    if(Get(options,"extra") is {} extra)query["extra"]=TransportJson(extra).ToJsonString();
+                    profile.VlessTransport=NativeVlessTransportSettings.Parse(query,profile);
+                    if(Get(options,"headers") is YamlMappingNode headers)foreach(var pair in headers.Children){var name=((YamlScalarNode)pair.Key).Value??"";var value=((YamlScalarNode)pair.Value).Value??"";if(name.Equals("Host",StringComparison.OrdinalIgnoreCase))profile.Host=value;else profile.VlessTransport.Headers[name]=value;}
+                }
                 break;
             default: throw new FormatException($"Неподдерживаемый Clash-транспорт {profile.Network}.");
         }
     }
+    private static System.Text.Json.Nodes.JsonNode TransportJson(YamlNode node)=>node switch {
+        YamlMappingNode map=>new System.Text.Json.Nodes.JsonObject(map.Children.Select(p=>new KeyValuePair<string,System.Text.Json.Nodes.JsonNode?>(((YamlScalarNode)p.Key).Value??"",TransportJson(p.Value)))),
+        YamlSequenceNode sequence=>new System.Text.Json.Nodes.JsonArray(sequence.Children.Select(TransportJson).ToArray()),
+        YamlScalarNode scalar when int.TryParse(scalar.Value,out var number)=>System.Text.Json.Nodes.JsonValue.Create(number)!,
+        YamlScalarNode scalar when bool.TryParse(scalar.Value,out var boolean)=>System.Text.Json.Nodes.JsonValue.Create(boolean)!,
+        YamlScalarNode scalar=>System.Text.Json.Nodes.JsonValue.Create(scalar.Value??"")!,_=>throw new FormatException("Некорректный транспорт")};
 
     private static YamlNode? Get(YamlMappingNode map, string key) =>
         map.Children.TryGetValue(new YamlScalarNode(key), out var node) ? node : null;

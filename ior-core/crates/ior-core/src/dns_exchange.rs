@@ -56,15 +56,48 @@ where
     Fut: Future<Output = io::Result<Vec<u8>>>,
 {
     let started = std::time::Instant::now();
+    crate::trace::emit(serde_json::json!({"stage":"dns","code":"DNS_RESOLVER_STARTED","resolver":server}));
     let result = attempt(server.clone()).await;
+    let negative = result.as_ref().err().is_some_and(|error|matches!(failure_code(error),"DNS_ADDRESS_NODATA"|"TUN_DNS_ADDRESS_NODATA"|"DNS_ADDRESS_NXDOMAIN"));
     crate::trace::emit(
-        serde_json::json!({"stage":"dns","code":if result.is_ok(){"DNS_RESOLVER_COMPLETE"}else{"DNS_RESOLVER_FAILED"},"resolver":server,"durationMs":started.elapsed().as_millis() as u64}),
+        serde_json::json!({"stage":"dns","code":if result.is_ok(){"DNS_RESOLVER_COMPLETE"}else if negative{"DNS_RESOLVER_NEGATIVE_ANSWER"}else{"DNS_RESOLVER_FAILED"},"classification":if negative{"DNS_NEGATIVE_ANSWER"}else if result.is_ok(){"SUCCESS"}else{"RESOLVER_ATTEMPT_FAILURE"},"resolver":server,"durationMs":started.elapsed().as_millis() as u64,
+            "reason":result.as_ref().err().map(failure_code)}),
     );
     result
 }
 
+pub fn failure_code(error: &io::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "DNS_ADDRESS_NODATA" => "DNS_ADDRESS_NODATA",
+        "DNS_ADDRESS_RESPONSE_INVALID" => "DNS_ADDRESS_RESPONSE_INVALID",
+        "DNS_ADDRESS_RESPONSE_MISMATCH" => "DNS_ADDRESS_RESPONSE_MISMATCH",
+        "DNS_ADDRESS_NXDOMAIN" => "DNS_ADDRESS_NXDOMAIN",
+        "DNS_ADDRESS_SERVER_FAILURE" => "DNS_ADDRESS_SERVER_FAILURE",
+        "DNS_ADDRESS_TRUNCATED" => "DNS_ADDRESS_TRUNCATED",
+        "TUN_DNS_QUERY_INVALID" => "TUN_DNS_QUERY_INVALID",
+        "TUN_DNS_CNAME_INCOMPLETE" => "TUN_DNS_CNAME_INCOMPLETE",
+        "TUN_DNS_ADDRESS_NODATA" => "TUN_DNS_ADDRESS_NODATA",
+        "TUN_DNS_RESPONSE_MISMATCH" => "TUN_DNS_RESPONSE_MISMATCH",
+        "TUN_DNS_RESPONSE_INVALID" => "TUN_DNS_RESPONSE_INVALID",
+        "TUN_DNS_SERVER_FAILURE" => "TUN_DNS_SERVER_FAILURE",
+        "TUN_DNS_TCP_TRUNCATED" => "TUN_DNS_TCP_TRUNCATED",
+        _ => match error.kind() {
+            io::ErrorKind::TimedOut => "TUN_DNS_TIMEOUT",
+            io::ErrorKind::UnexpectedEof => "TUN_DNS_RESPONSE_EOF",
+            io::ErrorKind::InvalidData => "TUN_DNS_INVALID_DATA",
+            _ => "TUN_DNS_TRANSPORT_FAILURE",
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resource_dns_negative_answers_are_not_transport_failures(){
+        for code in ["DNS_ADDRESS_NODATA","DNS_ADDRESS_NXDOMAIN","DNS_ADDRESS_SERVER_FAILURE","DNS_ADDRESS_TRUNCATED","DNS_ADDRESS_RESPONSE_MISMATCH"]{
+            let error=std::io::Error::new(std::io::ErrorKind::NotFound,code);assert_eq!(super::failure_code(&error),code);
+        }
+    }
     use super::*;
     #[tokio::test]
     async fn early_hedge_cancels_loser() {

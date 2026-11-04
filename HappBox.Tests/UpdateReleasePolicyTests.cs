@@ -6,6 +6,29 @@ namespace HappBox.Tests;
 
 public sealed class UpdateReleasePolicyTests
 {
+    [Fact] public void PackagedInstallerHasUtf8SignatureForWindowsPowerShell(){using var script=typeof(MainForm).Assembly.GetManifestResourceStream("HappBox.Install-Update.ps1");Assert.NotNull(script);Assert.Equal(0xef,script!.ReadByte());Assert.Equal(0xbb,script.ReadByte());Assert.Equal(0xbf,script.ReadByte());}
+    [Theory]
+    [InlineData("draft")]
+    [InlineData("prerelease")]
+    public void UnpublishedOrPreviewReleasesAreNotOffered(string flag){using var json=System.Text.Json.JsonDocument.Parse("{\"tag_name\":\"v99.0.0\",\""+flag+"\":true}");Assert.Null(UpdateReleasePolicy.Parse(json.RootElement,"https://example.test/release",false));}
+    [Fact]
+    public void InstalledVersionMatchesAssemblyAndCurrentReleaseDoesNotOfferUpdate()
+    {
+        var installed = UpdateReleasePolicy.InstalledVersion(typeof(MainForm).Assembly);
+        var assembly = typeof(MainForm).Assembly.GetName().Version!;
+        Assert.Equal($"{assembly.Major}.{assembly.Minor}.{assembly.Build}", installed);
+        Assert.False(UpdateReleasePolicy.IsNewer("v" + installed, installed));
+        Assert.False(UpdateReleasePolicy.IsNewer("v" + installed + ".0", installed));
+        Assert.True(UpdateReleasePolicy.IsNewer($"v{assembly.Major}.{assembly.Minor}.{assembly.Build + 1}", installed));
+    }
+
+    [Theory]
+    [InlineData("v1.2.4", "1.2.4+commit", "1.2.3", true)]
+    [InlineData("v1.2.4", "1.2.3", "1.2.3", false)]
+    [InlineData("v1.2.4", "1.2.5", "1.2.3", false)]
+    [InlineData("v1.2.3", "1.2.3", "1.2.3", false)]
+    public void ArchiveMustMatchReleaseAndBeNewer(string release, string downloaded, string installed, bool accepted) =>
+        Assert.Equal(accepted, UpdateReleasePolicy.CanInstall(release, downloaded, installed));
     [Fact]
     public void ParsesNewerReleaseAndSelectsMatchingWindowsArchive()
     {

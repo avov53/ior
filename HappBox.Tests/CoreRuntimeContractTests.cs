@@ -6,6 +6,18 @@ namespace HappBox.Tests;
 
 public sealed class CoreRuntimeContractTests
 {
+    [Fact] public void ImportedSalamanderReachesNativeContract(){
+        var profile=ProfileParser.ParseManyDetailed("hy2://test-auth@edge.example:443?sni=edge.example&obfs=salamander&obfs-password=test-obfs").Profiles.Single();
+        Assert.True(CoreRuntimeContract.TryCreateStart(new AppState(),profile,out var request,out var reason),reason);
+        Assert.Equal("salamander",request!.Profile.Options.Obfs);Assert.Equal("test-obfs",request.Profile.Options.ObfsPassword);
+        profile.ObfsType="unknown";Assert.False(CoreRuntimeContract.TryCreateStart(new AppState(),profile,out _,out _));
+    }
+    [Fact] public void SalamanderOptionsRoundTripWithoutExposingPassword(){
+        var profile=new CoreWireProfile{Protocol="hysteria2",Options=new(){Obfs="salamander",ObfsPassword="test-obfs"}};
+        var copy=JsonSerializer.Deserialize<CoreWireProfile>(JsonSerializer.Serialize(profile,CoreRuntimeContract.JsonOptions),CoreRuntimeContract.JsonOptions)!;
+        Assert.Equal("salamander",copy.Options.Obfs);Assert.Equal("test-obfs",copy.Options.ObfsPassword);Assert.DoesNotContain("test-obfs",profile.ToString());
+    }
+
     [Fact]
     public void PacketPathFlagIsOptionalAndExplicitInExperimentalPackage()
     {
@@ -43,7 +55,7 @@ public sealed class CoreRuntimeContractTests
 
     [Theory]
     [InlineData("xtls-rprx-vision", null)]
-    [InlineData(null, "grpc")]
+    [InlineData(null, "mkcp")]
     public void RejectsUnsupportedVlessTransportBeforeNetworkChanges(string? flow, string? network)
     {
         var state = new AppState();
@@ -52,6 +64,14 @@ public sealed class CoreRuntimeContractTests
             ServerName = "example.com", Flow = flow, Network = network };
         Assert.False(CoreRuntimeContract.TryCreateStart(state, profile, out var request, out var reason));
         Assert.Null(request);
-        Assert.Contains("не поддерживает", reason);
+        Assert.True(reason.Contains("Vision")||reason.Contains("не поддерживается"));
+    }
+    [Theory]
+    [InlineData("raw")][InlineData("ws")][InlineData("httpupgrade")][InlineData("grpc")][InlineData("xhttp")]
+    public void VlessTransportSurvivesImportAndCoreContract(string transport){
+        var parsed=ProfileParser.ParseManyDetailed($"vless://11111111-1111-1111-1111-111111111111@203.0.113.10:443?security=tls&type={transport}&sni=edge.example&path=%2Flab&serviceName=service&encryption=none").Profiles.Single();
+        Assert.True(CoreRuntimeContract.TryCreateStart(new AppState(),parsed,out var request,out var reason),reason);
+        Assert.Equal(transport,request!.Profile.Options.Transport);Assert.Equal("/lab",request.Profile.Options.Path);
+        var shared=ProfileShareCodec.Import(ProfileShareCodec.Export(parsed));Assert.Equal(transport,shared.Network);Assert.NotNull(shared.VlessTransport);
     }
 }

@@ -13,11 +13,11 @@ public static class CoreEngineService
 
     public static Capabilities Capability(CoreKind core, AppState? state = null) => core switch
     {
-        CoreKind.SingBox => new(true, true, true, true, true, true, Enum.GetValues<ProxyProtocol>().Where(protocol => (int)protocol != 8).ToArray()),
-        CoreKind.XrayCore => new(true, true, true, true, true, OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000),
-            [ProxyProtocol.Vless, ProxyProtocol.Vmess, ProxyProtocol.Trojan, ProxyProtocol.Shadowsocks, ProxyProtocol.Hysteria2, ProxyProtocol.WireGuard, ProxyProtocol.Socks, ProxyProtocol.Http]),
-        CoreKind.IorCore => new(true, true, true, true, true, OperatingSystem.IsWindowsVersionAtLeast(10,0,22000),
-            [ProxyProtocol.Hysteria2, ProxyProtocol.Vless, ProxyProtocol.Vmess, ProxyProtocol.Shadowsocks, ProxyProtocol.Trojan, ProxyProtocol.WireGuard]),
+        CoreKind.SingBox => new(true, true, true, true, true, true, Enum.GetValues<ProxyProtocol>().Where(protocol => (int)protocol != 8 && protocol is not (ProxyProtocol.Vmess or ProxyProtocol.Shadowsocks or ProxyProtocol.Trojan)).ToArray()),
+        CoreKind.XrayCore => new(true, true, true, true, true, NativeWindowsPlatform.TunAvailable,
+            [ProxyProtocol.Vless, ProxyProtocol.Hysteria2, ProxyProtocol.WireGuard, ProxyProtocol.Socks, ProxyProtocol.Http]),
+        CoreKind.IorCore => new(true, true, true, true, true, NativeWindowsPlatform.TunAvailable,
+            [ProxyProtocol.Hysteria2, ProxyProtocol.Vless, ProxyProtocol.WireGuard, ProxyProtocol.AmneziaWG]),
         _ => new(false, false, false, false, false, false, [])
     };
 
@@ -28,30 +28,32 @@ public static class CoreEngineService
     public static bool CanRun(AppState state, ProxyProfile? profile, out string reason)
     {
         if (profile is null) { reason = "Сначала выберите сервер."; return false; }
-        if (RemovedProtocolPolicy.IsRemoved(profile)) { reason = RemovedProtocolPolicy.Message; return false; }
+        if(RemovedProtocolPolicy.IsRemoved(profile)){reason=RemovedProtocolPolicy.Message;return false;}
+        if (profile.Protocol == ProxyProtocol.AmneziaWG && (state.SelectedCore != CoreKind.IorCore || !state.TunEnabled))
+        { reason = "AmneziaWG доступен только с ior-core и TUN."; return false; }
+        if (profile.Protocol == ProxyProtocol.AmneziaWG && state.AwgEngine==AwgEngine.Go && !NativeProtocolComponents.VerifyAwg())
+        { reason = "AWG: отсутствует проверенный пакетный движок."; return false; }
         switch (state.SelectedCore)
         {
             case CoreKind.IorCore:
                 var promotedCombination = profile.Protocol == ProxyProtocol.Hysteria2 ||
                     profile.Protocol == ProxyProtocol.Vless && profile.RealityEnabled;
-                if (!state.ExperimentalCoreTesting && !promotedCombination)
-                { reason = "Для подключения ior-core включите экспериментальный режим в настройках."; return false; }
                 if (!File.Exists(IorCorePath(state)))
                 { reason = "Файл ior-core.exe отсутствует в этой сборке."; return false; }
                 if (!state.MixedProxyEnabled)
                 { reason = "Для ior-core нужен включённый локальный прокси."; return false; }
                 if (!CoreRuntimeContract.TryCreateStart(state, profile, out _, out reason)) return false;
-                if (state.TunEnabled && !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
-                { reason = "ior-core TUN требует отдельного испытания Windows 10; сейчас доступна Windows 11."; return false; }
+                if (state.TunEnabled && !NativeWindowsPlatform.TunAvailable)
+                { reason = "ior-core TUN требует Windows 10 1607 (сборка 14393) или новее, либо Windows 11."; return false; }
                 if(state.TunEnabled)
                 {
-                    if(profile.Protocol is not (ProxyProtocol.Hysteria2 or ProxyProtocol.Vmess or ProxyProtocol.Shadowsocks or ProxyProtocol.Trojan or ProxyProtocol.WireGuard) && (profile.Protocol != ProxyProtocol.Vless || !profile.RealityEnabled))
+                    if(profile.Protocol is not (ProxyProtocol.Hysteria2 or ProxyProtocol.Vmess or ProxyProtocol.Shadowsocks or ProxyProtocol.Trojan or ProxyProtocol.WireGuard or ProxyProtocol.AmneziaWG) && (profile.Protocol != ProxyProtocol.Vless || !profile.RealityEnabled))
                     { reason = "ior-core TUN сейчас испытывается для VLESS Reality; этот протокол требует отдельной проверки TUN."; return false; }
                 }
                 reason = ""; return true;
             case CoreKind.SingBox:
 
-                var singBoxRoute = state.HappRoutingProfiles.FirstOrDefault(route => route.Id == state.SelectedHappRoutingProfileId);
+                var singBoxRoute = RoutingSelectionPolicy.Effective(state);
                 if (singBoxRoute is { Source: RoutingProfileSource.Clash } &&
                     !SingBoxClashRuleCompiler.TryCompile(singBoxRoute, out _, out reason)) return false;
                 reason = "";
@@ -64,8 +66,8 @@ public static class CoreEngineService
                 { reason = "Этот xray.exe не поддерживает Hysteria2. Нужен Xray 26.9.9 или новее; встроенный бинарник обновлён."; return false; }
                 if (state.TunEnabled)
                 {
-                    if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
-                    { reason = "Xray TUN пока прошёл живую проверку только на Windows 11. На Windows 10 он остаётся закрытым до отдельного испытания."; return false; }
+                    if (!NativeWindowsPlatform.TunAvailable)
+                    { reason = "Xray TUN требует Windows 10 1607 или новее, либо Windows 11."; return false; }
                     return XrayConfigBuilder.CanBuildTun(state, profile, out reason);
                 }
                 return XrayConfigBuilder.CanBuild(state, profile, out reason);
@@ -77,28 +79,29 @@ public static class CoreEngineService
 
     public static string ConnectionUnavailableReason(CoreKind core) => core switch
     {
-        CoreKind.IorCore => "ior-core: экспериментальный Hysteria2 Proxy с TCP/UDP доступен. Возможность запуска зависит от протокола, режима и конкретных правил; скрытой подмены ядра нет.",
-        CoreKind.XrayCore => "Xray TUN доступен на Windows 11. Дополнительные протоколы и DIRECT требуют экспериментального тестирования и успешной проверки сети при запуске.",
+        CoreKind.IorCore => "ior-core: VLESS, Hysteria2, WireGuard и AmneziaWG. Доступность зависит от режима и совместимости правил.",
+        CoreKind.XrayCore => "Xray TUN доступен на Windows 10/11. При запуске проверяются маршруты и физический выход DIRECT.",
         _ => "Выбранное ядро не поддерживает подключение."
     };
 
     public static object[] AvailableCores(AppState state) =>
     [
-        new { id = "iorCore", name = "ior-core", selectable = true, available = File.Exists(IorCorePath(state)), installed = File.Exists(IorCorePath(state)), version = FileVersion(IorCorePath(state)), backend = "ior-core", detail = "VLESS Reality и Hysteria2: Proxy/TUN Windows 11. Остальные протоколы экспериментальные. При подключении проверяются трафик и откат.", capabilities = Capability(CoreKind.IorCore,state), combinations = NativeCombinations(state) },
+        new { id = "iorCore", name = "ior-core", selectable = true, available = File.Exists(IorCorePath(state)), installed = File.Exists(IorCorePath(state)), version = FileVersion(IorCorePath(state)), backend = "ior-core", detail = "Proxy/TUN Windows 10/11: VLESS Reality, Hysteria2, WireGuard и AmneziaWG. Совместимость проверяется перед запуском.", capabilities = Capability(CoreKind.IorCore,state), combinations = NativeCombinations(state) },
         new { id = "singBox", name = "sing-box", selectable = true, available = true, installed = File.Exists(state.SingBoxPath), version = FileVersion(state.SingBoxPath), backend = "sing-box", detail = "Рабочий сетевой движок", capabilities = Capability(CoreKind.SingBox) },
-        new { id = "xrayCore", name = "xray-core", selectable = true, available = File.Exists(XrayCorePath(state)), installed = File.Exists(XrayCorePath(state)), version = FileVersion(XrayCorePath(state)), backend = "xray-core", detail = state.ExperimentalCoreTesting ? "Proxy/TUN Windows 11 · WireGuard и дополнительные протоколы экспериментально" : "Proxy · TUN Windows 11: VLESS Reality и Hysteria2", capabilities = Capability(CoreKind.XrayCore) }
+        new { id = "xrayCore", name = "xray-core", selectable = true, available = File.Exists(XrayCorePath(state)), installed = File.Exists(XrayCorePath(state)), version = FileVersion(XrayCorePath(state)), backend = "xray-core", detail = "Proxy/TUN Windows 10/11: VLESS Reality, Hysteria2, WireGuard", capabilities = Capability(CoreKind.XrayCore) }
     ];
 
-    public static object[] NativeCombinations(AppState state) => new[] { ProxyProtocol.Hysteria2, ProxyProtocol.Vless, ProxyProtocol.Vmess, ProxyProtocol.Shadowsocks, ProxyProtocol.Trojan, ProxyProtocol.WireGuard }.SelectMany(protocol => new[] { "proxy", "tun" }.Select(mode =>
+    public static object[] NativeCombinations(AppState state, Version? windowsVersion = null) => new[] { ProxyProtocol.Hysteria2, ProxyProtocol.Vless, ProxyProtocol.WireGuard, ProxyProtocol.AmneziaWG }.SelectMany(protocol => (protocol == ProxyProtocol.AmneziaWG ? new[] { "tun" } : new[] { "proxy", "tun" }).Select(mode =>
     {
         var promoted = protocol is ProxyProtocol.Hysteria2 or ProxyProtocol.Vless;
-        var windowsSupported = mode != "tun" || OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000);
+        var version = windowsVersion ?? Environment.OSVersion.Version;
+        var windowsSupported = mode != "tun" || NativeWindowsPlatform.SupportsTun(version);
         return (object)new
         {
             protocol = protocol == ProxyProtocol.Vless ? "VLESS Reality" : protocol.ToString(), mode,
-            status = !windowsSupported ? "unverifiedWindowsVersion" : promoted ? "supported" : state.ExperimentalCoreTesting ? "experimental" : "disabled",
-            implementation = "ior-core Rust",
-            verified = promoted && windowsSupported
+            status = !windowsSupported ? "unverifiedWindowsVersion" : "supported",
+            implementation = protocol == ProxyProtocol.AmneziaWG ? state.AwgEngine==AwgEngine.Rust ? "ior-core AWG Rust" : "ior-core + официальный AWG Go" : "ior-core Rust",
+            verified = promoted && windowsSupported && (mode != "tun" || NativeWindowsPlatform.IsWindows11(version))
         };
     })).ToArray();
 

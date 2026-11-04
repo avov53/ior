@@ -8,14 +8,19 @@ use reality_rustls::Connection;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
 
+#[derive(Clone)]
 pub struct RealityConnector {
     profile: WireProfile,
     bootstrap: SocketAddr,
     config: Arc<reality_rustls::ClientConfig>,
     network: Option<crate::ipc_contract::WireNetwork>,
+    transports:Arc<crate::vless_transport::Runtime>,
+    server_dns: Arc<dns_engine::ServerIpv4Resolver>,
 }
 impl RealityConnector {
+    pub fn secure_transport(&self)->ConnectFuture{self.carrier(String::new(),0,false,true)}
     pub fn new(profile: &WireProfile, bootstrap: SocketAddr) -> io::Result<Self> {
+        crate::vless_transport::validate(profile)?;
         if profile.protocol != "vless_reality" {
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -50,6 +55,7 @@ impl RealityConnector {
         .and_then(|parameters| parameters.install_into(&mut config))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "REALITY_PARAMETERS_INVALID"))?;
         config.resumption = reality_rustls::client::Resumption::disabled();
+        config.alpn_protocols=profile.options.alpn.as_ref().map(|values|values.iter().map(|v|v.as_bytes().to_vec().into()).collect()).unwrap_or_else(||if matches!(crate::vless_transport::kind(profile),"grpc"|"xhttp"){vec![b"h2".to_vec().into()]}else{vec![]});
         let verifier = config.verifier().clone();
         config.dangerous().set_certificate_verifier(Arc::new(
             reality_provider::reality::RealityServerVerifier::new(Arc::new(RejectCamouflage {
@@ -72,6 +78,8 @@ impl RealityConnector {
             bootstrap,
             config: Arc::new(config),
             network: None,
+            transports:Arc::new(Default::default()),
+            server_dns: Arc::new(Default::default()),
         })
     }
 }
@@ -115,6 +123,7 @@ impl reality_rustls::client::danger::ServerVerifier for RejectCamouflage {
     }
 }
 impl OutboundConnector for RealityConnector {
+    fn named_tun_destination(&self)->bool {true}
     fn connect(&self, host: String, port: u16) -> ConnectFuture {
         self.open(host, port, false)
     }
@@ -139,15 +148,31 @@ impl OutboundConnector for RealityConnector {
 impl RealityConnector {
     pub fn with_network(mut self, network: Option<crate::ipc_contract::WireNetwork>) -> Self {
         self.network = network;
+        self.server_dns = Arc::new(Default::default());
         self
     }
     fn open(&self, host: String, port: u16, mux: bool) -> ConnectFuture {
+        if crate::vless_transport::kind(&self.profile)=="raw"{return self.carrier(host,port,mux,false);}
+        let profile=self.profile.clone();let bootstrap=self.bootstrap;let network=self.network.clone();let transports=self.transports.clone();
+        Box::pin(async move{
+            let mut request=vless_codec::encode_tcp_request(&profile.credential,&host,port)?;
+            if mux{request[18]=3;request.truncate(19);}
+            let dial:crate::vless_transport::Dial=Arc::new(move|p|{
+                if p.protocol=="vless_reality"{match Self::new(&p,bootstrap){Ok(connector)=>connector.with_network(network.clone()).carrier(String::new(),0,false,true),Err(error)=>Box::pin(async{Err(error)})}}
+                else{crate::vless_tls::VlessTlsConnector::secure_profile(p,bootstrap,network.clone())}
+            });
+            let remote=transports.connect(profile,dial).await?;
+            Ok(crate::vless_transport::vless_stream(remote,request))
+        })
+    }
+    fn carrier(&self, host:String,port:u16,mux:bool,transport_only:bool)->ConnectFuture {
         let profile = self.profile.clone();
         let config = self.config.clone();
         let bootstrap = self.bootstrap;
         let network = self.network.clone();
+        let server_dns = self.server_dns.clone();
         Box::pin(async move {
-            let mut header = vless_codec::encode_tcp_request(&profile.credential, &host, port)?;
+            let mut header = if transport_only{Vec::new()}else{vless_codec::encode_tcp_request(&profile.credential, &host, port)?};
             if mux {
                 header[18] = 3;
                 header.truncate(19);
@@ -163,23 +188,26 @@ impl RealityConnector {
                 header[17] = addons.len() as u8;
                 header.splice(18..18, addons);
             }
-            let ip = dns_engine::resolve_server_ipv4(&profile.server, bootstrap).await?;
+            let ip = server_dns.resolve(&profile.server, bootstrap, &network).await?;
             let bound = crate::native_router::bound_socket(false, &network)?;
-            let socket = tokio::net::TcpSocket::from_std_stream(bound.into());
             let endpoint = SocketAddr::new(ip.into(), profile.port);
-            let guard = crate::egress_registry::register(socket.local_addr()?, endpoint, false);
-            let socket = socket.connect(endpoint).await?;
-            socket.set_nodelay(true)?;
-            let socket = socket.into_std()?;
-            crate::trace::code("handshake", "REALITY_TCP_CONNECTED");
             let scheduled = std::time::Instant::now();
             let trace_flow = crate::trace::current();
             let id = *uuid::Uuid::parse_str(&profile.credential)
                 .unwrap()
                 .as_bytes();
-            let carrier = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let (carrier,guard) = tokio::task::spawn_blocking(move || -> io::Result<_> {
                 use std::io::Write;
                 crate::trace::emit_with_flow(serde_json::json!({"stage":"handshake","code":"REALITY_WORKER_READY","durationMs":scheduled.elapsed().as_millis() as u64}), trace_flow.as_ref());
+                // The blocking TLS worker owns TCP from its first byte. Do not
+                // transfer a registered IOCP socket with pending readiness reads
+                // from Tokio into a blocking reader during the server handshake.
+                bound.set_nonblocking(false)?;
+                bound.connect_timeout(&endpoint.into(),Duration::from_secs(10))?;
+                let socket:std::net::TcpStream=bound.into();
+                socket.set_nodelay(true)?;
+                let guard=crate::egress_registry::register(socket.local_addr()?,endpoint,false);
+                crate::trace::emit_with_flow(serde_json::json!({"stage":"handshake","code":"REALITY_TCP_CONNECTED"}),trace_flow.as_ref());
                 socket.set_nonblocking(false)?;
                 socket.set_read_timeout(Some(Duration::from_secs(10)))?;
                 socket.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -207,6 +235,13 @@ impl RealityConnector {
                         io::Error::new(io::ErrorKind::ConnectionAborted, code)
                     })?;
                 }
+                // Xray's authenticated REALITY carrier can omit ALPN; its gRPC/XHTTP
+                // client then speaks HTTP/2 with prior knowledge over that carrier.
+                if transport_only&&conn.alpn_protocol().is_some_and(|p|p.as_ref()!=b"h2"){
+                    crate::trace::emit(serde_json::json!({"stage":"handshake","code":"REALITY_ALPN_UNEXPECTED","reason":"not_h2"}));
+                    return Err(io::Error::new(io::ErrorKind::Unsupported,"VLESS_HTTP2_ALPN_REQUIRED"));
+                }
+                if transport_only&&conn.alpn_protocol().is_none(){crate::trace::code("handshake","REALITY_HTTP2_PRIOR_KNOWLEDGE");}
                 let (reads, read_wait_us) = socket.handshake_metrics();
                 crate::trace::emit_with_flow(
                     serde_json::json!({"stage":"handshake","code":"REALITY_TLS_COMPLETE","durationMs":exchanging.elapsed().as_millis() as u64,"readCalls":reads,"readWaitUs":read_wait_us}),
@@ -214,12 +249,9 @@ impl RealityConnector {
                 );
                 socket.finish_handshake();
                 let mut tls = reality_util::StreamOwned::new(conn, socket);
-                tls.write_all(&header)?;
-                tls.flush()?;
-                Ok(crate::vision_io::VlessCarrier::new(
-                    tls,
-                    if vision { Some(id) } else { None },
-                ))
+                let carrier=if transport_only {crate::vision_io::VlessCarrier::transport(tls)}
+                else{tls.write_all(&header)?;tls.flush()?;crate::vision_io::VlessCarrier::new(tls,if vision { Some(id) } else { None })};
+                Ok((carrier,guard))
             })
             .await
             .map_err(io::Error::other)??;

@@ -21,13 +21,14 @@ public static class JsonSubscriptionParser
             {
                 if(node.ValueKind==JsonValueKind.String)
                 { var parsed=ProfileParser.ParseManyDetailed(node.GetString()!);profiles.AddRange(parsed.Profiles);rejected+=parsed.RejectedCount;removed+=parsed.RemovedProtocolCount;continue; }
-                if (RemovedProtocolPolicy.IsJson(node)) { rejected++; removed++; continue; }
+
                 var type=String(node,"type")??String(node,"protocol")??"";
+                if(type.ToLowerInvariant() is "vmess" or "ss" or "shadowsocks" or "trojan"){removed++;rejected++;continue;}
                 if(type is "direct" or "block" or "dns" or "freedom" or "blackhole" or "selector" or "urltest")continue;
-                var result=type is "wireguard" ? Tunnel(node,type) : String(node,"protocol") is not null?Xray(node,type):SingBox(node,type);
+                var result=type is "wireguard" or "awg" or "amneziawg" ? Tunnel(node,type) : String(node,"protocol") is not null?Xray(node,type):SingBox(node,type);
                 if(result is null){rejected++;continue;}
                 if(result.Port is <1 or >65535 || string.IsNullOrWhiteSpace(result.Server))throw new FormatException("Некорректный JSON-сервер.");
-                profiles.Add(result);
+                if(RemovedProtocolPolicy.IsRemoved(result)){removed++;rejected++;}else profiles.Add(result);
             }
             catch(Exception error) when(error is FormatException or InvalidOperationException or JsonException){rejected++;}
         }
@@ -52,6 +53,13 @@ public static class JsonSubscriptionParser
             ObfsType=String(Get(node,"obfs"),"type"),ObfsPassword=String(Get(node,"obfs"),"password")};
         var known=new HashSet<string>(["type","tag","name","server","server_port","uuid","password","username","method","plugin","security","alter_id","flow","tls","transport","obfs"],StringComparer.Ordinal);
         profile.UnsupportedParameters.AddRange(node.EnumerateObject().Where(field=>!known.Contains(field.Name)).Select(field=>field.Name));
+        if(kind==ProxyProtocol.Vless&&transport.ValueKind==JsonValueKind.Object){
+            profile.Host=String(Get(transport,"headers"),"Host")??String(transport,"host");
+            var options=new CoreVlessTransportOptions{MultiMode=Boolean(transport,"multi_mode"),Mode=String(transport,"mode")};
+            if(Get(transport,"headers").ValueKind==JsonValueKind.Object)foreach(var header in Get(transport,"headers").EnumerateObject()){if(!header.Name.Equals("Host",StringComparison.OrdinalIgnoreCase))options.Headers[header.Name]=header.Value.GetString()??"";}
+            profile.VlessTransport=options;
+            profile.UnsupportedParameters.AddRange(transport.EnumerateObject().Where(p=>p.Name is not ("type" or "path" or "headers" or "host" or "service_name" or "multi_mode" or "mode")).Select(p=>"transport."+p.Name));
+        }
         return profile;
     }
     private static ProxyProfile Tunnel(JsonElement node,string type)
@@ -61,6 +69,8 @@ public static class JsonSubscriptionParser
             Server=String(node,"server")??"",Port=Number(node,"server_port"),ServerName=String(node,"server"),PrivateKey=String(node,"private_key"),
             PeerPublicKey=String(node,"peer_public_key"),PreSharedKey=String(node,"pre_shared_key"),LocalAddress=List("local_address"),AllowedIps=List("allowed_ips")??"0.0.0.0/0,::/0",
             TunnelDns=List("dns"),Mtu=Number(node,"mtu") is var mtu && mtu!=0?mtu:null,PersistentKeepalive=Number(node,"persistent_keepalive_interval") };
+        profile.Awg = node.EnumerateObject().Where(field=>RemovedProtocolPolicy.IsParameter(field.Name)).ToDictionary(field=>ProfileParser.AwgParameterNames.First(pair=>pair.Key.Equals(field.Name,StringComparison.OrdinalIgnoreCase)||pair.Value.Equals(field.Name,StringComparison.OrdinalIgnoreCase)).Value,field=>field.Value.ToString());
+        if(type is "awg" or "amneziawg" || profile.Awg.Count>0)profile.Protocol=ProxyProtocol.AmneziaWG;
         if(Get(node,"peers").ValueKind!=JsonValueKind.Undefined)profile.UnsupportedParameters.Add("peers");
         var settings=Get(node,"settings");
         if(settings.ValueKind==JsonValueKind.Object)
@@ -97,8 +107,8 @@ public static class JsonSubscriptionParser
         var user=users.ValueKind==JsonValueKind.Array && users.GetArrayLength()==1?users[0]:server;
         var security=String(stream,"security");var tls=Get(stream,security=="reality"?"realitySettings":"tlsSettings");
         var network=String(stream,"network")??String(stream,"method")??"tcp";
-        var transport=Get(stream,network=="grpc"?"grpcSettings":"wsSettings");
-        return new ProxyProfile {Protocol=kind.Value,Name=String(node,"tag")??String(server,"address")??type,
+        var transport=Get(stream,network switch{"grpc"=>"grpcSettings","xhttp"=>"xhttpSettings","httpupgrade"=>"httpupgradeSettings",_=>"wsSettings"});
+        var profile = new ProxyProfile {Protocol=kind.Value,Name=String(node,"tag")??String(server,"address")??type,
             Server=String(server,"address")??"",Port=Number(server,"port"),UserId=String(user,"id"),
             Password=kind==ProxyProtocol.Hysteria2?String(Get(stream,"hysteriaSettings"),"auth"):String(user,"password"),
             Username=String(user,"user"),Method=String(user,"method"),Flow=String(user,"flow"),
@@ -107,6 +117,16 @@ public static class JsonSubscriptionParser
             ServerName=String(tls,"serverName")??String(server,"address"),PublicKey=String(tls,"publicKey")??String(tls,"password"),
             ShortId=String(tls,"shortId"),Fingerprint=String(tls,"fingerprint"),Network=network,
             Path=String(transport,"path"),Host=String(Get(transport,"headers"),"Host"),ServiceName=String(transport,"serviceName")};
+        if(kind==ProxyProtocol.Vless){
+            profile.Host=String(transport,"host")??String(transport,"authority")??profile.Host;
+            var query=new Dictionary<string,string>{{"type",network},{"multiMode",Boolean(transport,"multiMode").ToString().ToLowerInvariant()}};
+            if(String(transport,"mode") is {} mode)query["mode"]=mode;
+            if(Get(transport,"extra").ValueKind==JsonValueKind.Object)query["extra"]=Get(transport,"extra").GetRawText();
+            profile.VlessTransport=NativeVlessTransportSettings.Parse(query,profile);
+            if(Get(transport,"headers").ValueKind==JsonValueKind.Object)foreach(var header in Get(transport,"headers").EnumerateObject()){if(!header.Name.Equals("Host",StringComparison.OrdinalIgnoreCase))profile.VlessTransport.Headers[header.Name]=header.Value.GetString()??"";}
+            profile.UnsupportedParameters.AddRange(transport.ValueKind==JsonValueKind.Object?transport.EnumerateObject().Where(p=>p.Name is not ("path" or "headers" or "host" or "authority" or "serviceName" or "multiMode" or "mode" or "extra")).Select(p=>"transport."+p.Name):[]);
+        }
+        return profile;
     }
     private static JsonElement Get(JsonElement node,string property)=>node.ValueKind==JsonValueKind.Object && node.TryGetProperty(property,out var value)?value:default;
     private static string? String(JsonElement node,string property)=>Get(node,property) is var value && value.ValueKind==JsonValueKind.String?value.GetString():null;

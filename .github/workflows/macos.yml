@@ -1,0 +1,76 @@
+name: macOS test package
+run-name: macos-${{ inputs.request_id || github.sha }}
+on:
+  push:
+    branches: ["codex/macos-actions-20261104"]
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Unique local build request
+        required: true
+      expected_sha:
+        description: Exact committed source
+        required: true
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - arch: x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify requested source
+        env:
+          EXPECTED: ${{ inputs.expected_sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.14.0'
+      - name: Rust
+        run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0 && rustup target add ${{ matrix.target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ior-core/target
+            macos/src-tauri/target
+          key: macos-build-v1-${{ matrix.arch }}-${{ hashFiles('ior-core/Cargo.lock', 'macos/src-tauri/Cargo.lock') }}
+          restore-keys: macos-build-v1-${{ matrix.arch }}-
+      - name: Build interface
+        run: npm ci --prefix design --no-audit --no-fund && npm run build --prefix design
+      - name: Install Tauri CLI
+        run: npm install --prefix .local/tauri-cli --no-package-lock --no-audit --no-fund @tauri-apps/cli@2.9.3
+      - name: Verify macOS lockfile
+        run: test -f macos/src-tauri/Cargo.lock
+      - name: Build without changing system networking
+        run: bash macos/scripts/package.sh ${{ matrix.arch }}
+      - uses: actions/cache/save@v4
+        if: failure()
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ior-core/target
+            macos/src-tauri/target
+          key: macos-build-v1-${{ matrix.arch }}-${{ hashFiles('ior-core/Cargo.lock', 'macos/src-tauri/Cargo.lock') }}-partial-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ior-macos-${{ matrix.arch }}
+          path: |
+            macos-output/${{ matrix.arch }}/*.zip
+            macos-output/${{ matrix.arch }}/build.json
+            macos-output/${{ matrix.arch }}/SHA256SUMS.txt
+            macos-output/${{ matrix.arch }}/README.md
+          retention-days: 14
+          if-no-files-found: error

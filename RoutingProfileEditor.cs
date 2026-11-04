@@ -5,6 +5,7 @@ public static class RoutingProfileEditor
 {
     public static HappRoutingProfile Prepare(HappRoutingProfile draft, HappRoutingProfile? previous)
     {
+        if(draft.Id=="none"||previous?.Id=="none")throw new InvalidOperationException("Системный маршрут none нельзя изменить.");
         if (string.IsNullOrWhiteSpace(draft.Name)) throw new InvalidOperationException("Название маршрута не может быть пустым.");
         if (previous?.Source == RoutingProfileSource.Happ || draft.Source == RoutingProfileSource.Happ)
             throw new InvalidOperationException("Профили Happ доступны только для чтения.");

@@ -31,6 +31,7 @@ pub struct HysteriaClient {
 }
 
 impl HysteriaClient {
+    pub(crate) fn udp_metrics(&self)->Option<(u64,u64,u64,u64)>{self.udp_sm.as_ref().map(|manager|manager.metrics())}
     pub(crate) fn new(
         conn: quinn::Connection,
         endpoint: quinn::Endpoint,

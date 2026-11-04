@@ -24,14 +24,14 @@ public static class NativeTunQualification
     public static Status Inspect(string binary, string flow)
     {
         var reason = "NATIVE_TUN_VALIDATION_PENDING: базовый прогон Reality TUN для этой сборки ещё не пройден.";
-        if (!OperatingSystem.IsWindowsVersionAtLeast(10,0,22000))
-            return new(false, "ior-core TUN требует отдельного испытания Windows 10; первая проверка рассчитана на Windows 11.", RequiredChecks, []);
+        if (!NativeWindowsPlatform.TunAvailable)
+            return new(false, "ior-core TUN требует Windows 10 1607 или новее, либо Windows 11.", RequiredChecks, []);
         try
         {
             var path = ReportPath(binary);
             if (!File.Exists(path) || new FileInfo(path).Length > 16384 || !File.Exists(binary)) return new(false, reason, RequiredChecks, []);
             var proof = JsonSerializer.Deserialize<Proof>(File.ReadAllText(path));
-            if (proof is null || proof.Schema != 1 || proof.Protocol != "vless_reality" || proof.WindowsBuild < 22000 ||
+            if (proof is null || proof.Schema != 1 || proof.Protocol != "vless_reality" || !NativeWindowsPlatform.SameTestedFamily(proof.WindowsBuild, Environment.OSVersion.Version.Build) ||
                 proof.Flow != flow || proof.Checks is null || proof.Sha256 != Hash(binary))
                 return new(false, "NATIVE_TUN_VALIDATION_PENDING: отчёт не соответствует текущей сборке или Reality flow.", RequiredChecks, []);
             var missing = RequiredChecks.Except(proof.Checks, StringComparer.Ordinal).ToArray();
@@ -41,7 +41,7 @@ public static class NativeTunQualification
                 reason = "NATIVE_TUN_VALIDATION_PENDING: ещё не подтверждены " + string.Join(", ", missing.Select(Describe)) + ".";
                 return new(false, reason, missing, extended);
             }
-            return new(true, "Базовая проверка пройдена. Reality TUN доступен экспериментально на Windows 11.", [], extended);
+            return new(true, "Базовая проверка Reality TUN пройдена для текущего семейства Windows.", [], extended);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
         { return new(false, reason, RequiredChecks, []); }
@@ -56,15 +56,15 @@ public static class NativeTunQualification
 
     public static void Record(string binary, string flow, IEnumerable<string> checks)
     {
-        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
-            throw new InvalidOperationException("Native TUN qualification is restricted to Windows 11.");
+        if (!NativeWindowsPlatform.TunAvailable)
+            throw new InvalidOperationException("Native TUN qualification requires Windows 10 1607 or newer.");
         var path = ReportPath(binary);
         var hash = Hash(binary);
         Proof? previous = null;
         if (File.Exists(path))
             try { previous = JsonSerializer.Deserialize<Proof>(File.ReadAllText(path)); } catch (JsonException) { }
         var verified = new HashSet<string>(StringComparer.Ordinal);
-        if (previous is { Schema: 1, Protocol: "vless_reality" } && previous.Sha256 == hash && previous.Flow == flow && previous.Checks is not null)
+        if (previous is { Schema: 1, Protocol: "vless_reality" } && previous.Sha256 == hash && previous.Flow == flow && previous.Checks is not null && NativeWindowsPlatform.SameTestedFamily(previous.WindowsBuild, Environment.OSVersion.Version.Build))
             verified.UnionWith(previous.Checks);
         verified.UnionWith(checks.Intersect(RequiredChecks.Concat(ExtendedChecks), StringComparer.Ordinal));
         var proof = new Proof(1, hash, Environment.OSVersion.Version.Build, "vless_reality", flow,

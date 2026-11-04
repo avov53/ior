@@ -13,11 +13,12 @@ internal sealed class NativeProxyTrafficEvidence
     private readonly ConcurrentDictionary<ulong,string> _proxyFlows=new();
     private readonly ConcurrentDictionary<ulong,byte> _remoteData=new();
     private readonly ConcurrentDictionary<ulong,byte> _dnsData=new();
+    private readonly ConcurrentDictionary<ulong,(string Source,string Destination)> _packetFlows=new();
 
     public bool HasProxiedTraffic(string host)=>_proxyFlows.Any(item=>item.Value.StartsWith(host+":",StringComparison.OrdinalIgnoreCase)&&_remoteData.ContainsKey(item.Key));
     public bool HasProxiedDnsTraffic(string host)=>_proxyFlows.Any(item=>item.Value.Equals(host+":53",StringComparison.OrdinalIgnoreCase)&&_dnsData.ContainsKey(item.Key));
     public bool HasProxyRoute(string host)=>_proxyFlows.Values.Any(value=>value.StartsWith(host+":",StringComparison.OrdinalIgnoreCase));
-    public bool HasProxiedPacketTraffic(string source,string destination)=>false;
+    public bool HasProxiedPacketTraffic(string source,string destination)=>_packetFlows.Any(item=>item.Value.Source==source&&item.Value.Destination==destination&&_remoteData.ContainsKey(item.Key));
 
     private static string? Safe(JsonElement json,string property)=>json.TryGetProperty(property,out var value)&&value.ValueKind==JsonValueKind.String&&
         value.GetString() is {Length:>0 and <=255} text&&text.All(c=>char.IsAsciiLetterOrDigit(c)||".:_-[]".Contains(c))?text:null;
@@ -28,10 +29,12 @@ internal sealed class NativeProxyTrafficEvidence
         var destination=Safe(json,"destination");
         var proxied=json.TryGetProperty("target",out var target)&&target.ValueKind==JsonValueKind.String&&target.GetString()=="PROXY";
         if(code=="ROUTE_SELECTED"&&proxied&&destination is not null)_proxyFlows[id]=destination;
+        if(code=="AWG_PACKET_ADMITTED"&&proxied&&destination is not null&&Safe(json,"source") is {} source){_packetFlows[id]=(source,destination);_proxyFlows[id]=destination;}
+        if(code=="AWG_PACKET_FIRST_REMOTE_BYTE"&&proxied&&_packetFlows.TryGetValue(id,out var packet)&&packet.Destination==destination&&packet.Source==Safe(json,"source"))_remoteData[id]=0;
         if(code=="TUN_TCP_FIRST_REMOTE_BYTE"&&_proxyFlows.ContainsKey(id))_remoteData[id]=0;
         if(code is "DNS_RESPONSE_READY" or "DNS_CACHE_HIT" or "DNS_IPV6_NODATA"&&_proxyFlows.ContainsKey(id))_dnsData[id]=0;
         if(_proxyFlows.Count>4096)foreach(var old in _proxyFlows.Keys.Where(key=>key<id&&id-key>2048)) {
-            _proxyFlows.TryRemove(old,out _);_remoteData.TryRemove(old,out _);_dnsData.TryRemove(old,out _);
+            _proxyFlows.TryRemove(old,out _);_remoteData.TryRemove(old,out _);_dnsData.TryRemove(old,out _);_packetFlows.TryRemove(old,out _);
         }
     }
 }

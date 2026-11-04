@@ -14,10 +14,17 @@ pub mod protocols;
 pub mod proxy_inbound;
 pub mod reality_bridge;
 pub mod relay_diagnostics;
+mod resource_diagnostics;
 pub mod route_engine;
 pub mod runtime;
 pub mod trace;
+pub mod awg_adapter;
+pub mod awg_rust;
+pub mod awg_packets;
+pub mod packet_budget;
 pub mod tun;
+#[cfg(target_os = "android")]
+pub mod android_network;
 pub mod tun_dns;
 pub mod tun_names;
 pub mod tun_reject;
@@ -30,6 +37,9 @@ pub mod vision_io;
 pub mod vless_codec;
 pub mod vless_reality;
 pub mod vless_tls;
+pub mod vless_transport;
 pub mod xudp;
 
 mod tunnel_tcp;
+
+pub mod lan_proxy;

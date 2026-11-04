@@ -8,6 +8,11 @@ pub(crate) static RX_DROPPED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TUN_UDP_DROPPED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TRANSPORT_QUEUE: WaitMetric = WaitMetric::new();
 pub(crate) static APPLICATION_QUEUE: WaitMetric = WaitMetric::new();
+static PIPE_WRITE: WaitMetric = WaitMetric::new();
+static PIPE_QUEUE: WaitMetric = WaitMetric::new();
+pub(crate) fn pipe_queue(created:Instant){PIPE_QUEUE.record(created);}
+pub(crate) fn pipe_write(started:Instant){PIPE_WRITE.record(started);}
+pub(crate) fn pipe_report(){crate::trace::emit(serde_json::json!({"stage":"transport","code":"AWG_PIPE_METRICS","count":PIPE_WRITE.count.load(Ordering::Relaxed),"totalUs":PIPE_WRITE.micros.load(Ordering::Relaxed),"maxUs":PIPE_WRITE.maximum.load(Ordering::Relaxed),"queueWaitUs":PIPE_QUEUE.micros.load(Ordering::Relaxed),"maxWaitUs":PIPE_QUEUE.maximum.load(Ordering::Relaxed)}));}
 
 pub(crate) struct WaitMetric {
     count: AtomicU64,

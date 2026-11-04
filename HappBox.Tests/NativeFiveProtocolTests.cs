@@ -20,6 +20,7 @@ public sealed class NativeFiveProtocolTests
     {
         var profile=new ProxyProfile{Protocol=protocol,Server="203.0.113.1",Port=443,ServerName="example.com",UserId="00112233-4455-6677-8899-aabbccddeeff",Password="test-only",Method="aes-128-gcm",Security="auto",TlsEnabled=protocol==ProxyProtocol.Trojan,Network="tcp",PrivateKey=Key,PeerPublicKey=Key,LocalAddress="10.0.0.2/32",AllowedIps="0.0.0.0/0",TunnelDns="9.9.9.9",PersistentKeepalive=25,Mtu=1380};
         foreach(var tun in new[]{false,true}) {
+            if(RemovedProtocolPolicy.IsRemoved(profile)){Assert.False(CoreRuntimeContract.TryCreateStart(new AppState{TunEnabled=tun},profile,out _,out _));continue;}
             Assert.True(CoreRuntimeContract.TryCreateStart(new AppState{TunEnabled=tun},profile,out var request,out var reason),reason);
             Assert.Equal(CoreRuntimeContract.ApiVersion,request!.ApiVersion);Assert.Equal(wireName,request.Profile.Protocol);
             var roundtrip=JsonSerializer.Deserialize<CoreStartRequest>(JsonSerializer.Serialize(request,CoreRuntimeContract.JsonOptions),CoreRuntimeContract.JsonOptions)!;
@@ -52,7 +53,7 @@ public sealed class NativeFiveProtocolTests
     [InlineData("bad-key")]
     [InlineData("c2hvcnQ=")]
     public void Shadowsocks2022InvalidKeyRejectedBeforeStart(string password)
-    {var profile=new ProxyProfile{Protocol=ProxyProtocol.Shadowsocks,Server="example.com",Port=443,Method="2022-blake3-aes-128-gcm",Password=password};Assert.False(CoreRuntimeContract.TryCreateStart(new AppState(),profile,out _,out var reason));Assert.Contains("2022",reason);Assert.DoesNotContain(password,reason);}
+    {var profile=new ProxyProfile{Protocol=ProxyProtocol.Shadowsocks,Server="example.com",Port=443,Method="2022-blake3-aes-128-gcm",Password=password};Assert.False(CoreRuntimeContract.TryCreateStart(new AppState(),profile,out _,out var reason));Assert.Contains("пока не поддерживаются",reason);Assert.DoesNotContain(password,reason);}
     [Fact]
     public async Task OptInRealPrivateControlStartsAndStopsAllFiveTransports()
     {

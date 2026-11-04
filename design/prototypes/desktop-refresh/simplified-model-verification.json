@@ -1,0 +1,22 @@
+{
+  "kind": "non-browser model and generated markup checks",
+  "oldFiltersIgnored": true,
+  "searchExpandsSubscriptions": true,
+  "collapseRestored": true,
+  "personalAlwaysVisible": true,
+  "search": true,
+  "themes": true,
+  "reducedSetting": true,
+  "connectionStates": true,
+  "reconnectConfirmation": true,
+  "validation": true,
+  "import": true,
+  "editor": true,
+  "subscriptionReadonly": true,
+  "logLevels": true,
+  "copyScopes": true,
+  "rename": true,
+  "delete": true,
+  "reset": true,
+  "layoutAndPixels": "not checked: local browser file URL blocked"
+}

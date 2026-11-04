@@ -6,8 +6,14 @@ public sealed record UpdateRelease(string Tag, string ReleaseUrl, string? AssetN
 
 public static class UpdateReleasePolicy
 {
+    public static string InstalledVersion(System.Reflection.Assembly assembly)
+    {
+        var version = assembly.GetName().Version;
+        return version is null ? "0.0.0" : $"{version.Major}.{version.Minor}.{version.Build}";
+    }
     public static UpdateRelease? Parse(JsonElement releaseRoot, string fallbackReleaseUrl, bool windows10)
     {
+        if(releaseRoot.TryGetProperty("draft",out var draft)&&draft.ValueKind==JsonValueKind.True || releaseRoot.TryGetProperty("prerelease",out var prerelease)&&prerelease.ValueKind==JsonValueKind.True)return null;
         var tag = releaseRoot.TryGetProperty("tag_name", out var tagValue) ? tagValue.GetString() : null;
         if (string.IsNullOrWhiteSpace(tag)) return null;
 
@@ -17,14 +23,25 @@ public static class UpdateReleasePolicy
     }
 
     public static bool IsNewer(string latest, string current) =>
-        Version.TryParse(Normalize(latest), out var latestVersion) &&
-        Version.TryParse(Normalize(current), out var currentVersion) && latestVersion > currentVersion;
+        TryVersion(latest, out var latestVersion) && TryVersion(current, out var currentVersion) && latestVersion > currentVersion;
+
+    public static bool CanInstall(string release, string downloaded, string current) =>
+        TryVersion(release, out var expected) && TryVersion(downloaded, out var actual) &&
+        expected == actual && IsNewer(downloaded, current);
+
+    private static bool TryVersion(string value, out Version version)
+    {
+        version = new Version(0, 0, 0, 0);
+        if (!Version.TryParse(Normalize(value), out var parsed)) return false;
+        version = new Version(parsed.Major, parsed.Minor, Math.Max(0, parsed.Build), Math.Max(0, parsed.Revision));
+        return true;
+    }
 
     public static int? ProgressPercent(long receivedBytes, long? totalBytes) => totalBytes is > 0
         ? Math.Clamp((int)(Math.Max(0, receivedBytes) / (double)totalBytes.Value * 100), 0, 100)
         : null;
 
-    private static string Normalize(string value) => value.Trim().TrimStart('v', 'V');
+    private static string Normalize(string value) => value.Trim().TrimStart('v', 'V').Split('+')[0];
 
     private static (string? Name, string? Url) FindAsset(JsonElement releaseRoot, bool windows10)
     {

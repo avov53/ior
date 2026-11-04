@@ -10,14 +10,17 @@
     <RootNamespace>HappBox</RootNamespace>
     <Product>ior</Product>
     <Title>ior</Title>
-    <Version>1.2.3</Version>
-    <ApplicationIcon />
+    <Version>1.2.4</Version>
+    <ApplicationIcon>assets\app-icon\icon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <DefaultItemExcludes>$(DefaultItemExcludes);.local\**;android\**;android-output\**;windows-output\**;distandroid\**</DefaultItemExcludes>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="scripts/Install-Update.ps1" LogicalName="HappBox.Install-Update.ps1" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3537.50" />
     <PackageReference Include="YamlDotNet" Version="18.1.0" />
     <Compile Remove="HappBox.Tests\**\*.cs" />
+    <Compile Remove="verification-publish\**\*.cs" />
     <Content Include="core\sing-box.exe" Condition="Exists('core\sing-box.exe')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -34,7 +37,11 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
-    <Content Include="ior-core\licenses\*" Exclude="ior-core\licenses\LICENSE-amneziawg-*">
+    <Content Include="core\ior-core\ior-awg-adapter.exe" Condition="Exists('core\ior-core\ior-awg-adapter.exe')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="ior-core\licenses\*">
       <Link>core\ior-core\%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>

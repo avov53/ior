@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -9,6 +9,22 @@ namespace HappBox;
 
 public sealed partial class MainForm
 {
+    protected override void WndProc(ref Message message)
+    {
+        base.WndProc(ref message);
+        if (message.Msg == 0x0084 && WindowState == FormWindowState.Normal)
+        {
+            var coordinates = message.LParam.ToInt64();
+            var point = PointToClient(new Point((short)(coordinates & 0xffff), (short)((coordinates >> 16) & 0xffff)));
+            var grip = Math.Max(5, (int)Math.Round(6 * DeviceDpi / 96d));
+            var left = point.X < grip;
+            var right = point.X >= ClientSize.Width - grip;
+            var top = point.Y < grip;
+            var bottom = point.Y >= ClientSize.Height - grip;
+            var hit = top && left ? 13 : top && right ? 14 : bottom && left ? 16 : bottom && right ? 17 : left ? 10 : right ? 11 : top ? 12 : bottom ? 15 : 1;
+            message.Result = new IntPtr(hit);
+        }
+    }
     private WebView2? _webView;
     private readonly System.Windows.Forms.Timer _webUiSnapshotTimer = new() { Interval = 1000 };
     private readonly System.Windows.Forms.Timer _subscriptionRefreshTimer = new() { Interval = 60_000 };
@@ -61,19 +77,48 @@ public sealed partial class MainForm
 
     private async Task InitializeWebUiAsync()
     {
+        // Show the same three-bar loader while WebView2 itself is starting.
+        var startup = new Panel { Dock = DockStyle.Fill, BackColor = Bg };
+        var startupClock = Stopwatch.StartNew();
+        var startupTimer = new System.Windows.Forms.Timer { Interval = 33 };
+        startup.Paint += (_, e) =>
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            for (var bar = 0; bar < 3; bar++)
+            {
+                var phase = (startupClock.Elapsed.TotalSeconds - bar * .25 + 1) % 1;
+                var pulse = phase < .2 ? phase / .2 : phase < .4 ? 1 - (phase - .2) / .2 : 0;
+                var height = (float)((bar == 1 ? 35 : 20) * (1 + pulse * .5));
+                using var brush = new SolidBrush(Color.FromArgb((int)(128 + 127 * pulse), TextColor));
+                e.Graphics.FillRectangle(brush, startup.Width / 2f - 9 + bar * 8, (startup.Height - height) / 2, 3, height);
+            }
+        };
+        startupTimer.Tick += (_, _) => startup.Invalidate();
+        void FinishStartup()
+        {
+            if (startup.IsDisposed) return;
+            startupTimer.Stop();
+            startupTimer.Dispose();
+            startup.Dispose();
+        }
+        Controls.Add(startup);
+        startup.BringToFront();
+        startupTimer.Start();
+        FormClosed += (_, _) => FinishStartup();
         try
         {
             var webRoot = Path.Combine(AppContext.BaseDirectory, "webui");
             var indexPath = Path.Combine(webRoot, "index.html");
             if (!File.Exists(indexPath))
             {
+                FinishStartup();
                 ShowWebUiFailure("React-интерфейс не найден в папке webui.", false);
                 return;
             }
 
             _ = CoreWebView2Environment.GetAvailableBrowserVersionString();
             var environment = await CoreWebView2Environment.CreateAsync(null, Path.Combine(_appDir, "webview2"));
-            _webView = new WebView2 { Dock = DockStyle.Fill, BackColor = Bg };
+            _webView = new WebView2 { Dock = DockStyle.Fill, BackColor = Bg, Visible = false };
             Controls.Add(_webView);
             _webView.BringToFront();
             await _webView.EnsureCoreWebView2Async(environment);
@@ -87,12 +132,17 @@ public sealed partial class MainForm
             _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
             _webView.CoreWebView2.NavigationCompleted += (_, args) =>
             {
+                FinishStartup();
+                _webView.Visible = true;
                 _webUiReady = args.IsSuccess;
                 if (_webUiReady) PushWebSnapshot();
             };
             _webView.Source = new Uri("https://app.ior/index.html");
 
-            _webUiSnapshotTimer.Tick += (_, _) => PushWebSnapshot(includeLogs: false);
+            _webUiSnapshotTimer.Tick += (_, _) =>
+            {
+                if (Visible && WindowState != FormWindowState.Minimized) PushWebSnapshot(includeLogs: false);
+            };
             _webUiSnapshotTimer.Start();
             _subscriptionRefreshTimer.Tick += async (_, _) => await RefreshDueSubscriptionsAsync();
             _subscriptionRefreshTimer.Start();
@@ -107,10 +157,12 @@ public sealed partial class MainForm
         }
         catch (WebView2RuntimeNotFoundException)
         {
+            FinishStartup();
             ShowWebUiFailure("Для нового интерфейса ior требуется Microsoft Edge WebView2 Runtime.", true);
         }
         catch (Exception ex)
         {
+            FinishStartup();
             Log($"Web UI initialization failed: {ex.Message}");
             ShowWebUiFailure($"Не удалось открыть новый интерфейс: {ex.Message}", false);
         }
@@ -149,6 +201,8 @@ public sealed partial class MainForm
             var method = root.GetProperty("method").GetString() ?? "";
             var payload = root.TryGetProperty("payload", out var payloadElement) ? payloadElement.Clone() : default;
             if (_shutdownRequested) throw new InvalidOperationException("Приложение завершает подключение и восстанавливает сеть.");
+            if (method is "connection.toggle" or "server.select") _subscriptionStartupCancellation.Cancel();
+            if(method is "connection.toggle" or "server.select" or "connection.mode" or "route.select")CancelBackgroundConnectionActions();
             if (method is "connection.toggle" or "connection.mode" or "server.select" or "settings.update" or "route.select")
             {
                 if (_webOperationRunning) throw new InvalidOperationException("Предыдущая операция ещё выполняется.");
@@ -186,9 +240,15 @@ public sealed partial class MainForm
 
     private async Task<object?> HandleWebRequestAsync(string method, JsonElement payload)
     {
+        if(method.StartsWith("connectionProfile.",StringComparison.Ordinal))throw new InvalidOperationException("Наборы подключений больше не используются.");
         switch (method)
         {
-            case "state.get": _webLogDelta.Clear(); return BuildWebSnapshot();
+            case "state.get":
+            {
+                var includeLogs = !payload.TryGetProperty("includeLogs", out var include) || include.GetBoolean();
+                if (includeLogs) _webLogDelta.Clear();
+                return BuildWebSnapshot(includeLogs);
+            }
             case "backup.export": return JsonSerializer.Serialize(_state, JsonOptions());
             case "backup.import":
             {
@@ -200,6 +260,7 @@ public sealed partial class MainForm
                 NormalizeSubscriptions(restored);
                 NormalizeHappRoutingProfiles(restored);
                 MigrateWebUiState(restored);
+                SubscriptionHwid.ClearImportedPermissions(restored);
                 if (!CoreEngineService.CanSelect(restored.SelectedCore)) restored.SelectedCore = CoreKind.SingBox;
                 ServiceMonitorCatalog.NormalizeTargets(restored);
                 if (IsConnectionRunning() && !await StopSingBoxAsync()) throw new InvalidOperationException("Не удалось остановить работающее ядро для импорта резервной копии.");
@@ -254,6 +315,7 @@ public sealed partial class MainForm
                 _runtimeConnectionWarning = null;
                 if (_connectionTransitionInProgress) throw new InvalidOperationException("Дождитесь завершения текущего переключения.");
                 var target = FindProfile(RequiredString(payload, "id"));
+                if(RemovedProtocolPolicy.IsRemoved(target))throw new InvalidOperationException(RemovedProtocolPolicy.Message);
                 var wasRunning = IsConnectionRunning();
                 if (wasRunning && target.Id != _state.RunningServerId && !OptionalBool(payload, "confirmReconnect"))
                     throw new InvalidOperationException("Смена работающего сервера требует подтверждения переподключения.");
@@ -300,6 +362,33 @@ public sealed partial class MainForm
                 SaveState(); RefreshProfiles(); PushWebSnapshot(); return null;
             }
             case "server.get": return FindProfile(RequiredString(payload, "id"));
+            case "server.export": return WireGuardFile.Export(FindProfile(RequiredString(payload, "id")));
+            case "server.latency.refresh":
+            {
+                var profile = FindProfile(RequiredString(payload, "id"));
+                await _latencyMonitor.RefreshAsync(profile);
+                PushWebSnapshot(includeLogs: false);
+                return _latencyMonitor.SnapshotFor(profile);
+            }
+            case "server.share":
+            {
+                var profile = FindProfile(RequiredString(payload, "id"));
+                if (OptionalString(payload, "format") == "protocol")
+                {
+                    var shared = MobileShare.Configuration(profile);
+                    if (shared.Format == "ior") throw new NotSupportedException("Для этого протокола экспорт в Happ пока не поддерживается. Экспортируйте конфигурацию в формате ior.");
+                    return shared.Text;
+                }
+                return OptionalString(payload, "format") == "qr" ? (object)MobileShare.Configuration(profile) : ProfileShareCodec.Export(profile);
+            }
+            case "subscription.share":
+            {
+                var subscription = FindSubscription(RequiredString(payload, "id"));
+                if (OptionalString(payload, "format") == "qr") return MobileShare.Subscription(subscription, _state);
+                if (OptionalString(payload, "format") != "json") return subscription.Url;
+                return JsonSerializer.Serialize(new { name = subscription.Name, url = subscription.Url,
+                    profiles = _state.Profiles.Where(profile => profile.SubscriptionId == subscription.Id).Select(ProfileShareCodec.Export).ToArray() });
+            }
             case "server.copy":
             {
                 var source = FindProfile(RequiredString(payload, "id"));
@@ -310,12 +399,14 @@ public sealed partial class MainForm
                 copy.SubscriptionUploadBytes = null; copy.SubscriptionDownloadBytes = null;
                 copy.SubscriptionTotalBytes = null; copy.SubscriptionExpireUtc = null;
                 _state.Profiles.Add(copy);
+                ConnectionWorkspaceService.AttachConfigurations(_state, [copy]);
                 SaveState(); RefreshProfiles(); PushWebSnapshot();
                 return copy;
             }
             case "server.save":
             {
                 var profile = Deserialize<ProxyProfile>(payload);
+                if(RemovedProtocolPolicy.IsRemoved(profile))throw new InvalidOperationException(RemovedProtocolPolicy.Message);
                 var current = FindProfile(profile.Id);
                 if (current.SubscriptionId is not null) throw new InvalidOperationException("Сервер подписки доступен только для чтения. Создайте локальную копию.");
                 ValidateEditableProfile(profile);
@@ -336,8 +427,35 @@ public sealed partial class MainForm
                 SaveState(); RefreshProfiles(); PushWebSnapshot(); return null;
             }
             case "subscription.refresh":
-                await RefreshSubscriptionAsync(FindSubscription(RequiredString(payload, "id")), showErrors: false);
+                await RefreshSubscriptionAsync(FindSubscription(RequiredString(payload, "id")), showErrors: false, requestHwidConsent: true);
                 PushWebSnapshot(); return null;
+            case "subscription.hwid.approve":
+                await ApproveSubscriptionHwidAsync(FindSubscription(RequiredString(payload, "id"))); return null;
+            case "subscription.hwid.prompt":
+                _hwidConsentSubscriptionId = FindSubscription(RequiredString(payload, "id")).Id; PushWebSnapshot(); return null;
+            case "subscription.hwid.current":
+            {
+                var sub = FindSubscription(RequiredString(payload, "id"));
+                var context = SubscriptionIdentityContext(sub);
+                return context.Resolve(context.SourceOrigin);
+            }
+            case "subscription.hwid.dismiss":
+                _hwidConsentSubscriptionId = null; PushWebSnapshot(); return null;
+            case "subscription.hwid.settings":
+            {
+                var sub = FindSubscription(RequiredString(payload, "id"));
+                if (!Enum.TryParse<SubscriptionHwidMode>(RequiredString(payload, "mode"), true, out var mode) || !Enum.IsDefined(mode)) throw new FormatException("Некорректный режим HWID.");
+                var value = OptionalString(payload, "override")?.Trim();
+                if (!string.IsNullOrEmpty(value) && !SubscriptionHwid.IsValid(value)) throw new FormatException("HWID: 10–64 символа, латинские буквы, цифры, = или -.");
+                sub.HwidMode = mode; sub.HwidOverride = string.IsNullOrEmpty(value) ? null : value;
+                if (mode != SubscriptionHwidMode.Allow) sub.HwidApprovedOrigins.Clear();
+                else
+                {
+                    var source = SubscriptionHwid.Origin(new Uri(SubscriptionService.NormalizeUrl(sub.Url)));
+                    if (source.StartsWith("https://", StringComparison.Ordinal) && !sub.HwidApprovedOrigins.Contains(source, StringComparer.Ordinal)) sub.HwidApprovedOrigins.Add(source);
+                }
+                SaveState(); PushWebSnapshot(); return null;
+            }
             case "subscription.rename":
             {
                 var subscription = FindSubscription(RequiredString(payload, "id"));
@@ -346,6 +464,7 @@ public sealed partial class MainForm
                 SaveState(); RefreshProfiles(); PushWebSnapshot(); return null;
             }
             case "subscription.delete":
+                if (_hwidConsentSubscriptionId == RequiredString(payload, "id")) _hwidConsentSubscriptionId = null;
                 SubscriptionService.Remove(_state, FindSubscription(RequiredString(payload, "id")));
                 SaveState(); RefreshProfiles(); PushWebSnapshot(); return null;
             case "settings.update":
@@ -376,6 +495,13 @@ public sealed partial class MainForm
                 if (active) SelectConnectionProfile(profile.Id);
                 if (wasRunning) await RestartConnectionAsync();
                 return null;
+            }
+            case "connectionProfile.export": return ConnectionProfileFile.Export(_state, RequiredString(payload, "id"));
+            case "connectionProfile.import":
+            {
+                var imported = ConnectionProfileFile.Import(_state, RequiredString(payload, "text"));
+                SaveState();RefreshProfiles();PushWebSnapshot();
+                return imported;
             }
             case "connectionProfile.select":
             {
@@ -418,12 +544,21 @@ public sealed partial class MainForm
                 if (wasRunning) await RestartConnectionAsync();
                 return null;
             }
+            case "subscription.route-consent":
+                var routeSub=_state.Subscriptions.First(s=>s.Id==payload.GetProperty("id").GetString());if(payload.TryGetProperty("review",out var review)&&review.GetBoolean())routeSub.RouteConsent="ask";else SubscriptionService.ResolveRoutingConsent(_state,routeSub,payload.GetProperty("accept").GetBoolean());SaveState();PushWebSnapshot();return null;
+            case "subscription.settings": SaveSubscriptionOptions(payload);return null;
+            case "lan.settings": await SaveLanAsync(payload);return null;
+            case "lan.firewall": ConfigureLanFirewall();return null;
+            case "route.enabled":
+                await ChangeRoutingAsync(payload.GetProperty("enabled").GetBoolean(), _state.SelectedHappRoutingProfileId); return null;
             case "route.select":
             {
                 var wasRunning = IsConnectionRunning();
                 var previouslySelectedRoute = _state.SelectedHappRoutingProfileId;
-                SelectRoutingProfile(RequiredString(payload, "id"));
-                if (wasRunning)
+                var requestedRoute=RequiredString(payload,"id");
+                if(!_state.HappRoutingProfiles.Any(r=>r.Id==requestedRoute))throw new InvalidOperationException("Маршрут не найден");
+                await ChangeRoutingAsync(_state.RoutingEnabled, requestedRoute);
+                if (SelectedProfile() is not null)
                 {
                     if (!CoreEngineService.CanRun(_state, SelectedProfile(), out var reason))
                     {
@@ -431,13 +566,14 @@ public sealed partial class MainForm
                         SaveState(); PushWebSnapshot();
                         throw new InvalidOperationException(reason);
                     }
-                    await RestartConnectionAsync();
+
                 }
                 return null;
             }
             case "route.rename":
             {
                 var route = _state.HappRoutingProfiles.FirstOrDefault(item => item.Id == RequiredString(payload, "id")) ?? throw new InvalidOperationException("Маршрут не найден.");
+                if(route.Id=="none")throw new InvalidOperationException("Системный маршрут none нельзя изменить.");
                 route.Name = RequiredString(payload, "name").Trim(); SaveState(); PushWebSnapshot(); return null;
             }
             case "route.delete":
@@ -478,6 +614,13 @@ public sealed partial class MainForm
             case "route.share": return ExportRoutingProfile(RequiredString(payload, "id"));
             case "service.save":
                 SaveServiceTarget(Deserialize<ServiceMonitorTarget>(payload)); return null;
+            case "clipboard.copy": Clipboard.SetText(RequiredString(payload,"text"));return null;
+            case "service.colors":
+            {
+                var available=RequiredString(payload,"available");var unavailable=RequiredString(payload,"unavailable");
+                if(!System.Text.RegularExpressions.Regex.IsMatch(available,"^#[0-9a-fA-F]{6}$")||!System.Text.RegularExpressions.Regex.IsMatch(unavailable,"^#[0-9a-fA-F]{6}$"))throw new InvalidOperationException("Введите цвет в формате #RRGGBB.");
+                _state.ServiceAvailableColor=available;_state.ServiceUnavailableColor=unavailable;SaveState();PushWebSnapshot();return null;
+            }
             case "service.visibility":
             {
                 var target = _state.ServiceMonitorTargets.FirstOrDefault(item => item.Id == RequiredString(payload, "id"))
@@ -488,7 +631,25 @@ public sealed partial class MainForm
             case "service.delete":
                 _state.ServiceMonitorTargets.RemoveAll(target => target.Id == RequiredString(payload, "id"));
                 _serviceStatusStrip.SetTargets(_state.ServiceMonitorTargets); SaveState(); PushWebSnapshot(); return null;
-            case "logs.clear": _logs.Clear(); PushWebSnapshot(); return null;
+            case "logs.clear": FlushPendingProcessLogs();await Diagnostics.ClearAsync();_pendingProcessLogs.Clear();_logs.Clear(); PushWebSnapshot(includeLogs:true); return null;
+            case "journal.size": return new {bytes=await Diagnostics.SizeAsync()};
+            case "journal.settings":
+            {var policy=Deserialize<JournalPolicy>(payload);policy.Validate();await Diagnostics.ConfigureAsync(policy);_state.Journal=policy;SaveState();PushWebSnapshot();return new {bytes=await Diagnostics.SizeAsync()};}
+            case "lifecycle.settings": await SaveLifecycleSettingsAsync(payload);return null;
+            case "logs.copy":
+            {
+                var entries = _logs.ToArray();
+                var level = OptionalString(payload, "level") ?? "all";
+                var query = OptionalString(payload, "query") ?? "";
+                var text = await Task.Run(() => string.Join(Environment.NewLine, entries.Where(line =>
+                {
+                    var severity = System.Text.RegularExpressions.Regex.IsMatch(line, "error|ошибк|fail", System.Text.RegularExpressions.RegexOptions.IgnoreCase) ? "error"
+                        : System.Text.RegularExpressions.Regex.IsMatch(line, "warn|предупреж", System.Text.RegularExpressions.RegexOptions.IgnoreCase) ? "warning" : "info";
+                    return (level == "all" || level == severity) && line.Contains(query, StringComparison.OrdinalIgnoreCase);
+                })));
+                if (text.Length > 0) Clipboard.SetText(text);
+                return new { count = entries.Length };
+            }
             case "diagnostics.export": return await ExportDiagnosticsAsync();
             case "config.get":
                 if (_state.AutoValidateConfig) ValidateSelectedConfig();
@@ -499,8 +660,18 @@ public sealed partial class MainForm
                 return await ValidatePreviewConfigAsync(FindProfile(RequiredString(payload, "id")));
             case "config.validate":
             {
+                if (_state.SelectedCore == CoreKind.IorCore)
+                    return await ValidatePreviewConfigAsync(SelectedProfile() ?? throw new InvalidOperationException("Выберите профиль для проверки."));
                 return ValidateSelectedConfig(force: true);
             }
+            case "app.update.check":
+                if(_updateDownloadRunning||_updateUiState==UpdateUiState.Ready||_shutdownRequested)throw new InvalidOperationException("Обновление уже выполняется.");
+                await CheckForStartupUpdateAsync(manual:true);return new {available=_updateUiState==UpdateUiState.Available&&!string.IsNullOrWhiteSpace(_availableUpdate?.AssetDownloadUrl)};
+            case "app.update.dismiss":
+                _dismissedUpdateTags.Add(RequiredString(payload,"tag"));PushWebSnapshot();return null;
+            case "app.update.accept":
+                if(_availableUpdate is null||!IsNewerVersion(_availableUpdate.Tag,AppVersion)||string.IsNullOrWhiteSpace(_availableUpdate.AssetDownloadUrl)||_updateDownloadRunning||_updateUiState is not (UpdateUiState.Available or UpdateUiState.Failed)||RequiredString(payload,"tag")!=_availableUpdate.Tag)throw new InvalidOperationException("Сведения об обновлении изменились; проверьте обновления снова.");
+                _dismissedUpdateTags.Add(_availableUpdate.Tag);_ = DownloadAndApplyUpdateAsync();return new {accepted=true};
             case "app.update.download":
             {
                 if (_availableUpdate is null || _updateUiState is not (UpdateUiState.Available or UpdateUiState.Failed))
@@ -508,6 +679,16 @@ public sealed partial class MainForm
                 _ = DownloadUpdateAsync();
                 return new { accepted = true };
             }
+            case "window.drag":
+                DragWindow(this, new MouseEventArgs(MouseButtons.Left, 1, 0, 0, 0));
+                return new { accepted = true };
+            case "window.minimize": WindowState = FormWindowState.Minimized; return new { accepted = true };
+            case "window.maximize":
+                MaximizedBounds = Screen.FromHandle(Handle).WorkingArea;
+                WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+                return new { maximized = WindowState == FormWindowState.Maximized };
+            case "window.close": Close(); return new { accepted = true };
+            case "app.exit": _allowExit = true; Close(); return new { accepted = true };
             case "app.update.apply": ApplyStagedUpdate(); return new { accepted = true };
             default: throw new InvalidOperationException($"Unknown web command: {method}");
         }
@@ -515,6 +696,19 @@ public sealed partial class MainForm
 
     private async Task<object> ValidatePreviewConfigAsync(ProxyProfile profile)
     {
+        if (_state.SelectedCore == CoreKind.IorCore)
+        {
+            if (!CoreRuntimeContract.TryCreateStart(_state, profile, out var request, out var reason))
+                return new { valid = false, output = reason };
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            try
+            {
+                await IorCoreControlClient.ValidateProfileAsync(CoreEngineService.IorCorePath(_state), request!, timeout.Token);
+                return new { valid = true, output = "Параметры ior-core корректны. Проверка выполнена без подключения к серверу; адреса TUN и физического интерфейса определяются при запуске." };
+            }
+            catch (Exception error) when (error is IOException or InvalidOperationException or OperationCanceledException or TimeoutException or System.ComponentModel.Win32Exception)
+            { return new { valid = false, output = error is OperationCanceledException or TimeoutException ? "Время проверки ior-core истекло." : "ior-core отклонил конфигурацию: " + error.Message }; }
+        }
         var previewPath = Path.Combine(_appDir, $"config.preview.{Guid.NewGuid():N}.json");
         try
         {
@@ -559,8 +753,16 @@ public sealed partial class MainForm
     {
         CoreKind.SingBox => SingBoxConfigBuilder.Build(_state, profile),
         CoreKind.XrayCore => XrayConfigBuilder.Build(_state, profile),
-        _ => throw new InvalidOperationException("У ior-core ещё нет исполняемого сетевого конфига.")
+        CoreKind.IorCore => BuildNativePreviewConfig(profile),
+        _ => throw new InvalidOperationException("Неизвестное ядро.")
     };
+
+    private string BuildNativePreviewConfig(ProxyProfile profile)
+    {
+        if (!CoreRuntimeContract.TryCreateStart(_state, profile, out var request, out var reason))
+            throw new InvalidOperationException(reason);
+        return JsonSerializer.Serialize(request, new JsonSerializerOptions(CoreRuntimeContract.JsonOptions) { WriteIndented = true });
+    }
 
     private object BuildWebSnapshot(bool includeLogs = true)
     {
@@ -569,6 +771,7 @@ public sealed partial class MainForm
         var selected = workspace is null
             ? SelectedProfile()
             : _state.Profiles.FirstOrDefault(profile => profile.Id == _state.SelectedProfileId);
+        if(selected is not null&&RemovedProtocolPolicy.IsRemoved(selected))selected=null;
         var serviceStatuses = _serviceStatusStrip.StatusSnapshot();
         var latencies = _latencyMonitor.Snapshot();
         var availableServerIds = workspace is null
@@ -577,7 +780,7 @@ public sealed partial class MainForm
                 (connected && profile.Id == _state.RunningServerId)).Select(profile => profile.Id).ToArray();
         var now = DateTime.UtcNow;
         string? currentConfig = null;
-        if (selected is not null)
+        if ((_state.AutoValidateConfig || _validatedConfig is not null) && selected is not null)
         {
             try { currentConfig = SingBoxConfigBuilder.Build(_state, selected); }
             catch (Exception ex) when (ex is FormatException or NotSupportedException) { /* Invalid/unsupported profiles are reported on validation, never crash snapshot updates. */ }
@@ -592,7 +795,8 @@ public sealed partial class MainForm
                 tag = _availableUpdate?.Tag,
                 percent = _updatePercent,
                 error = _updateError,
-                hasAsset = !string.IsNullOrWhiteSpace(_availableUpdate?.AssetDownloadUrl)
+                hasAsset = !string.IsNullOrWhiteSpace(_availableUpdate?.AssetDownloadUrl),
+                offerDismissed = _availableUpdate is not null&&_dismissedUpdateTags.Contains(_availableUpdate.Tag)
             },
             connected,
             connecting = _connectionTransitionInProgress || _webOperationRunning,
@@ -605,15 +809,18 @@ public sealed partial class MainForm
             runtimeConnectionWarning = connected ? _runtimeConnectionWarning : null,
             tunReadiness = connected ? _state.NativeTunReadiness : null,
             activeRoutingProfileId = _state.SelectedHappRoutingProfileId,
+            routingEnabled = _state.RoutingEnabled,
             activeConnectionProfileId = _state.SelectedConnectionProfileId,
             core = new { selected = _state.SelectedCore.ToString(), activeBackend = CoreEngineService.ActiveBackend(_state, connected), buildId = _state.RunningCore == CoreKind.IorCore || _state.SelectedCore == CoreKind.IorCore ? CoreEngineService.NativeBuildId(_state) : null, protocol = connected ? _state.RunningProfileSnapshot?.Protocol.ToString() : null, mode = _state.TunEnabled ? "TUN" : "Proxy", options = CoreEngineService.AvailableCores(_state) },
             configValidation = new { checkedConfig = currentValidation.HasValue, valid = currentValidation },
             availableServerIds,
-            traffic = new { download = _downloadSpeedValue.Text, upload = _uploadSpeedValue.Text, ping = _lastLatencyMs, quality = _qualityValue.Text },
+            traffic = new { download = _downloadSpeedValue.Text, upload = _uploadSpeedValue.Text, ping = _lastLatencyMs, pingStatus = _latencyMonitor.SnapshotFor(SelectedProfile())?.Status ?? "idle", quality = _qualityValue.Text },
             diagnostics = _loadMonitor.Sample(connected ? _state.ActiveProcessId : null,
                 _state.TunEnabled ? "TUN" : "Proxy", _state.SystemProxyApplied),
             settings = new
             {
+                journal=_state.Journal,launchWithWindows=_state.LaunchWithWindows,connectAtWindowsStartup=_state.ConnectAtWindowsStartup,windowsStartupProfileId=_state.WindowsStartupProfileId,restoreAfterSleep=_state.RestoreAfterSleep,windowsStartupStatus=_windowsStartupStatus,
+                lan = _state.Lan, lanInterfaces=LanInterfaces(), lanStatus=_lanStatus,
                 tunEnabled = _state.TunEnabled, mixedProxyEnabled = _state.MixedProxyEnabled, mixedProxyPort = _state.MixedProxyPort,
                 tunMtu = _state.TunMtu, sniffEnabled = _state.SniffEnabled, autoRoute = _state.AutoRoute,
                 strictRoute = _state.StrictRoute, stackSystem = _state.StackSystem, allowInsecureCertificates = _state.AllowInsecureCertificates,
@@ -621,40 +828,45 @@ public sealed partial class MainForm
                 dnsStrategy = _state.DnsStrategy, logLevel = _state.LogLevel, language = _state.Language.ToString(),
                 theme = _state.Theme.ToString(), navPanelPosition = _state.NavPanelPosition.ToString(), showNavTooltips = _state.ShowNavTooltips,
                 showNavSeparators = _state.ShowNavSeparators, usePanelGlass = _state.UsePanelGlass,
-                minimizeToTray = _state.MinimizeToTray, autoRefreshSubscriptions = _state.AutoRefreshSubscriptions,
+                minimizeToTray = _state.MinimizeToTray, autoRefreshSubscriptions = _state.AutoRefreshSubscriptions, sendSubscriptionHwid = _state.SendSubscriptionHwid,
                 autoValidateConfig = _state.AutoValidateConfig, powerSavingMode = _state.PowerSavingMode,
-                experimentalCoreTesting = _state.ExperimentalCoreTesting, realityUdp443Enabled = _state.RealityUdp443Enabled
+                realityUdp443Enabled = _state.RealityUdp443Enabled,
+                awgEngine = _state.AwgEngine.ToString()
                 , selectedCore = _state.SelectedCore.ToString(), bootstrapDnsServer = _state.BootstrapDnsServer
             },
-            servers = _state.Profiles.Select(profile => new
+            servers = _state.Profiles.Where(p=>!RemovedProtocolPolicy.IsRemoved(p)).Select(profile => new
             {
                 profile.Id, profile.Name, protocol = profile.Protocol.ToString(), profile.Server, profile.Port, profile.CountryCode,
                 profile.CountryName, profile.SubscriptionId, uploadBytes = profile.SubscriptionUploadBytes,
                 downloadBytes = profile.SubscriptionDownloadBytes, totalBytes = profile.SubscriptionTotalBytes,
                 expireUtc = profile.SubscriptionExpireUtc,
-                ping = latencies.TryGetValue(ServerTreeView.EndpointKey(profile), out var latency) ? latency.Current : null
+                ping = latencies.TryGetValue(ServerTreeView.EndpointKey(profile), out var latency) ? latency.Current : null,
+                pingStatus = latency?.Status ?? "idle"
             }),
+            unsupportedStoredCount = _state.Profiles.Count(RemovedProtocolPolicy.IsRemoved),
             subscriptions = _state.Subscriptions,
+            hwidConsentSubscriptionId = _hwidConsentSubscriptionId,
             routes = _state.HappRoutingProfiles,
-            connectionProfiles = _state.ConnectionProfiles,
+            connectionProfiles = Array.Empty<ConnectionWorkspaceProfile>(),
+            serviceStatusColors = new {available=_state.ServiceAvailableColor,unavailable=_state.ServiceUnavailableColor},
             services = _state.ServiceMonitorTargets.Select(service => new
             {
                 service.Id, service.Name, service.Url, service.PresetId, service.Visible,
-                iconData = ServiceIconData(service.Url),
+                iconData = ServiceIconData(service.Url, service.PresetId),
                 status = serviceStatuses.GetValueOrDefault(service.Id, "unknown")
             }),
-            logs = includeLogs ? _logs.TakeLast(500).ToArray() : null
+            logs = includeLogs ? _logs.ToArray() : null
         };
     }
 
-    private void PushWebSnapshot(bool includeLogs = true)
+    private void PushWebSnapshot(bool includeLogs = false)
     {
         if (!_webUiReady || _webView?.CoreWebView2 is null || IsDisposed) return;
         PostWebMessage(new { type = "event", name = "state", payload = BuildWebSnapshot(includeLogs) });
         if (includeLogs) _webLogDelta.Clear();
         else if (_webLogDelta.Count > 0)
         {
-            PostWebMessage(new { type = "event", name = "logs", payload = _webLogDelta.ToArray() });
+            PostWebMessage(new { type = "event", name = "logs", startId = _logs.Count - _webLogDelta.Count, payload = _webLogDelta.ToArray() });
             _webLogDelta.Clear();
         }
     }
@@ -676,7 +888,7 @@ public sealed partial class MainForm
             throw new InvalidOperationException("Пароль не может быть пустым.");
         if (profile.Protocol == ProxyProtocol.Shadowsocks && string.IsNullOrWhiteSpace(profile.Method))
             throw new InvalidOperationException("Укажите метод шифрования Shadowsocks.");
-        if (profile.Protocol == ProxyProtocol.WireGuard && (string.IsNullOrWhiteSpace(profile.PrivateKey) || string.IsNullOrWhiteSpace(profile.PeerPublicKey)))
+        if (profile.Protocol is ProxyProtocol.WireGuard or ProxyProtocol.AmneziaWG && (string.IsNullOrWhiteSpace(profile.PrivateKey) || string.IsNullOrWhiteSpace(profile.PeerPublicKey)))
             throw new InvalidOperationException("Для WireGuard нужны приватный и публичный ключи.");
     }
     private ProxySubscription FindSubscription(string id) => _state.Subscriptions.FirstOrDefault(subscription => subscription.Id == id) ?? throw new InvalidOperationException("Подписка не найдена.");
@@ -723,6 +935,7 @@ public sealed partial class MainForm
     private void SaveRoutingProfile(HappRoutingProfile profile)
     {
         profile = RoutingProfileEditor.Prepare(profile, _state.HappRoutingProfiles.FirstOrDefault(item => item.Id == profile.Id));
+        if(profile.Id=="none")throw new InvalidOperationException("Системный маршрут none нельзя изменить.");
         var index = _state.HappRoutingProfiles.FindIndex(item => item.Id == profile.Id);
         if (index >= 0) _state.HappRoutingProfiles[index] = profile; else _state.HappRoutingProfiles.Add(profile);
         _state.SelectedHappRoutingProfileId = profile.Id;
@@ -749,9 +962,10 @@ public sealed partial class MainForm
 
     private void DeleteRoutingProfile(string id)
     {
+        if(id=="none")throw new InvalidOperationException("Системный маршрут none нельзя удалить.");
         var removedIndex = _state.HappRoutingProfiles.FindIndex(profile => profile.Id == id);
         _state.HappRoutingProfiles.RemoveAll(profile => profile.Id == id);
-        if (_state.HappRoutingProfiles.Count == 0) _state.HappRoutingProfiles.Add(new HappRoutingProfile { Name = "Без маршрутизации", Source = RoutingProfileSource.Ior, GlobalProxy = true });
+
         if (_state.SelectedHappRoutingProfileId == id) _state.SelectedHappRoutingProfileId = _state.HappRoutingProfiles[Math.Clamp(removedIndex, 0, _state.HappRoutingProfiles.Count - 1)].Id;
         SaveState(); PushWebSnapshot();
     }
@@ -839,9 +1053,17 @@ public sealed partial class MainForm
         }, TaskScheduler.Default);
     }
 
-    private string? ServiceIconData(string url)
+    private string? ServiceIconData(string url, string? presetId = null)
     {
-        if (_serviceIconDataCache.TryGetValue(url, out var cached)) return cached;
+        // Presets use bundled PNGs so unavailable favicon servers cannot hide their icons.
+        var preset=ServiceMonitorCatalog.Presets.FirstOrDefault(item => item.Id == presetId);
+        if(preset is null && Uri.TryCreate(url,UriKind.Absolute,out var target))
+            preset=ServiceMonitorCatalog.Presets.FirstOrDefault(item=>Uri.TryCreate(item.Url,UriKind.Absolute,out var known) && known.Host.TrimStart('.').Replace("www.","").Equals(target.Host.Replace("www.",""),StringComparison.OrdinalIgnoreCase));
+        if(preset is not null){
+            var bundled=Path.Combine(AppContext.BaseDirectory,"assets","service-icons",preset.Id+".png");
+            if(File.Exists(bundled))return "data:image/png;base64,"+Convert.ToBase64String(File.ReadAllBytes(bundled));
+        }
+        if (_serviceIconDataCache.TryGetValue(url, out var cached) && cached is not null) return cached;
         var bytes = _faviconCache.TryGetCached(url);
         if (bytes is null) { _serviceIconDataCache[url] = null; return null; }
         var mime = bytes.Length >= 8 && bytes[0] == 0x89 && bytes[1] == 0x50 ? "image/png"
@@ -855,6 +1077,7 @@ public sealed partial class MainForm
 
     private void ApplyWebSettings(JsonElement payload)
     {
+        if(payload.TryGetProperty("awgEngine",out var engine) && (engine.ValueKind!=JsonValueKind.String || !Enum.TryParse<AwgEngine>(engine.GetString(),out var choice) || !Enum.IsDefined(choice)))throw new InvalidOperationException("Неизвестный движок AWG.");
         // Validate before changing any of the settings in this request.
         foreach (var property in payload.EnumerateObject())
         {
@@ -881,10 +1104,11 @@ public sealed partial class MainForm
                 case "dnsStrategy": _state.DnsStrategy = property.Value.GetString() ?? _state.DnsStrategy; break;
                 case "logLevel": _state.LogLevel = property.Value.GetString() ?? _state.LogLevel; break;
                 case "powerSavingMode": _state.PowerSavingMode = property.Value.GetBoolean(); ApplyPowerSavingMode(); break;
-                case "experimentalCoreTesting": _state.ExperimentalCoreTesting = property.Value.GetBoolean(); break;
                 case "realityUdp443Enabled": _state.RealityUdp443Enabled = property.Value.GetBoolean(); break;
+                case "awgEngine": _state.AwgEngine = Enum.Parse<AwgEngine>(property.Value.GetString()!); _state.AwgRustDefaultMigrated = true; break;
                 case "minimizeToTray": _state.MinimizeToTray = property.Value.GetBoolean(); _trayIcon.Visible = _state.MinimizeToTray; break;
                 case "autoRefreshSubscriptions": _state.AutoRefreshSubscriptions = property.Value.GetBoolean(); break;
+                case "sendSubscriptionHwid": _state.SendSubscriptionHwid = property.Value.GetBoolean(); break;
                 case "autoValidateConfig": _state.AutoValidateConfig = property.Value.GetBoolean(); if (_state.AutoValidateConfig) ValidateSelectedConfigIfEnabled(); break;
                 case "showNavTooltips": _state.ShowNavTooltips = property.Value.GetBoolean(); break;
                 case "showNavSeparators": _state.ShowNavSeparators = property.Value.GetBoolean(); break;
@@ -897,6 +1121,7 @@ public sealed partial class MainForm
                     {
                         var subscription = _state.Subscriptions.FirstOrDefault(value => value.Id == item.Name);
                         if (subscription is null) continue;
+                        if(subscription.ServerRefreshIntervalHours.HasValue)continue;
                         if (item.Value.TryGetProperty("enabled", out var enabled)) subscription.AutoRefreshEnabled = enabled.GetBoolean();
                         if (item.Value.TryGetProperty("intervalHours", out var interval))
                         {
@@ -922,11 +1147,22 @@ public sealed partial class MainForm
         return payload.EnumerateObject().Any(property => liveSettings.Contains(property.Name));
     }
 
+    private async Task ChangeRoutingAsync(bool enabled,string? id)
+    {
+        var oldEnabled=_state.RoutingEnabled;var oldId=_state.SelectedHappRoutingProfileId;
+        var running=IsConnectionRunning();var server=_state.RunningProfileSnapshot ?? SelectedProfile();
+        _state.RoutingEnabled=enabled;_state.SelectedHappRoutingProfileId=id;
+        try {
+            if(server is not null && !CoreEngineService.CanRun(_state,server,out var reason))throw new InvalidOperationException(reason);
+            if(running){if(!await StopSingBoxAsync())throw new InvalidOperationException("Не удалось остановить VPN");if(!await StartSingBoxAsync(server))throw new InvalidOperationException("Не удалось применить маршрут");}
+            SaveState();PushWebSnapshot();
+        } catch { _state.RoutingEnabled=oldEnabled;_state.SelectedHappRoutingProfileId=oldId;SaveState();if(running&&!IsConnectionRunning())await StartSingBoxAsync(server);PushWebSnapshot();throw; }
+    }
     private async Task RestartConnectionAsync()
     {
         if (!await StopSingBoxAsync()) throw new InvalidOperationException("Не удалось остановить прежнее подключение для перезапуска.");
         if (_state.Profiles.All(profile => profile.Id != _state.SelectedProfileId)) return;
-        if (!await StartSingBoxAsync()) await ShowConnectionFailedAsync();
+        if (!await StartSingBoxAsync(SelectedProfile())) await ShowConnectionFailedAsync();
     }
 
     private async Task SwitchCoreAsync(CoreKind target)
@@ -971,8 +1207,8 @@ public sealed partial class MainForm
 
     private async Task RefreshDueSubscriptionsAsync()
     {
-        if (_scheduledRefreshRunning || !_state.AutoRefreshSubscriptions) return;
-        var due = _state.Subscriptions.Where(subscription => SubscriptionRefreshSchedule.IsDue(subscription, DateTime.UtcNow)).ToArray();
+        if (_scheduledRefreshRunning) return;
+        var due = _state.Subscriptions.Where(subscription => SubscriptionRefreshSchedule.IsDue(subscription, DateTime.UtcNow) && !AwaitingHwidPermission(subscription)).ToArray();
         if (due.Length == 0) return;
         _scheduledRefreshRunning = true;
         try

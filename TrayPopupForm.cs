@@ -376,20 +376,20 @@ internal sealed class TrayPopupForm : Form
         {
             var colors = theme switch
             {
-                AppTheme.Darker => ("#090a0d", "#0e1014", "#ffffff", "#888f9a", "#b8f356"),
+                AppTheme.Darker => ("#0d0d0d", "#171717", "#fafafa", "#929292", "#ffffff"),
                 AppTheme.Midnight => ("#0d1322", "#111a2e", "#f4f7ff", "#8592ad", "#7da2ff"),
                 AppTheme.RedNeon => ("#180d11", "#211116", "#fff5f6", "#a4888d", "#ff667d"),
                 AppTheme.Emerald => ("#0b1714", "#10211d", "#f0fff9", "#7f9c92", "#5ee5a2"),
                 AppTheme.Violet => ("#151020", "#1d152b", "#fbf7ff", "#9687a7", "#b68cff"),
                 AppTheme.Amber => ("#18130c", "#211a10", "#fffaf0", "#a2957d", "#ffc260"),
-                AppTheme.PureLight => ("#ffffff", "#f5f6f8", "#111318", "#68707d", "#6f9e25"),
+                AppTheme.PureLight => ("#ffffff", "#f4f4f5", "#202020", "#717171", "#303030"),
                 AppTheme.IceBlue => ("#ffffff", "#eaf1ff", "#142038", "#65728b", "#4678e8"),
                 AppTheme.WhiteRed => ("#ffffff", "#ffecef", "#2b1418", "#84666c", "#e8415b"),
                 AppTheme.MintGlass => ("#ffffff", "#e4f8ef", "#12271f", "#628074", "#229f70"),
                 AppTheme.LightLavender => ("#ffffff", "#f0e8fb", "#281b37", "#786989", "#8558c9"),
                 AppTheme.PeachCream => ("#ffffff", "#ffecdc", "#302016", "#887263", "#db713e"),
                 AppTheme.SkyGradient => ("#ffffff", "#e5f5ff", "#122633", "#627b89", "#258ec1"),
-                _ => ("#121419", "#181b22", "#f5f6f8", "#858b98", "#a8d96d")
+                _ => ("#242424", "#2c302e", "#ececec", "#a0a0a0", "#ececec")
             };
             return new TrayPalette(ColorTranslator.FromHtml(colors.Item1), ColorTranslator.FromHtml(colors.Item2),
                 ColorTranslator.FromHtml(colors.Item3), ColorTranslator.FromHtml(colors.Item4), ColorTranslator.FromHtml(colors.Item5));

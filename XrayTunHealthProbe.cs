@@ -14,23 +14,14 @@ public static class XrayTunHealthProbe
         IPAddress? dnsEndpoint = null, string coreLabel = "Xray", bool ipv6Only = false,
         Action<string,int,long,string>? measured=null, Func<string,bool>? proxyTrafficConfirmed=null, bool hedged=true,
         bool fastStart=false, Action<NativeTunReadinessResult>? readiness=null,string? optionalRouteError=null,
-        Func<string,bool>? proxyDnsConfirmed=null,Func<string,string,bool>? proxyPacketTrafficConfirmed=null)
+        Func<string,bool>? proxyDnsConfirmed=null,Func<string,string,bool>? proxyPacketTrafficConfirmed=null,bool requireDns=false)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(25));
         try
         {
-            for (var attempt = 0; attempt < 30; attempt++)
-            {
-                if (NetworkInterface.GetAllNetworkInterfaces().Any(item =>
-                    item.Name.Equals(adapterName, StringComparison.OrdinalIgnoreCase) &&
-                    item.OperationalStatus == OperationalStatus.Up)) break;
-                await Task.Delay(100, timeout.Token);
-            }
-            if (!NetworkInterface.GetAllNetworkInterfaces().Any(item =>
-                item.Name.Equals(adapterName, StringComparison.OrdinalIgnoreCase) &&
-                item.OperationalStatus == OperationalStatus.Up))
-                return (false, $"{coreLabel} не создал активный TUN-адаптер.");
+            if (!await TunAdapterDiscovery.WaitAsync(adapterName,timeout.Token))
+                return (false, $"{coreLabel} не создал активный TUN-адаптер {adapterName}. Состояние: {TunAdapterDiscovery.DescribeOwnedAdapters()}");
 
             // The TUN adapter can be up while the server's own route has already
             // moved into it. Check the actual Windows decision after TUN starts.
@@ -140,11 +131,11 @@ public static class XrayTunHealthProbe
             {
                 var result=await NativeTunReadiness.CheckAsync(
                     token=>CheckTrafficStageAsync("HTTPS",CheckHttpsAsync,token, hedgeDelay:TimeSpan.FromMilliseconds(150)),
-                    CheckDnsAsync,token=>CheckUdpAsync(0,token),timeout.Token);
+                    CheckDnsAsync,token=>CheckUdpAsync(0,token),timeout.Token,requireDns:requireDns);
                 readiness?.Invoke(result);
                 foreach(var item in new[]{("dns",result.Dns),("udp",result.Udp)})
                     measured?.Invoke(item.Item1,0,item.Item2.DurationMs,item.Item2.Code);
-                if(!result.Ready)return(false,"NATIVE_TUN_HTTPS_FAILED: "+result.Https.Code);
+                if(!result.Ready)return(false,result.Https.Status!="ready"?"NATIVE_TUN_HTTPS_FAILED: "+result.Https.Code:"NATIVE_TUN_DNS_FAILED: "+result.Dns.Code);
             }
             else await Task.WhenAll(
                 hedged?CheckTrafficStageAsync("HTTPS", CheckHttpsAsync, timeout.Token):CheckTrafficSequentialAsync("HTTPS",CheckHttpsAsync,timeout.Token),

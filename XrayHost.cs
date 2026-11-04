@@ -23,16 +23,17 @@ public sealed partial class MainForm
         Microsoft.Win32.SystemEvents.PowerModeChanged -= OnXrayPowerModeChanged;
     }
 
-    private void OnXrayNetworkAddressChanged(object? sender, EventArgs e) => ScheduleXrayNetworkRecovery(force: false);
+    private void OnXrayNetworkAddressChanged(object? sender, EventArgs e){if(_waitingForSleepNetwork&&IsHandleCreated&&!IsDisposed){BeginInvoke(new Action(async()=>await RestoreAfterSleepAsync()));return;}ScheduleXrayNetworkRecovery(force:false);}
 
     private void OnXrayPowerModeChanged(object? sender, Microsoft.Win32.PowerModeChangedEventArgs e)
     {
-        if (e.Mode == Microsoft.Win32.PowerModes.Resume) ScheduleXrayNetworkRecovery(force: true);
+        if(e.Mode==Microsoft.Win32.PowerModes.Suspend){_sleepProfile=_state.RestoreAfterSleep&&IsConnectionRunning()?(_state.RunningProfileSnapshot??SelectedProfile()):null;_sleepCore=_state.RunningCore;}
+        if(e.Mode==Microsoft.Win32.PowerModes.Resume&&IsHandleCreated&&!IsDisposed)BeginInvoke(new Action(async()=>await RestoreAfterSleepAsync()));
     }
 
     private void ScheduleXrayNetworkRecovery(bool force)
     {
-        if (_state.RunningCore is not (CoreKind.XrayCore or CoreKind.IorCore) || !_state.TunEnabled || _xrayTunRouteLease is null ||
+        if (_sleepProfile is not null || _recoveringSleep || _state.RunningCore is not (CoreKind.XrayCore or CoreKind.IorCore) || !_state.TunEnabled || _xrayTunRouteLease is null ||
             !IsHandleCreated || IsDisposed || Interlocked.Exchange(ref _xrayNetworkRecoveryScheduled, 1) != 0) return;
         _ = Task.Run(async () =>
         {
@@ -43,7 +44,7 @@ public sealed partial class MainForm
                 try
                 {
                     var lease = _xrayTunRouteLease;
-                    if (_state.RunningCore is not (CoreKind.XrayCore or CoreKind.IorCore) || !_state.TunEnabled || lease is null ||
+                    if (_sleepProfile is not null || _recoveringSleep || _state.RunningCore is not (CoreKind.XrayCore or CoreKind.IorCore) || !_state.TunEnabled || lease is null ||
                         _connectedAt is null || _connectionTransitionInProgress ||
                         (!force && lease.IsPhysicalLinkUnchanged())) return;
                     _connectionTransitionInProgress = true;
@@ -70,6 +71,7 @@ public sealed partial class MainForm
 
     private async Task<bool> StartXrayAsync(ProxyProfile? overrideProfile = null)
     {
+        Log($"ior {AppVersion}: Xray preflight · Windows={Environment.OSVersion.Version.Build} · TUN={_state.TunEnabled} · supported={NativeWindowsPlatform.TunAvailable}");
         var profile = overrideProfile ?? SelectedProfile();
         if (!CoreEngineService.CanRun(_state, profile, out var reason))
         {
@@ -112,7 +114,6 @@ public sealed partial class MainForm
                 }
                 Diagnostics.Record("dns", "BOOTSTRAP_OK", ("address", endpoint.ToString()));
                 Diagnostics.Record("egress", "PHYSICAL_INTERFACE_SELECTED", ("interface", physicalInterface));
-                if (_state.ExperimentalCoreTesting)
                 {
                     _xrayDirectHelper = DirectEgressHelper.ForPhysicalInterface(physicalInterface, _state.BootstrapDnsServer, Diagnostics);
                     await _xrayDirectHelper.VerifyPhysicalEgressAsync("before-tun");

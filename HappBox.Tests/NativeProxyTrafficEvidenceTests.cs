@@ -7,6 +7,19 @@ namespace HappBox.Tests;
 
 public sealed class NativeProxyTrafficEvidenceTests
 {
+    [Fact]
+    public void CurrentAwgPacketEvidenceRequiresMatchingTupleAndRemotePayload()
+    {
+        var evidence=new NativeProxyTrafficEvidence();
+        const string source="172.19.0.1:58957",destination="104.16.124.96:443";
+        Event(evidence,"AWG_PACKET_ADMITTED",17,"PROXY");
+        Assert.False(evidence.HasProxiedPacketTraffic(source,destination));
+        Event(evidence,"AWG_PACKET_FIRST_REMOTE_BYTE",17,"PROXY",source:"172.19.0.1:58958");
+        Assert.False(evidence.HasProxiedPacketTraffic(source,destination));
+        Event(evidence,"AWG_PACKET_FIRST_REMOTE_BYTE",17,"PROXY");
+        Assert.True(evidence.HasProxiedPacketTraffic(source,destination));
+        Assert.False(evidence.HasProxiedPacketTraffic("172.19.0.1:58958",destination));
+    }
     private static void Event(NativeProxyTrafficEvidence evidence,string code,ulong flow,string? target=null,
         string source="172.19.0.1:58957",string destination="104.16.124.96:443")
     {

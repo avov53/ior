@@ -6,6 +6,19 @@ namespace HappBox.Tests;
 public sealed class SubscriptionRefreshScheduleTests
 {
     [Fact]
+    public void ServerIntervalOverridesDisabledAndRetainsUserPreference()
+    {
+        var now=DateTime.UtcNow;
+        var subscription=new ProxySubscription{AutoRefreshEnabled=false,RefreshIntervalHours=6,ServerRefreshIntervalHours=1,LastUpdatedUtc=now.AddHours(-2)};
+        SubscriptionRefreshSchedule.Normalize(subscription,now);
+        Assert.True(SubscriptionRefreshSchedule.IsDue(subscription,now));
+        SubscriptionRefreshSchedule.ScheduleNext(subscription,now);
+        Assert.Equal(now.AddHours(1),subscription.NextRefreshUtc);
+        subscription.ServerRefreshIntervalHours=null;
+        Assert.False(SubscriptionRefreshSchedule.IsDue(subscription,now.AddDays(1)));
+        Assert.Equal(6,subscription.RefreshIntervalHours);
+    }
+    [Fact]
     public void SubscriptionsBecomeDueIndependently()
     {
         var now = new DateTime(2026, 9, 21, 12, 0, 0, DateTimeKind.Utc);

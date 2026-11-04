@@ -8,3 +8,9 @@ zero-window time and application receive-buffer backpressure. Snapshots
 are aggregated every five seconds during activity and on socket closure.
 The observer is disabled unless installed by the host. It does not inspect
 payloads or change TCP settings.
+
+An explicit TcpAbortHandle lets ior-core reject a routed AWG connection whose
+destination family is unsupported, after name inspection. The runner emits
+the smoltcp RST before recycling the socket. Ordinary drop and half-close
+retain their existing graceful behavior. A virtual TCP handshake regression
+checks that an abort after dropping the stream sends RST rather than only FIN.

@@ -126,6 +126,22 @@ impl Default for NameCache {
     }
 }
 impl NameCache {
+    /// All fresh observations for an address. Shared CDN names must be checked together.
+    pub fn routing_names(&self, ip: IpAddr) -> Vec<String> {
+        self.routing_observation(ip).0
+    }
+    pub(crate) fn routing_observation(&self,ip:IpAddr)->(Vec<String>,&'static str,u64){
+        let Ok(mut entries) = self.entries.lock() else { return (Vec::new(),"unavailable",0); };
+        let Some(names) = entries.get_mut(&ip) else { return (Vec::new(),"missing",0); };
+        let now = Instant::now();
+        let had_names=!names.is_empty();
+        names.retain(|entry| entry.expires > now);
+        // An overflow marker means some live names were not retained. Never assume they select PROXY.
+        if names.iter().any(|entry| entry.name.is_empty()) { return (Vec::new(),"overflow",0); }
+        let ttl=names.iter().map(|entry|entry.expires.saturating_duration_since(now).as_secs()).min().unwrap_or(0);
+        let state=if names.is_empty(){if had_names{"expired"}else{"missing"}}else{"observed"};
+        (names.iter().map(|entry|entry.name.clone()).collect(),state,ttl)
+    }
     /// Only previously observed, unexpired DNS addresses; never invent an A record.
     pub fn ipv4_candidates(&self, name: &str) -> Vec<Ipv4Addr> {
         let Ok(entries) = self.entries.lock() else {
@@ -297,7 +313,7 @@ impl NameCache {
             }
             offset += size;
         }
-        let mut accepted = HashMap::<String, u32>::from([(query.name.clone(), 600)]);
+        let mut accepted = HashMap::<String, u32>::from([(query.name.clone(), u32::MAX)]);
         for _ in 0..16 {
             let mut changed = false;
             for (from, to, ttl) in &aliases {
@@ -317,14 +333,18 @@ impl NameCache {
             values.retain(|value| value.expires > now);
             !values.is_empty()
         });
+        let mut observed_count=0;let mut observed_ttl=u32::MAX;
         for (owner, ip, ttl) in addresses {
             let Some(chain_ttl) = accepted.get(&owner) else {
                 continue;
             };
-            let ttl = ttl.min(*chain_ttl).min(600);
+            // The client can retain this address for the resolver's complete TTL.
+            // Memory is bounded by address/name counts, not by shortening that TTL.
+            let ttl = ttl.min(*chain_ttl);
             if ttl == 0 {
                 continue;
             }
+            observed_count+=1;observed_ttl=observed_ttl.min(ttl);
             if entries.len() >= 4096 && !entries.contains_key(&ip) {
                 continue;
             }
@@ -343,17 +363,18 @@ impl NameCache {
                     query_type: query.kind,
                 });
             } else if let Some(overflow) = names.iter_mut().find(|entry| entry.name.is_empty()) {
-                overflow.expires = now + Duration::from_secs(600);
+                overflow.expires = overflow.expires.max(now + Duration::from_secs(ttl as u64));
             } else {
                 names.push(NameEntry {
                     name: String::new(),
-                    expires: now + Duration::from_secs(600),
+                    expires: now + Duration::from_secs(ttl as u64),
                     observed: now,
                     dns_flow_id: None,
                     query_type: 0,
                 });
             }
         }
+        if crate::resource_diagnostics::enabled(&query.name){crate::resource_diagnostics::emit(&query.name,"RESOURCE_DNS_OBSERVATION",serde_json::json!({"stage":"dns","queryType":query.kind,"count":observed_count,"ttlSeconds":if observed_count>0{observed_ttl}else{0}}));}
         Ok(())
     }
 }
@@ -433,6 +454,27 @@ pub fn sniff(bytes: &[u8]) -> Sniff {
         }
     }
     if bytes[0].is_ascii_uppercase() {
+        // A random binary/obfuscated prefix is not an incomplete HTTP header.
+        // Keep extension methods and fragmented headers, but stop waiting as
+        // soon as a control byte or an invalid request line rules HTTP out.
+        if bytes.iter().any(|b| !matches!(*b, b'\t' | b'\r' | b'\n' | 0x20..=0xff))
+            || std::str::from_utf8(bytes).is_err_and(|error| error.error_len().is_some()) {
+            return Sniff::Unknown;
+        }
+        let method_end = bytes.iter().position(|b| *b == b' ');
+        let method = &bytes[..method_end.unwrap_or(bytes.len())];
+        if method.is_empty() || !method.iter().all(|b|
+            b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b)) {
+            return Sniff::Unknown;
+        }
+        if let Some(end) = bytes.windows(2).position(|part| part == b"\r\n") {
+            let Ok(line) = std::str::from_utf8(&bytes[..end]) else { return Sniff::Unknown; };
+            let mut parts = line.split(' ');
+            if parts.next().is_none() || !parts.next().is_some_and(|p| !p.is_empty())
+                || !matches!(parts.next(), Some("HTTP/1.0" | "HTTP/1.1")) || parts.next().is_some() {
+                return Sniff::Unknown;
+            }
+        }
         if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
             let Ok(headers) = std::str::from_utf8(&bytes[..end]) else {
                 return Sniff::Unknown;
@@ -457,7 +499,49 @@ pub fn sniff(bytes: &[u8]) -> Sniff {
     }
     Sniff::Unknown
 }
-fn client_hello_name(hello: &[u8]) -> Option<String> {
+#[cfg(test)]
+mod http_prefix_tests {
+    use super::*;
+    #[test]
+    fn binary_uppercase_prefixes_do_not_wait_for_http_headers() {
+        for first in b'A'..=b'Z' {
+            assert_eq!(sniff(&[first, 0x01, 0x81, 0xff]), Sniff::Unknown);
+            assert_eq!(sniff(&[first, 0xff, 0xff]), Sniff::Unknown);
+        }
+        assert_eq!(sniff(b"SSH-2.0-server\r\n"), Sniff::Unknown);
+        assert_eq!(sniff(b"GET / NOTHTTP\r\n"), Sniff::Unknown);
+    }
+    #[test]
+    fn every_http_fragment_and_extension_method_keeps_host_routing() {
+        for request in [
+            "GET / HTTP/1.1\r\nHost: cdn.example\r\n\r\n",
+            "PROPFIND / HTTP/1.0\r\nHost: cdn.example\r\nX-Label: видео\r\n\r\n",
+            "CUSTOM-METHOD / HTTP/1.1\r\nHost: cdn.example\r\n\r\n",
+        ] {
+            let request = request.as_bytes();
+            for end in 0..request.len() {
+                assert_eq!(sniff(&request[..end]), Sniff::NeedMore, "fragment {end}");
+            }
+            assert_eq!(sniff(request), Sniff::Name("cdn.example".into()));
+        }
+    }
+}
+/// ECH carries an outer cover SNI. Preserve its original IP rather than resolve that cover name.
+pub fn proxy_name_is_authoritative(packet:&[u8])->bool {
+    if packet.first()!=Some(&22){return true;}
+    let mut data=Vec::new();let mut offset=0;
+    while offset<packet.len(){
+        let Some(header)=packet.get(offset..offset+5) else{return false;};
+        if header[0]!=22{return false;}
+        let len=u16::from_be_bytes([header[3],header[4]]) as usize;offset+=5;
+        let Some(record)=packet.get(offset..offset+len) else{return false;};data.extend_from_slice(record);offset+=len;
+        if data.len()>=4 {let size=((data[1] as usize)<<16)|((data[2] as usize)<<8)|data[3] as usize;if data[0]!=1||size>32768{return false;}
+            if data.len()>=size+4 {let hello=&data[4..size+4];let Some((mut at,end))=hello_extensions(hello) else{return false;};while at+4<=end {let kind=word(hello,at).unwrap();let len=word(hello,at+2).unwrap() as usize;at+=4;if at+len>end||kind==0xfe0d{return false;}at+=len;}return at==end;}
+        }
+    }
+    false
+}
+fn hello_extensions(hello:&[u8])->Option<(usize,usize)> {
     let mut offset = 34;
     let sid = *hello.get(offset)? as usize;
     offset += 1 + sid;
@@ -471,6 +555,10 @@ fn client_hello_name(hello: &[u8]) -> Option<String> {
     if end > hello.len() {
         return None;
     }
+    Some((offset,end))
+}
+fn client_hello_name(hello: &[u8]) -> Option<String> {
+    let (mut offset,end)=hello_extensions(hello)?;
     while offset + 4 <= end {
         let kind = word(hello, offset).ok()?;
         let size = word(hello, offset + 2).ok()? as usize;
@@ -506,6 +594,19 @@ fn client_hello_name(hello: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn awg_routing_observations_exclude_expired_and_keep_shared_names() {
+        let cache=NameCache::default();let ip="203.0.113.7".parse().unwrap();
+        let (q,p)=dns("video.test",[203,0,113,7],30);cache.observe(&p,&q).unwrap();
+        let (q,p)=dns("private.test",[203,0,113,7],30);cache.observe(&p,&q).unwrap();
+        let mut names=cache.routing_names(ip);names.sort();assert_eq!(names,vec!["private.test","video.test"]);
+        assert!(cache.lookup(ip).is_none());
+        assert_eq!(cache.routing_observation(ip).1,"observed");
+        cache.entries.lock().unwrap().get_mut(&ip).unwrap().push(NameEntry{name:String::new(),expires:Instant::now()+Duration::from_secs(30),observed:Instant::now(),dns_flow_id:None,query_type:0});
+        assert_eq!(cache.routing_observation(ip).1,"overflow");
+        cache.entries.lock().unwrap().get_mut(&ip).unwrap().iter_mut().for_each(|entry|entry.expires=Instant::now());
+        assert_eq!(cache.routing_observation(ip).1,"expired");
+    }
     #[test]
     fn https_hints_link_a_unique_name_without_mutating_the_dns_reply() {
         let mut query = vec![
@@ -590,6 +691,13 @@ mod tests {
         assert_eq!(cache.lookup_at(ip, now + Duration::from_secs(11)), None);
     }
     #[test]
+    fn observations_live_until_resolver_ttl_not_an_arbitrary_ten_minutes() {
+        let cache=NameCache::default();let now=Instant::now();let ip="203.0.113.7".parse().unwrap();
+        let (q,p)=dns("video.example",[203,0,113,7],3600);cache.observe_at(&p,&q,now).unwrap();
+        assert_eq!(cache.lookup_at(ip,now+Duration::from_secs(601)),Some("video.example".into()));
+        assert_eq!(cache.lookup_at(ip,now+Duration::from_secs(3600)),None);
+    }
+    #[test]
     fn dns_observation_rejects_wrong_identity_and_pointer_loops() {
         let (q, mut p) = dns("one.example", [203, 0, 113, 7], 10);
         p[0] ^= 1;
@@ -616,7 +724,7 @@ mod tests {
         hello.extend((ext.len() as u16).to_be_bytes());
         hello.extend(ext);
         let mut handshake = vec![1, 0, 0, hello.len() as u8];
-        handshake.extend(hello);
+        handshake.extend(&hello);
         let cut = 22;
         let mut tls = vec![22, 3, 3, 0, cut as u8];
         tls.extend(&handshake[..cut]);
@@ -624,11 +732,19 @@ mod tests {
         tls.extend(&handshake[cut..]);
         assert_eq!(sniff(&tls[..8]), Sniff::NeedMore);
         assert_eq!(sniff(&tls), Sniff::Name("cdn.example".into()));
+        assert!(proxy_name_is_authoritative(&tls));
+        let (extension_start,_) = hello_extensions(&hello).unwrap();
+        let extended=word(&hello,extension_start-2).unwrap() as usize+5;hello[extension_start-2..extension_start].copy_from_slice(&(extended as u16).to_be_bytes());
+        hello.extend([0xfe,0x0d,0,1,0]);
+        let mut ech_handshake=vec![1,0,0,hello.len() as u8];ech_handshake.extend(hello);
+        let mut ech=vec![22,3,3,0,ech_handshake.len() as u8];ech.extend(ech_handshake);
+        assert_eq!(sniff(&ech),Sniff::Name("cdn.example".into()));assert!(!proxy_name_is_authoritative(&ech));
+        assert!(proxy_name_is_authoritative(b"GET / HTTP/1.1\r\nHost: cdn.example\r\n\r\n"));
         assert_eq!(
             sniff(b"GET / HTTP/1.1\r\nHost: CDN.Example:80\r\n\r\n"),
             Sniff::Name("cdn.example".into())
         );
-        assert_eq!(sniff(b"SSH-2.0-server\r\n"), Sniff::NeedMore);
+        assert_eq!(sniff(b"SSH-2.0-server\r\n"), Sniff::Unknown);
         assert_eq!(sniff(&[22, 3, 3, 0xff, 0xff]), Sniff::Unknown);
     }
 }

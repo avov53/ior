@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Text.Json;
 
 namespace HappBox;
@@ -25,17 +25,27 @@ public static class CoreRuntimeContract
             ProxyProtocol.Shadowsocks => "shadowsocks",
             ProxyProtocol.Trojan => "trojan",
             ProxyProtocol.WireGuard => "wireguard",
+            ProxyProtocol.AmneziaWG => "amneziawg",
             _ => null
         };
         if (protocol is null)
         { reason = $"Сетевой контракт ior-core пока не поддерживает {profile.Protocol} без TLS/Reality."; return false; }
-        if (protocol.StartsWith("vless", StringComparison.Ordinal) &&
-            ((!string.IsNullOrWhiteSpace(profile.Flow) && protocol != "vless_reality") ||
-             (!string.IsNullOrWhiteSpace(profile.Network) && !profile.Network.Equals("tcp", StringComparison.OrdinalIgnoreCase)) ||
-             !string.IsNullOrWhiteSpace(profile.Host) || !string.IsNullOrWhiteSpace(profile.Path) ||
-             !string.IsNullOrWhiteSpace(profile.ServiceName) || (!string.IsNullOrWhiteSpace(profile.Fingerprint) && protocol != "vless_reality")))
-        { reason = "ior-core пока не поддерживает Vision, uTLS или VLESS-транспорт, отличный от обычного TCP."; return false; }
-        var tunnel = protocol is "wireguard";
+        if (protocol.StartsWith("vless", StringComparison.Ordinal))
+        {
+            var transport = (profile.Network ?? "tcp").ToLowerInvariant();
+            if (transport is "" or "tcp") transport = "raw";
+            if (transport == "websocket") transport = "ws";
+            if (transport is not ("raw" or "xhttp" or "grpc" or "ws" or "httpupgrade"))
+            { reason = "Транспорт VLESS не поддерживается: " + transport; return false; }
+            if (profile.RealityEnabled && transport is "ws" or "httpupgrade")
+            { reason = "REALITY несовместим с WebSocket/HTTPUpgrade."; return false; }
+            if (!string.IsNullOrWhiteSpace(profile.Flow) && (transport != "raw" || !profile.RealityEnabled))
+            { reason = "Vision этого выпуска доступен для RAW/REALITY."; return false; }
+        }
+        var tunnel = protocol is "wireguard" or "amneziawg";
+        if(protocol=="amneziawg" && !Enum.IsDefined(state.AwgEngine)){reason="Неизвестный движок AWG.";return false;}
+        Dictionary<string,string>? awg=null;
+        if(protocol=="amneziawg")try{awg=AwgProfileParameters.Normalize(profile.Awg);}catch(FormatException error){reason=error.Message;return false;}
         var identity = protocol is "vless_tls" or "vless_reality" or "vmess";
         if (string.IsNullOrWhiteSpace(profile.Server) || profile.Port is < 1 or > 65535 ||
             (identity ? !Guid.TryParse(profile.UserId, out _) : tunnel ? !IsKey(profile.PrivateKey) : string.IsNullOrWhiteSpace(profile.Password)))
@@ -67,20 +77,29 @@ public static class CoreRuntimeContract
         { reason = "WireGuard требует корректные адреса и совместимую семью AllowedIPs."; return false; }
         if (protocol == "vless_reality" && string.IsNullOrWhiteSpace(profile.PublicKey))
         { reason = "VLESS Reality требует public key."; return false; }
-        if (protocol == "hysteria2" && !string.IsNullOrWhiteSpace(profile.ObfsType))
-        { reason = "Параметр Hysteria2 obfs ещё не поддерживается собственным ядром."; return false; }
-        var route = state.HappRoutingProfiles.FirstOrDefault(item => item.Id == state.SelectedHappRoutingProfileId);
-        if (!string.IsNullOrWhiteSpace(state.SelectedHappRoutingProfileId) && route is null)
+        if (protocol == "hysteria2") {
+            var obfs=profile.ObfsType?.ToLowerInvariant() ?? "";
+            if(obfs is not ("" or "none" or "salamander")){reason="Тип obfs Hysteria2 не поддерживается.";return false;}
+            var bytes=System.Text.Encoding.UTF8.GetByteCount(profile.ObfsPassword ?? "");
+            if(obfs=="salamander" ? bytes is <4 or >4096 : bytes!=0){reason="Неверный пароль obfs Hysteria2.";return false;}
+        }
+        var awgTun=protocol=="amneziawg" && state.SelectedCore==CoreKind.IorCore && state.TunEnabled;
+        var route = RoutingSelectionPolicy.Effective(state);
+        if (state.RoutingEnabled && !string.IsNullOrWhiteSpace(state.SelectedHappRoutingProfileId) && route is null)
         { reason = "Выбранный маршрут не найден."; return false; }
         IReadOnlyList<OrderedRouteRule> rules;
-        if (route is null)
+        if (route is null || awgTun && AwgClientPolicy.EmptyRoute(route))
             rules = [new OrderedRouteRule { Kind = "MATCH", Target = "PROXY", Source = RoutingProfileSource.Ior }];
         else if (!OrderedRoutePlan.TryCreate(route, out rules, out reason)) return false;
+        // AWG is the default VPN route. Copy the final rule; saved profiles retain their original policy.
+        if (awgTun) rules=rules.Select(rule=>rule.Kind.Equals("MATCH",StringComparison.OrdinalIgnoreCase)
+            ? new OrderedRouteRule {Kind="MATCH",Target="PROXY",Source=rule.Source,Raw="AWG final"} : rule).ToArray();
         if(rules.Any(rule=>rule.Parameters.Any(parameter=>!parameter.Equals("no-resolve",StringComparison.OrdinalIgnoreCase))))
         { reason="Неподдерживаемый параметр правила маршрутизации.";return false; }
         try { rules=rules.SelectMany(rule=>NativeRuleProviderCache.Expand(rule,route)).SelectMany(rule=>NativeGeoData.Expand(rule,Path.Combine(AppContext.BaseDirectory,"core","xray"))).ToArray(); }
         catch(Exception error) when(error is FormatException or IOException or OverflowException)
         { reason=error.Message;return false; }
+        var fullAwgProxy=awgTun && rules.Count==1 && rules[0].Kind.Equals("MATCH",StringComparison.OrdinalIgnoreCase) && rules[0].Target.Equals("PROXY",StringComparison.OrdinalIgnoreCase);
         foreach (var rule in rules)
         {
             if(route?.RoutePlan?.Groups.Any(group=>group.Name.Equals(rule.Target,StringComparison.OrdinalIgnoreCase))==true)
@@ -123,11 +142,18 @@ public static class CoreRuntimeContract
                 Flow = protocol == "vless_reality" ? (state.SelectedCore == CoreKind.IorCore && state.RealityUdp443Enabled && profile.Flow == "xtls-rprx-vision" ? "xtls-rprx-vision-udp443" : profile.Flow) : null,
                 Fingerprint = protocol == "vless_reality" ? profile.Fingerprint : null,
                 Options = new CoreProtocolOptions {
+                    Obfs = protocol=="hysteria2" ? profile.ObfsType?.ToLowerInvariant() : null,
+                    ObfsPassword = protocol=="hysteria2" ? profile.ObfsPassword : null,
                     Method = protocol == "vmess" ? profile.Security ?? "auto" : profile.Method,
                     AlterId = protocol == "vmess" ? profile.AlterId : null, Tls = profile.TlsEnabled, Transport = profile.Network,
-                    Host = profile.Host, Path = profile.Path, ServiceName = profile.ServiceName,
+                    Host = profile.Host, Path = profile.Path, ServiceName = profile.ServiceName, VlessTransport = profile.VlessTransport, Alpn=profile.Alpn,
                     LocalAddresses = tunnel ? SplitList(profile.LocalAddress) : null,
                     AllowedIps = tunnel ? SplitList(profile.AllowedIps) : null, PeerPublicKey = profile.PeerPublicKey,
+                    Awg = awg,
+                    AwgRoutingMode = protocol=="amneziawg" ? fullAwgProxy ? "fullProxy" : "rules" : null,
+                    AwgEngine = protocol=="amneziawg" ? state.AwgEngine==HappBox.AwgEngine.Rust ? "rust" : "go" : null,
+                    AwgAdapterPath = protocol == "amneziawg" && state.AwgEngine==HappBox.AwgEngine.Go ? NativeProtocolComponents.AwgPath : null,
+                    AwgAdapterSha256 = protocol == "amneziawg" && state.AwgEngine==HappBox.AwgEngine.Go ? NativeProtocolComponents.AwgSha256 : null,
                     PresharedKey = profile.PreSharedKey, Keepalive = profile.PersistentKeepalive, Mtu = profile.Mtu
                 }
             },
@@ -202,6 +228,18 @@ public sealed class CoreWireProfile
 
 public sealed class CoreProtocolOptions
 {
+    public string? Obfs {get;set;}
+    public string? ObfsPassword {get;set;}
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? AwgEngine { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? AwgRoutingMode { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string,string>? Awg { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? AwgAdapterPath { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? AwgAdapterSha256 { get; set; }
     public string? Method { get; set; }
     public int? AlterId { get; set; }
     public bool? Tls { get; set; }
@@ -209,6 +247,8 @@ public sealed class CoreProtocolOptions
     public string? Host { get; set; }
     public string? Path { get; set; }
     public string? ServiceName { get; set; }
+    public string[]? Alpn { get; set; }
+    public CoreVlessTransportOptions? VlessTransport { get; set; }
     public string[]? LocalAddresses { get; set; }
     public string[]? AllowedIps { get; set; }
     public string? PeerPublicKey { get; set; }
@@ -223,6 +263,15 @@ public sealed class CoreWireDns
     public string Upstream { get; set; } = "";
     public bool Ipv4Only { get; set; }
     public List<string> Upstreams { get; set; } = [];
+}
+
+[System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
+public sealed class CoreVlessTransportOptions
+{
+    public string? Mode { get; set; }
+    public bool MultiMode { get; set; }
+    public Dictionary<string,string> Headers { get; set; } = [];
+    public CoreWireProfile? Download { get; set; }
 }
 
 public sealed class CoreWireRule

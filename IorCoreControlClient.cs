@@ -14,6 +14,7 @@ public sealed class IorCoreControlClient : IAsyncDisposable
     private readonly System.Collections.Concurrent.ConcurrentQueue<string> _diagnostics = new();
     public string DiagnosticCodes => string.Join(", ",_diagnostics);
     public event Action<string>? Diagnostic;
+    public event Action<string, (string Key, string Value)[]>? DiagnosticDetails;
     private readonly object _messageLock=new();
     private readonly Queue<string> _pendingMessages=new();
     private readonly NativeProxyTrafficEvidence _traffic=new();
@@ -45,6 +46,20 @@ public sealed class IorCoreControlClient : IAsyncDisposable
                 _traffic.Observe(json.RootElement,code);
                 _diagnostics.Enqueue(code);
                 Diagnostic?.Invoke(code);
+                var fields = new List<(string Key, string Value)>();
+                foreach(var field in new[]{"flowId","elapsedMs","queryType","durationMs","count","sentBytes","receivedBytes","waitCount","readWaitUs","sendWaitUs","receiveWaitUs","queueWaitUs","maxWaitUs","rxQueuedBytes","txQueuedBytes","rxZeroWindowUs","peerZeroWindowUs","reassemblyDroppedPackets","active","fallback","forwardedPackets","receivedPackets","droppedPackets","packetBudgetBytes","packetBudgetUsedBytes","packetBudgetPeakBytes","budgetDroppedPackets","queueDroppedPackets","totalUs","maxUs","rcode","answerCount","dnsNameCount","ttlSeconds","tunDeliveredBytes","maxPacketBytes","mtu","icmpType","icmpCode"}.Distinct(StringComparer.Ordinal))
+                    if(json.RootElement.TryGetProperty(field,out var value) && value.ValueKind==JsonValueKind.Number && value.TryGetUInt64(out var number))
+                        fields.Add((field=="flowId"?"flow":field,number.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                foreach(var field in new[]{"destination","destinationName","resolver","source"}.Distinct(StringComparer.Ordinal))
+                    if(json.RootElement.TryGetProperty(field,out var value) && value.ValueKind==JsonValueKind.String && IsSafeDestination(value.GetString()))
+                        fields.Add((field,value.GetString()!));
+                foreach(var field in new[]{"reason","operation","side","transport","nameSource"}.Distinct(StringComparer.Ordinal))
+                    if(json.RootElement.TryGetProperty(field,out var value) && value.ValueKind==JsonValueKind.String && value.GetString() is { } text && System.Text.RegularExpressions.Regex.IsMatch(text,"^[a-zA-Z0-9_-]{1,80}$"))
+                        fields.Add((field,text));
+                foreach(var field in new[]{"readEof","writeClosed","truncated"}.Distinct(StringComparer.Ordinal))
+                    if(json.RootElement.TryGetProperty(field,out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                        fields.Add((field,value.GetBoolean().ToString()));
+                DiagnosticDetails?.Invoke(code,fields.ToArray());
                 var message=code;
                 if(json.RootElement.TryGetProperty("flowId",out var flow) && flow.TryGetUInt64(out var flowId))message+=" · flow="+flowId;
                 if(json.RootElement.TryGetProperty("elapsedMs",out var elapsed) && elapsed.TryGetUInt64(out var elapsedMs))message+=" · elapsed="+elapsedMs+"ms";
@@ -55,16 +70,22 @@ public sealed class IorCoreControlClient : IAsyncDisposable
                     IsSafeDestination(source.GetString()))message+=" · source="+source.GetString();
                 if(json.RootElement.TryGetProperty("target",out var target) && target.ValueKind==JsonValueKind.String &&
                     target.GetString() is "PROXY" or "DIRECT" or "REJECT")message+=" → "+target.GetString();
-                foreach(var field in new[]{"ruleIndex","sentBytes","receivedBytes","durationMs","parentFlowId","count","queueWaitUs","sendWaitUs","receiveWaitUs","maxWaitUs","durationUs","droppedPackets","attempt","queryType","mtu","rxBufferBytes","txBufferBytes","extraBudgetBytes","rttEstimateMs","rxWindowBytes","peerWindowBytes","rxQueuedBytes","txQueuedBytes","rxZeroWindowUs","peerZeroWindowUs","applicationWaitUs","reassemblyDroppedPackets","reassemblySegments","active","closing","retired","flowLimit","closingLimit","packetBudgetBytes","packetBudgetUsedBytes","packetBudgetPeakBytes","budgetDroppedPackets","queueDroppedPackets","forwardedPackets","forwardedBytes","receivedPackets","fallbackSyns"})
-                    if(json.RootElement.TryGetProperty(field,out var metric) && metric.TryGetUInt64(out var number))
+                foreach(var field in new[]{"ruleIndex","sentBytes","receivedBytes","durationMs","parentFlowId","count","queueWaitUs","sendWaitUs","receiveWaitUs","maxWaitUs","durationUs","droppedPackets","attempt","queryType","mtu","rxBufferBytes","txBufferBytes","extraBudgetBytes","proxyQueueDrops","tunQueueDrops","queuedDatagrams","queuedBytes","receiveQueueDrops","cwndBytes","lostPackets","sentPackets","rttEstimateMs","rxWindowBytes","peerWindowBytes","rxQueuedBytes","txQueuedBytes","rxZeroWindowUs","peerZeroWindowUs","applicationWaitUs","reassemblyDroppedPackets","active","fallback","forwardedPackets","receivedPackets","droppedPackets","packetBudgetBytes","packetBudgetUsedBytes","packetBudgetPeakBytes","budgetDroppedPackets","queueDroppedPackets","totalUs","maxUs","rcode","answerCount","reassemblySegments","active","closing","retired","flowLimit","closingLimit","packetBudgetBytes","packetBudgetUsedBytes","packetBudgetPeakBytes","budgetDroppedPackets","queueDroppedPackets","forwardedPackets","forwardedBytes","receivedPackets","fallbackSyns"}.Distinct(StringComparer.Ordinal))
+                    if(json.RootElement.TryGetProperty(field,out var metric) && metric.ValueKind==JsonValueKind.Number && metric.TryGetUInt64(out var number))
                         message+=" · "+field+"="+number;
                 if(json.RootElement.TryGetProperty("selectedAddress",out var selectedAddress) && selectedAddress.ValueKind==JsonValueKind.String && IsSafeDestination(selectedAddress.GetString()))message+=" · selectedAddress="+selectedAddress.GetString();
-                foreach(var field in new[]{"readCalls","readWaitUs"})
-                    if(json.RootElement.TryGetProperty(field,out var metric) && metric.TryGetUInt64(out var number)) message+=" · "+field+"="+number;
-                foreach(var field in new[]{"stage","transport","kind","reason","classification","side","direction","operation","addressFamily","nameSource","resolver","nagle","congestion","addressSource"})
+                foreach(var field in new[]{"readCalls","readWaitUs","waitCount"}.Distinct(StringComparer.Ordinal))
+                    if(json.RootElement.TryGetProperty(field,out var metric) && metric.ValueKind==JsonValueKind.Number && metric.TryGetUInt64(out var number)) message+=" · "+field+"="+number;
+                foreach(var field in new[]{"stage","transport","kind","reason","classification","side","direction","operation","addressFamily","nameSource","resolver","nagle","congestion","addressSource"}.Distinct(StringComparer.Ordinal))
                     if(json.RootElement.TryGetProperty(field,out var detail) && detail.ValueKind==JsonValueKind.String &&
                         detail.GetString() is { } value && System.Text.RegularExpressions.Regex.IsMatch(value,"^[a-zA-Z0-9_-]{1,80}$"))
                         message+=" · "+field+"="+value;
+                foreach(var field in new[]{"resolver","destinationName"}.Distinct(StringComparer.Ordinal))
+                    if(json.RootElement.TryGetProperty(field,out var detail) && detail.ValueKind==JsonValueKind.String && IsSafeDestination(detail.GetString()))
+                        message+=" · "+field+"="+detail.GetString();
+                foreach(var field in new[]{"readEof","writeClosed","truncated"}.Distinct(StringComparer.Ordinal))
+                    if(json.RootElement.TryGetProperty(field,out var detail) && detail.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                        message+=" · "+field+"="+detail.GetBoolean();
                 PublishMessage(message);
                 while(_diagnostics.Count>64)_diagnostics.TryDequeue(out _);
             }
@@ -115,10 +136,11 @@ public sealed class IorCoreControlClient : IAsyncDisposable
         finally { _commands.Release(); }
     }
 
-    private async Task<RuntimeEvent> CommandAsync(string operation, CancellationToken token)
+    private async Task<RuntimeEvent> CommandAsync(string operation, CancellationToken token, object? lan=null)
     {
         var id = Guid.NewGuid().ToString("N");
-        await _process.StandardInput.WriteLineAsync(JsonSerializer.Serialize(new { apiVersion = CoreRuntimeContract.ApiVersion, requestId = id, operation }));
+        object command=lan is null?new { apiVersion=CoreRuntimeContract.ApiVersion,requestId=id,operation }:(object)new {apiVersion=CoreRuntimeContract.ApiVersion,requestId=id,operation,lan};
+        await _process.StandardInput.WriteLineAsync(JsonSerializer.Serialize(command));
         await _process.StandardInput.FlushAsync(token);
         var result = await ReadAsync(token);
         if (result.RequestId != id || result.Operation != (operation == "stop" ? "stopped" : operation))
@@ -126,6 +148,7 @@ public sealed class IorCoreControlClient : IAsyncDisposable
         return result;
     }
 
+    public async Task ConfigureLanAsync(object settings,CancellationToken token=default){await _commands.WaitAsync(token);try{var result=await CommandAsync("configureLan",token,settings);if(result.Code!="LAN_CONFIGURED")throw new IOException("LAN_CONFIGURATION_FAILED");}finally{_commands.Release();}}
     public async Task CheckDirectEgressAsync(CancellationToken token = default)
     {
         await _commands.WaitAsync(token);

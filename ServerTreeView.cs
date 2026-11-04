@@ -10,7 +10,11 @@ public enum SubscriptionAction
     Delete
 }
 
-public sealed record LatencySnapshot(long? Current, long? Minimum, long? Average, long? Maximum, IReadOnlyList<long?> Samples);
+public sealed record LatencySnapshot(long? Current, long? Minimum, long? Average, long? Maximum, IReadOnlyList<long?> Samples, bool Measuring=false, bool Attempted=false)
+{
+    public string Status => Measuring ? "measuring" : !Attempted ? "idle" : Current.HasValue ? "ready" : "unavailable";
+    public string Display => Measuring ? "…" : Current.HasValue ? $"{Current} ms" : Attempted ? "Недоступно" : "—";
+}
 
 internal static class UiAnimationClock
 {
@@ -453,7 +457,7 @@ public sealed class ServerTreeView : Control
             TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
 
         var latency = profile is null ? null : LatencyFor(profile)?.Current;
-        var latencyText = latency is null ? "—" : $"{latency} ms";
+        var latencyText = profile is null ? "—" : LatencyFor(profile)?.Display ?? "—";
         TextRenderer.DrawText(g, latencyText, new Font("Segoe UI", 8.8f, FontStyle.Bold),
             new Rectangle(rect.Right - 92, rect.Top, 70, rect.Height), LatencyColor(latency),
             TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
@@ -502,7 +506,7 @@ public sealed class ServerTreeView : Control
             new Rectangle(rect.Left + 50, rect.Top + 28, rect.Width - 142, 18), BlendColor(BackColor, Color.FromArgb(166, 168, 180), reveal),
             TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter);
         var latency = LatencyFor(profile)?.Current;
-        TextRenderer.DrawText(g, latency is null ? "—" : $"{latency} ms", new Font("Segoe UI", 8.8f, FontStyle.Bold),
+        TextRenderer.DrawText(g, LatencyFor(profile)?.Display ?? "—", new Font("Segoe UI", 8.8f, FontStyle.Bold),
             new Rectangle(rect.Right - 92, rect.Top, 78, rect.Height), BlendColor(BackColor, LatencyColor(latency), reveal),
             TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
         g.Restore(clipState);

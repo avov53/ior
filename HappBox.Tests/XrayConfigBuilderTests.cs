@@ -80,6 +80,7 @@ public sealed class XrayConfigBuilderTests
             PeerPublicKey = Convert.ToBase64String(Enumerable.Repeat((byte)2, 32).ToArray()),
             LocalAddress = "10.10.0.2/32", AllowedIps = "0.0.0.0/0, ::/0", PersistentKeepalive = 25
         };
+        if(RemovedProtocolPolicy.IsRemoved(profile)){Assert.False(XrayConfigBuilder.CanBuild(state,profile,out _));return;}
         var json = XrayConfigBuilder.Build(state, profile);
         using var document = JsonDocument.Parse(json);
         Assert.Equal(2, document.RootElement.GetProperty("inbounds").GetArrayLength());
@@ -116,7 +117,7 @@ public sealed class XrayConfigBuilderTests
     }
 
     [Fact]
-    public void TunAllowsOnlyFullProxyVlessRealityOrHysteria2()
+    public void TunValidatesExplicitRoutesWithoutExperimentalFlag()
     {
         var state = new AppState { TunEnabled = true, MixedProxyEnabled = true };
         var vless = new ProxyProfile { Protocol = ProxyProtocol.Vless, Server = "203.0.113.10", Port = 443,
@@ -126,12 +127,11 @@ public sealed class XrayConfigBuilderTests
         state.HappRoutingProfiles.Add(new HappRoutingProfile { Id = "direct", Source = RoutingProfileSource.Ior,
             GlobalProxy = true, DirectSites = ["example.org"] });
         state.SelectedHappRoutingProfileId = "direct";
-        Assert.False(XrayConfigBuilder.CanBuildTun(state, vless, out reason));
-        Assert.Contains("direct", reason);
+        Assert.True(XrayConfigBuilder.CanBuildTun(state, vless, out reason),reason);
     }
 
     [Fact]
-    public void HappProxyRulesKeepConfiguredOrderAndTunStillBlocksExternalDirect()
+    public void HappProxyRulesKeepConfiguredOrderAndTunValidatesDirect()
     {
         var route = new HappRoutingProfile { Id = "happ-ordered", Source = RoutingProfileSource.Happ,
             Links = ["""
@@ -151,8 +151,7 @@ public sealed class XrayConfigBuilderTests
         state.TunEnabled = true;
         profile.RealityEnabled = true;
         profile.PublicKey = "test-key";
-        Assert.False(XrayConfigBuilder.CanBuildTun(state, profile, out var reason));
-        Assert.Contains("DIRECT", reason);
+        Assert.True(XrayConfigBuilder.CanBuildTun(state, profile, out var reason),reason);
     }
 
     [Fact]
@@ -265,6 +264,7 @@ public sealed class XrayConfigBuilderTests
             GlobalProxy = true, DirectIp = ["1.1.1.1/32"] };
         state.HappRoutingProfiles.Add(route);
         state.SelectedHappRoutingProfileId = route.Id;
+        if(RemovedProtocolPolicy.IsRemoved(profile)){Assert.False(XrayConfigBuilder.CanBuildTun(state,profile,out _));return;}
         var config = XrayConfigBuilder.BuildTunCandidateForValidation(state, profile,
             outboundInterface: "Wi-Fi");
         using var document = JsonDocument.Parse(config);
@@ -294,16 +294,14 @@ public sealed class XrayConfigBuilderTests
     [InlineData(ProxyProtocol.Vmess)]
     [InlineData(ProxyProtocol.Trojan)]
     [InlineData(ProxyProtocol.Shadowsocks)]
-    public void AdditionalTunProtocolsRequireExperimentalOptIn(ProxyProtocol protocol)
+    public void AdditionalTunProtocolsRespectAvailabilityWithoutExperimentalFlag(ProxyProtocol protocol)
     {
         var state = new AppState { TunEnabled = true };
         var profile = new ProxyProfile { Protocol = protocol, Server = "203.0.113.10", Port = 443,
             UserId = "11111111-1111-1111-1111-111111111111", Password = "test-password",
             Method = "aes-128-gcm", TlsEnabled = protocol != ProxyProtocol.Shadowsocks, ServerName = "example.com" };
-        Assert.False(XrayConfigBuilder.CanBuildTun(state, profile, out var reason));
-        Assert.Contains("экспериментальное", reason);
-        state.ExperimentalCoreTesting = true;
-        Assert.True(XrayConfigBuilder.CanBuildTun(state, profile, out reason), reason);
+        var expected=!RemovedProtocolPolicy.IsRemoved(profile);Assert.Equal(expected,XrayConfigBuilder.CanBuildTun(state, profile, out var reason));
+        state.ExperimentalCoreTesting = true;Assert.Equal(expected,XrayConfigBuilder.CanBuildTun(state, profile, out reason));
     }
 
     [Fact]
@@ -485,7 +483,7 @@ public sealed class XrayConfigBuilderTests
     }
 
     [Fact]
-    public void XrayTunAcceptsOrderedProxyAndBlockButRejectsExternalDirect()
+    public void XrayTunAcceptsOrderedProxyBlockAndDirect()
     {
         var route = new HappRoutingProfile { Id = "clash", Source = RoutingProfileSource.Clash,
             ClashOrderedRules = [
@@ -499,8 +497,7 @@ public sealed class XrayConfigBuilderTests
             ServerName = "example.com", PublicKey = "test-key" };
         Assert.True(XrayConfigBuilder.CanBuildTun(state, profile, out var reason), reason);
         route.ClashOrderedRules.Insert(0, new ClashRuleEntry { Kind = "IP-CIDR", Value = "8.8.8.8/32", Target = "DIRECT", Raw = "IP-CIDR,8.8.8.8/32,DIRECT" });
-        Assert.False(XrayConfigBuilder.CanBuildTun(state, profile, out reason));
-        Assert.Contains("DIRECT", reason);
+        Assert.True(XrayConfigBuilder.CanBuildTun(state, profile, out reason),reason);
     }
 
     [Fact]

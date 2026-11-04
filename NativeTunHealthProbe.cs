@@ -5,6 +5,16 @@ namespace HappBox;
 
 public static class NativeTunHealthProbe
 {
+    public static IPAddress RoutedTrafficResolver(IPAddress adapterDns, IPAddress? upstream, Func<IPAddress,bool> usesTun)
+    {
+        var preferred = TrafficResolver(adapterDns, upstream);
+        // Bootstrap DNS has an intentional physical /32 route. It cannot prove
+        // TUN UDP readiness, even when it is also the profile's DNS resolver.
+        foreach (var candidate in new[] { preferred, IPAddress.Parse("8.8.8.8"), IPAddress.Parse("1.1.1.1"), IPAddress.Parse("9.9.9.9") }.Distinct())
+            if (!candidate.Equals(adapterDns) && candidate.AddressFamily == preferred.AddressFamily && usesTun(candidate))
+                return candidate;
+        throw new IOException("NATIVE_TUN_UDP_PROBE_ROUTE_INVALID");
+    }
     public static IPAddress TrafficResolver(IPAddress adapterDns, IPAddress? upstream)
     {
         var resolver=upstream ?? IPAddress.Parse("8.8.8.8");
@@ -32,10 +42,16 @@ public static class NativeTunHealthProbe
         // UDP destination. Keep checking its configuration above, but exercise
         // actual routed UDP against the profile's upstream resolver.
         var probeDns = TrafficResolver(dns,trafficDnsEndpoint);
-        var routeValid=PhysicalInterfaceResolver.UsesInterfaceForAddress(probeDns,adapterName);
+        var routeValid = false;
+        try {
+            probeDns = RoutedTrafficResolver(dns, trafficDnsEndpoint, address => PhysicalInterfaceResolver.UsesInterfaceForAddress(address, adapterName));
+            routeValid = true;
+        } catch (IOException) { /* Keep fast-start's explicit optional-route diagnostic. */ }
+        measured?.Invoke("udp_probe_route",0,0,routeValid ? "TUN:"+probeDns : "NATIVE_TUN_UDP_PROBE_ROUTE_INVALID");
         if (!routeValid && !fastStart)
             return (false, "NATIVE_TUN_UDP_PROBE_ROUTE_INVALID");
         return await XrayTunHealthProbe.CheckAsync(server, physical, token, adapterName, probeDns, "ior-core",ipv6Only,measured,proxyTrafficConfirmed,hedged,
-            fastStart,readiness,routeValid?null:"NATIVE_TUN_UDP_PROBE_ROUTE_INVALID",proxyDnsConfirmed,proxyPacketTrafficConfirmed);
+            fastStart,readiness,routeValid?null:"NATIVE_TUN_UDP_PROBE_ROUTE_INVALID",proxyDnsConfirmed,proxyPacketTrafficConfirmed,
+            requireDns:!NativeWindowsPlatform.IsWindows11(Environment.OSVersion.Version));
     }
 }

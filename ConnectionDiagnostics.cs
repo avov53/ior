@@ -14,17 +14,25 @@ public sealed class ConnectionDiagnostics : IDisposable
     public sealed record Event(int Schema, DateTimeOffset Utc, string RunId, string Stage, string Code,
         IReadOnlyDictionary<string, string> Fields);
     private readonly ConcurrentQueue<Event> _events = new();
-    private readonly Channel<Event> _pending = Channel.CreateBounded<Event>(new BoundedChannelOptions(2048)
+    private sealed record Work(Event? Event=null,Func<Task>? Control=null);
+    private readonly JournalFileStore _files;
+    private readonly Channel<Work> _pending = Channel.CreateBounded<Work>(new BoundedChannelOptions(2048)
         { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
     private readonly Task _writer;
     private string _runId = Guid.NewGuid().ToString("N");
     private long _dropped;
+    private long _clearGeneration;
     private readonly ConcurrentQueue<(string RunId, NetworkDiagnosticSnapshot Snapshot)> _snapshots = new();
     private static readonly HashSet<string> AllowedFields = new(StringComparer.Ordinal)
-        { "engine", "mode", "protocol", "interface", "interfaceIndex", "address", "destination", "ruleId", "target", "durationMs", "count", "exitCode", "errorType", "socketError", "sha256", "version", "phase", "operation", "side", "direction", "sentBytes", "receivedBytes", "flow", "elapsedMs", "slowStage" };
+        { "engine", "mode", "protocol", "interface", "interfaceIndex", "address", "destination", "ruleId", "target", "durationMs", "count", "exitCode", "errorType", "socketError", "sha256", "version", "phase", "operation", "side", "direction", "sentBytes", "receivedBytes", "flow", "elapsedMs", "slowStage", "windowsBuild", "tunSupported", "destinationName", "resolver", "queryType", "reason", "waitCount", "readEof", "writeClosed", "source", "readWaitUs", "sendWaitUs", "receiveWaitUs", "queueWaitUs", "maxWaitUs", "rxQueuedBytes", "txQueuedBytes", "rxZeroWindowUs", "peerZeroWindowUs", "reassemblyDroppedPackets", "active", "fallback", "forwardedPackets", "receivedPackets", "droppedPackets", "packetBudgetBytes", "packetBudgetUsedBytes", "packetBudgetPeakBytes", "budgetDroppedPackets", "queueDroppedPackets", "totalUs", "maxUs", "rcode", "answerCount", "truncated" };
 
+    static ConnectionDiagnostics()
+    {
+        AllowedFields.UnionWith(["proxyQueueDrops","tunQueueDrops","queuedDatagrams","queuedBytes","receiveQueueDrops","cwndBytes","lostPackets","sentPackets","rttEstimateMs","ttlSeconds","dnsNameCount","tunDeliveredBytes","maxPacketBytes","mtu","icmpType","icmpCode","transport","nameSource"]);
+    }
     public ConnectionDiagnostics(string directory, string? runId = null)
     {
+        _files=new(directory);
         if (runId is not null && Guid.TryParseExact(runId, "N", out _)) _runId = runId;
         _writer = Task.Run(async () =>
         {
@@ -32,11 +40,33 @@ public sealed class ConnectionDiagnostics : IDisposable
             {
                 Directory.CreateDirectory(directory);
                 var path = Path.Combine(directory, "events.jsonl");
-                await foreach (var item in _pending.Reader.ReadAllAsync())
+                var resourcePath=Path.Combine(directory,"resources.jsonl");
+                string? resourceRun=null;
+                _files.Prune(true);
+                await foreach (var work in _pending.Reader.ReadAllAsync())
                 {
-                    if (File.Exists(path) && new FileInfo(path).Length > 2 * 1024 * 1024)
-                        File.Move(path, path + ".previous", overwrite: true);
-                    await File.AppendAllTextAsync(path, JsonSerializer.Serialize(item) + "\n");
+                    if(work.Control is { } control){await control();continue;}
+                    try {
+                    var item=work.Event!;
+                    _events.Enqueue(item);while(_events.Count>2048)_events.TryDequeue(out _);
+                    _files.Append(JsonSerializer.Serialize(item)+"\n");
+                    if(item.Code.StartsWith("RESOURCE_",StringComparison.Ordinal))
+                    {
+                        if(resourceRun!=item.RunId||!File.Exists(resourcePath)){await File.WriteAllTextAsync(resourcePath,"");resourceRun=item.RunId;}
+                        var line=JsonSerializer.Serialize(item)+"\n";
+                        if(new FileInfo(resourcePath).Length+System.Text.Encoding.UTF8.GetByteCount(line)>256*1024)
+                        {
+                            var rows=await File.ReadAllLinesAsync(resourcePath);
+                            var compact=CompactResourceRows(rows);
+                            await File.WriteAllTextAsync(resourcePath,compact);
+                            var marker=item with {Code="RESOURCE_REPORT_COMPACTED",Fields=new Dictionary<string,string>{{"count",Math.Max(0,rows.Length-compact.Count(c=>c=='\n')).ToString()}}};
+                            await File.AppendAllTextAsync(resourcePath,JsonSerializer.Serialize(marker)+"\n");
+                        }
+                        if(new FileInfo(resourcePath).Length+System.Text.Encoding.UTF8.GetByteCount(line)<=256*1024)
+                            await File.AppendAllTextAsync(resourcePath,line);
+                    }
+                    _files.Prune();
+                    }catch(IOException){Interlocked.Increment(ref _dropped);}catch(UnauthorizedAccessException){Interlocked.Increment(ref _dropped);}
                 }
             }
             catch (IOException) { Interlocked.Increment(ref _dropped); }
@@ -45,11 +75,20 @@ public sealed class ConnectionDiagnostics : IDisposable
     }
 
     public string RunId => Volatile.Read(ref _runId);
+    internal static string CompactResourceRows(string[] rows)
+    {
+        var head=new List<string>();var bytes=0;
+        foreach(var row in rows){var size=System.Text.Encoding.UTF8.GetByteCount(row)+1;if(bytes+size>32*1024)break;head.Add(row);bytes+=size;}
+        var tail=new List<string>();bytes=0;
+        for(var i=rows.Length-1;i>=head.Count;i--){var size=System.Text.Encoding.UTF8.GetByteCount(rows[i])+1;if(bytes+size>128*1024)break;tail.Add(rows[i]);bytes+=size;}
+        tail.Reverse();return string.Join('\n',head.Concat(tail))+"\n";
+    }
     public async Task CaptureNetworkAsync(string phase)
     {
+        var generation=Interlocked.Read(ref _clearGeneration);
         try
         {
-            _snapshots.Enqueue((RunId, await NetworkDiagnosticSnapshot.CaptureAsync(phase)));
+            var snapshot=await NetworkDiagnosticSnapshot.CaptureAsync(phase);if(generation!=Interlocked.Read(ref _clearGeneration))return;_snapshots.Enqueue((RunId,snapshot));
             while (_snapshots.Count > 12) _snapshots.TryDequeue(out _);
             Record("snapshot", "NETWORK_SNAPSHOT_OK", ("phase", phase));
         }
@@ -70,10 +109,17 @@ public sealed class ConnectionDiagnostics : IDisposable
         var safe = fields.Where(item => AllowedFields.Contains(item.Key))
             .ToDictionary(item => item.Key, item => Redact(item.Value).Substring(0, Math.Min(Redact(item.Value).Length, 256)));
         var item = new Event(1, DateTimeOffset.UtcNow, RunId, stage, code, safe);
-        _events.Enqueue(item);
-        while (_events.Count > 2048) _events.TryDequeue(out _);
-        if (!_pending.Writer.TryWrite(item)) Interlocked.Increment(ref _dropped);
+        if (!_pending.Writer.TryWrite(new Work(item))) Interlocked.Increment(ref _dropped);
     }
+    private async Task ControlAsync(Func<Task> action)
+    {
+        var done=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await _pending.Writer.WriteAsync(new Work(Control:async()=>{try{await action();done.SetResult();}catch(Exception error){done.SetException(error);}})).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(15));
+    }
+    public Task ConfigureAsync(JournalPolicy policy){policy.Validate();return ControlAsync(()=>{_files.Policy=new(){MaxMb=policy.MaxMb,Days=policy.Days};_files.Prune(true);return Task.CompletedTask;});}
+    public Task ClearAsync()=>ControlAsync(()=>{Interlocked.Increment(ref _clearGeneration);_files.Clear();_events.Clear();_snapshots.Clear();Interlocked.Exchange(ref _dropped,0);return Task.CompletedTask;});
+    public async Task<long> SizeAsync(){long size=0;await ControlAsync(()=>{_files.Prune(true);size=_files.Size();return Task.CompletedTask;});return size;}
 
     public static string Redact(string text, IEnumerable<string?>? secrets = null)
     {
@@ -89,11 +135,12 @@ public sealed class ConnectionDiagnostics : IDisposable
 
     public async Task ExportAsync(string path, IEnumerable<(string Engine, string Path)> binaries)
     {
-        var snapshot = _events.ToArray();
+        var snapshot=Array.Empty<Event>();
+        await ControlAsync(()=>{_files.Prune(true);snapshot=_files.Files().Where(p=>p.EndsWith(".jsonl")&&Path.GetFileName(p)!="resources.jsonl"||p.EndsWith(".jsonl.previous")).OrderBy(File.GetLastWriteTimeUtc).SelectMany(File.ReadLines).Select(line=>{try{return JsonSerializer.Deserialize<Event>(line);}catch{return null;}}).OfType<Event>().ToArray();return Task.CompletedTask;});
         var salt = RandomNumberGenerator.GetBytes(32);
         string Alias(string value) => "anon-" + Convert.ToHexString(HMACSHA256.HashData(salt, Encoding.UTF8.GetBytes(value)))[..16];
         var events = snapshot.Select(item => item with { Fields = item.Fields.ToDictionary(pair => pair.Key,
-            pair => pair.Key is "interface" or "address" or "destination" or "ruleId" ? Alias(pair.Value) : pair.Value) }).ToArray();
+            pair => pair.Key is "interface" or "address" or "destination" or "ruleId" or "destinationName" or "resolver" or "source" ? Alias(pair.Value) : pair.Value) }).ToArray();
         var hashes = new List<object>();
         foreach (var binary in binaries)
         {

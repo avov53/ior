@@ -1,0 +1,24 @@
+let journalBytes=null;
+const settingsBeforeLifecycle=settings;settings=function(){let html=settingsBeforeLifecycle();if(page!=='settings')return html;const s=snapshot?.settings||{};
+ if(category==='general'){
+ const check=(key,label,on)=>'<label class="setting-row"><strong>'+label+'</strong><input type="checkbox" data-lifecycle="'+key+'" '+(on?'checked':'')+'></label>';
+ const fields=check('launchWithWindows','Запускать вместе с Windows',s.launchWithWindows)+'<div data-startup-details '+(!s.launchWithWindows?'hidden':'')+'>'+check('connectAtWindowsStartup','Подключаться при автозапуске',s.connectAtWindowsStartup)+'<label class="feature-field" data-startup-profile '+(!s.connectAtWindowsStartup?'hidden':'')+'><span>Сервер для автоподключения</span><select data-lifecycle="windowsStartupProfileId"><option value="">Не выбран</option>'+(snapshot?.servers||[]).map(p=>'<option value="'+escape(p.id)+'" '+(p.id===s.windowsStartupProfileId?'selected':'')+'>'+escape(p.name)+'</option>').join('')+'</select></label></div>'+check('restoreAfterSleep','Сохранять и восстанавливать VPN после сна',s.restoreAfterSleep!==false)+'<p>'+escape(s.windowsStartupStatus||'Выключено')+'</p><small>Задача создаётся при включении настройки для входа текущего пользователя. Рабочее соединение после сна сохраняется; при обрыве восстанавливается тот же сервер.</small>'+button('lifecycle-save','Сохранить запуск и восстановление','outline');
+ html+=group('Запуск Windows и сон',fields);
+ }
+ if(category==='lan'){
+ html=html.replace(/<label class="setting-row"><strong>Использовать пароль<\/strong>[\s\S]*?<\/label>/,'<p>Пароль обязателен для LAN.</p>');
+ html+='<section class="card"><label class="feature-field"><span>Разрешённые IPv4-адреса устройств</span><textarea data-lan-option="allowedClientIps" placeholder="192.168.1.10&#10;192.168.1.11">'+escape((s.lan?.allowedClientIps||[]).join('\n'))+'</textarea></label><small>По одному адресу в строке. Пустой список запрещает доступ. При смене IP устройства обновите список.</small>'+button('lan-generate','Сгенерировать новый пароль','outline')+'</section>';
+ }
+ return html;
+};
+const logsBeforeStorage=logs;logs=function(){const p=snapshot?.settings?.journal||{maxMb:20,days:7};return '<section class="card"><h3>Хранение журнала</h3><p>Занято: '+(journalBytes==null?'нажмите «Обновить размер»':(journalBytes/1048576).toFixed(2)+' МиБ')+'</p><label>Максимум <select data-journal="maxMb">'+[5,20,50].map(n=>'<option '+(n===p.maxMb?'selected':'')+'>'+n+'</option>').join('')+'</select> МБ</label><label>Хранить <select data-journal="days">'+[1,7,30].map(n=>'<option '+(n===p.days?'selected':'')+'>'+n+'</option>').join('')+'</select> дней</label><p>Старые записи удаляются автоматически. Уменьшение лимита удаляет часть истории.</p>'+button('journal-save','Применить лимиты','outline')+button('journal-size','Обновить размер','outline')+button('journal-export','Экспорт диагностики','outline')+'</section>'+logsBeforeStorage();};
+root.addEventListener('change',event=>{if(event.target.dataset.lifecycle==='launchWithWindows')root.querySelector('[data-startup-details]').hidden=!event.target.checked;if(event.target.dataset.lifecycle==='connectAtWindowsStartup')root.querySelector('[data-startup-profile]').hidden=!event.target.checked;},true);
+const actionBeforeLifecycle=handleNativeAction;handleNativeAction=async function(action,id,el){
+ if(action==='lan-generate'){root.querySelector('[data-lan-option=password]').value=crypto.randomUUID().replaceAll('-','');showToast('Новый пароль создан. Нажмите «Сохранить».');return true;}
+ if(action==='lifecycle-save'){const data={};for(const field of root.querySelectorAll('[data-lifecycle]'))data[field.dataset.lifecycle]=field.type==='checkbox'?field.checked:field.value;await perform('lifecycle.settings',data);return true;}
+ if(action==='journal-save'){const data={};for(const field of root.querySelectorAll('[data-journal]'))data[field.dataset.journal]=Number(field.value);await perform('journal.settings',data,result=>{journalBytes=result.bytes;});return true;}
+ if(action==='journal-size'){await perform('journal.size',{},result=>{journalBytes=result.bytes;});return true;}
+ if(action==='journal-export'){if(confirm('Архив содержит обезличенные события, сетевые метрики и снимки маршрутов. Пароли, ключи и конфигурации не включаются. Экспортировать?'))await perform('diagnostics.export');return true;}
+ if(action==='lan-save'){const data={};for(const field of root.querySelectorAll('[data-lan-option]'))data[field.dataset.lanOption]=field.dataset.lanOption==='allowedClientIps'?field.value.split(/[\s,;]+/).filter(Boolean):field.type==='checkbox'?field.checked:field.type==='number'?Number(field.value):field.value;data.authEnabled=true;await perform('lan.settings',data);return true;}
+ return actionBeforeLifecycle(action,id,el);
+};

@@ -43,6 +43,7 @@ enum TcpSocketState {
 }
 
 struct TcpSocketControl {
+    abort_requested: bool,
     send_buffer: RingBuffer<'static, u8>,
     send_waker: Option<Waker>,
     recv_buffer: RingBuffer<'static, u8>,
@@ -154,6 +155,7 @@ impl TcpListenerRunner {
                 trace!("created TCP connection for {} <-> {}", src_addr, dst_addr);
 
                 let control = Arc::new(SpinMutex::new(TcpSocketControl {
+                    abort_requested: false,
                     send_buffer: RingBuffer::new(vec![0u8; tcp_send_buffer_size as usize]),
                     send_waker: None,
                     recv_buffer: RingBuffer::new(vec![0u8; tcp_recv_buffer_size as usize]),
@@ -251,6 +253,15 @@ impl TcpListenerRunner {
                 // drained into the smoltcp socket.  Closing earlier transitions
                 // the socket to FIN_WAIT_1, making can_send() return false, so
                 // the send loop below never runs and the remaining data is lost.
+                if control.abort_requested {
+                    control.abort_requested=false;
+                    socket.abort();
+                    // Leave the socket installed until the next interface poll
+                    // has emitted the reset, then the Closed branch recycles it.
+                    control.send_state=TcpSocketState::Closing;
+                    control.recv_state=TcpSocketState::Closing;
+                    continue;
+                }
                 if matches!(control.send_state, TcpSocketState::Close)
                     && control.send_buffer.is_empty()
                 {
@@ -493,6 +504,8 @@ impl Drop for TcpStream {
 }
 
 impl TcpStream {
+    /// A handle retained by the owner after moving this stream into a relay.
+    pub fn abort_handle(&self)->TcpAbortHandle {TcpAbortHandle{control:self.control.clone(),notify:self.notify.clone()}}
     pub fn local_addr(&self) -> &SocketAddr {
         &self.src_addr
     }
@@ -500,6 +513,12 @@ impl TcpStream {
     pub fn remote_addr(&self) -> &SocketAddr {
         &self.dst_addr
     }
+}
+
+#[derive(Clone)]
+pub struct TcpAbortHandle {control:SharedControl,notify:SharedNotify}
+impl TcpAbortHandle {
+    pub fn abort(&self){self.control.lock().abort_requested=true;self.notify.notify_one();}
 }
 
 impl AsyncRead for TcpStream {

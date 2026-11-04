@@ -322,8 +322,7 @@ public static class SingBoxConfigBuilder
 
     private static HappRoutingProfile? ActiveRoutingProfile(AppState state)
     {
-        return state.HappRoutingProfiles.FirstOrDefault(profile => profile.Id == state.SelectedHappRoutingProfileId) ??
-               state.HappRoutingProfiles.FirstOrDefault();
+        return RoutingSelectionPolicy.Effective(state);
     }
 
     private static string HappRuleSetTag(int index)

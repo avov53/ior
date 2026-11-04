@@ -24,7 +24,8 @@ public sealed record SubscriptionFetchResult(
     bool IsClashYaml = false,
     HappRoutingProfile? ClashRouting = null,
     string? ImportWarning = null,
-    int RemovedProtocolCount = 0);
+    int RemovedProtocolCount = 0,
+    bool RequiresHwid = false);
 
 public sealed record SubscriptionMergeResult(int Added, int Updated, int Removed, string? Warning);
 
@@ -46,22 +47,32 @@ public static class SubscriptionService
         return target.AbsoluteUri;
     }
 
+    // Identity-bearing callers must use SubscriptionHwid.CreateClient (automatic redirects disabled).
     public static async Task<SubscriptionFetchResult> FetchAsync(
         HttpClient client,
         string url,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        SubscriptionRequestIdentity? identity = null,
+        HttpClient? ruleProviderClient = null)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, NormalizeUrl(url));
-        request.Headers.TryAddWithoutValidation("User-Agent", "ior/1.2.2");
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
+        var fetched = await SubscriptionHwid.SendAsync(client, url, identity, cancellationToken);
+        using var response = fetched.Response;
+        if (SubscriptionHwid.Flag(response, "x-hwid-max-devices-reached") || SubscriptionHwid.Flag(response, "x-hwid-limit"))
+            throw new SubscriptionHwidException("limit", fetched.Origin, "Сервис сообщил о достижении лимита устройств. Прежние серверы сохранены.");
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        var required = SubscriptionHwid.Flag(response, "subscription-always-hwid-enable") || SubscriptionHwid.Flag(response, "x-hwid-not-supported") || SubscriptionHwid.BodyRequires(body);
+        if (required && !fetched.Sent)
+            throw new SubscriptionHwidException(fetched.Origin.StartsWith("https://", StringComparison.Ordinal) ? "required" : "httpsRequired", fetched.Origin,
+                "Подписка требует HWID. Разрешите передачу идентификатора для этой подписки по HTTPS.");
+        if (fetched.Sent && SubscriptionHwid.Flag(response, "x-hwid-not-supported"))
+            throw new SubscriptionHwidException("rejected", fetched.Origin, "Сервис не принял HWID ior. Проверьте требования провайдера или ручной идентификатор.");
+        if (!response.IsSuccessStatusCode) throw new HttpRequestException("Подписка: HTTP " + (int)response.StatusCode, null, response.StatusCode);
+        body = SubscriptionHwid.ContentWithoutDirective(body);
         var isClashYaml = ClashSubscriptionParser.LooksLikeClash(body);
         var clash = isClashYaml ? ClashSubscriptionParser.Parse(body) : null;
         string? importWarning=null;
         if(clash?.Routing is { } embeddedRoute)
-            try { await NativeRuleProviderCache.PrepareAsync(embeddedRoute,client,cancellationToken); }
+            try { await NativeRuleProviderCache.PrepareAsync(embeddedRoute,ruleProviderClient ?? client,cancellationToken); }
             catch(FormatException error) { importWarning=error.Message+". Маршрут сохранён, но подключение с отсутствующим RULE-SET будет заблокировано."; }
         if(!isClashYaml && body.TrimStart().StartsWith('{'))
         {
@@ -101,7 +112,7 @@ public static class SubscriptionService
             refreshInterval,
             isClashYaml,
             clash?.Routing,
-            importWarning, parsed.RemovedProtocolCount);
+            importWarning, parsed.RemovedProtocolCount, required);
     }
 
     public static SubscriptionMergeResult Apply(
@@ -117,7 +128,9 @@ public static class SubscriptionService
             throw new InvalidOperationException("The subscription contains no supported servers.");
         }
 
-        var previous = state.Profiles.Where(x => x.SubscriptionId == subscription.Id).ToList();
+        if(result.Profiles.Count==0) {subscription.ImportWarning=RemovedProtocolPolicy.Message+" Пропущено: "+result.RemovedProtocolCount;subscription.LastError=RemovedProtocolPolicy.Message;return new SubscriptionMergeResult(0,0,0,RemovedProtocolPolicy.Message);}
+        subscription.ImportWarning=result.RemovedProtocolCount>0?RemovedProtocolPolicy.Message+" Пропущено: "+result.RemovedProtocolCount:null;
+        var previous = state.Profiles.Where(x => x.SubscriptionId == subscription.Id && !RemovedProtocolPolicy.IsRemoved(x)).ToList();
         var previousByIdentity = previous
             .GroupBy(ProfileIdentity, StringComparer.Ordinal)
             .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
@@ -151,7 +164,7 @@ public static class SubscriptionService
 
         var insertIndex = state.Profiles.FindIndex(x => x.SubscriptionId == subscription.Id);
         if (insertIndex < 0) insertIndex = state.Profiles.Count;
-        state.Profiles.RemoveAll(x => x.SubscriptionId == subscription.Id);
+        state.Profiles.RemoveAll(x => x.SubscriptionId == subscription.Id && !RemovedProtocolPolicy.IsRemoved(x));
         state.Profiles.InsertRange(Math.Min(insertIndex, state.Profiles.Count), next);
 
         var removed = previous.Count(x => next.All(y => y.Id != x.Id));
@@ -174,11 +187,14 @@ public static class SubscriptionService
         subscription.TotalBytes = hasTotal ? result.TotalBytes : null;
         subscription.ExpireUtc = result.ExpireUtc;
         subscription.SupportUrl = result.SupportUrl;
+        subscription.RequiresHwid = result.RequiresHwid;
+        subscription.HwidRequiredOrigin = null;
+        subscription.HwidFailureCode = null;
+        subscription.IsClashYaml = result.IsClashYaml;
         subscription.ProfileWebPageUrl = result.ProfileWebPageUrl;
         subscription.Announcement = result.Announcement;
         subscription.ServerRefreshIntervalHours = result.RefreshIntervalHours;
-        if (!subscription.RefreshIntervalIsCustom && result.RefreshIntervalHours is { } serverHours)
-            subscription.RefreshIntervalHours = serverHours;
+        // Server intervals are mandatory; keep the user interval for when the header disappears.
         subscription.LastUpdatedUtc = DateTime.UtcNow;
         subscription.LastError = null;
         subscription.LastImportedServers = next.Count;
@@ -204,7 +220,7 @@ public static class SubscriptionService
         if (state.SelectedHappRoutingProfileId is not null &&
             state.HappRoutingProfiles.All(x => x.Id != state.SelectedHappRoutingProfileId))
         {
-            state.SelectedHappRoutingProfileId = state.HappRoutingProfiles.FirstOrDefault()?.Id;
+            state.SelectedHappRoutingProfileId = null;
         }
         if (state.SelectedProfileId is not null && state.Profiles.All(x => x.Id != state.SelectedProfileId))
         {
@@ -222,6 +238,7 @@ public static class SubscriptionService
             profile.PublicKey, profile.ShortId, profile.Fingerprint, profile.Security, profile.AlterId?.ToString(),
             profile.Network, profile.Host, profile.Path, profile.ServiceName, profile.ObfsType,
             profile.ObfsPassword, profile.PrivateKey, profile.PeerPublicKey, profile.PreSharedKey,
+            string.Join(";",profile.Awg.OrderBy(item=>item.Key,StringComparer.Ordinal).Select(item=>item.Key+"="+item.Value)),
             profile.LocalAddress, profile.AllowedIps, profile.PersistentKeepalive?.ToString(), profile.Mtu?.ToString()
         };
         var canonical = string.Join('\n', parts.Select(x => x?.Trim() ?? ""));
@@ -238,11 +255,15 @@ public static class SubscriptionService
             : "Subscription";
     }
 
+    public static void ResolveRoutingConsent(AppState state,ProxySubscription subscription,bool accept) {subscription.RouteConsent=accept?"accepted":"declined";if(accept&&subscription.PendingRoute is {} pending){SynchronizeRouting(state,subscription,pending);state.SelectedHappRoutingProfileId=subscription.RoutingProfileId;foreach(var workspace in state.ConnectionProfiles.Where(w=>w.SubscriptionId==subscription.Id))workspace.RoutingProfileId=subscription.RoutingProfileId;}else if(state.SelectedHappRoutingProfileId==subscription.RoutingProfileId)state.SelectedHappRoutingProfileId="none";}
+    public static void RestoreRouting(AppState state, ProxySubscription sub, SubscriptionFetchResult result) => SynchronizeRouting(state,sub,result);
     private static string? SynchronizeRouting(
         AppState state,
         ProxySubscription subscription,
         SubscriptionFetchResult result)
     {
+        if(result.RoutingEnabled==true || result.ClashRouting is not null)subscription.PendingRoute=result with {Profiles=[]};
+        subscription.RouteConsent="accepted";
         if (result.IsClashYaml)
         {
             var oldId = subscription.RoutingProfileId;
@@ -280,6 +301,7 @@ public static class SubscriptionService
 
         if (result.RoutingEnabled == false)
         {
+            subscription.PendingRoute=null;
             var oldId = subscription.RoutingProfileId;
             subscription.RoutingProfileId = null;
             RemoveUnusedManagedRoute(state, oldId);
@@ -299,7 +321,7 @@ public static class SubscriptionService
         }
 
         var oldRouteId = subscription.RoutingProfileId;
-        var profile = state.HappRoutingProfiles.FirstOrDefault(x => x.Source == RoutingProfileSource.Happ && x.Links.SequenceEqual(links, StringComparer.OrdinalIgnoreCase));
+        var profile = state.HappRoutingProfiles.FirstOrDefault(x => x.Source == RoutingProfileSource.Happ && x.ManagedBySubscriptionId == subscription.Id && x.Links.SequenceEqual(links, StringComparer.OrdinalIgnoreCase));
         profile ??= state.HappRoutingProfiles.FirstOrDefault(x => x.Id == oldRouteId &&
             !state.Subscriptions.Any(other => other.Id != subscription.Id && other.RoutingProfileId == oldRouteId));
         if (profile is null)
@@ -311,10 +333,7 @@ public static class SubscriptionService
                 ManagedBySubscriptionId = subscription.Id
             };
             state.HappRoutingProfiles.Add(profile);
-            if (string.IsNullOrWhiteSpace(state.SelectedHappRoutingProfileId))
-            {
-                state.SelectedHappRoutingProfileId = profile.Id;
-            }
+
         }
         else
         {
@@ -325,6 +344,7 @@ public static class SubscriptionService
             }
         }
 
+        profile.ManagedBySubscriptionId=subscription.Id;
         subscription.RoutingProfileId = profile.Id;
         if (oldRouteId != profile.Id) RemoveUnusedManagedRoute(state, oldRouteId);
         return null;

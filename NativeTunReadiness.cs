@@ -12,7 +12,7 @@ public static class NativeTunReadiness
     public static async Task<NativeTunReadinessResult> CheckAsync(
         Func<CancellationToken,Task> https, Func<CancellationToken,Task> dns,
         Func<CancellationToken,Task> udp, CancellationToken token,
-        TimeSpan? optionalTimeout = null)
+        TimeSpan? optionalTimeout = null, bool requireDns = false)
     {
         using var lifetime=CancellationTokenSource.CreateLinkedTokenSource(token);
         async Task<TunProbeStatus> Probe(string name,Func<CancellationToken,Task> probe,bool optional)
@@ -29,14 +29,15 @@ public static class NativeTunReadiness
                 return new("error",code.Length==0?name+"_"+error.GetType().Name.ToUpperInvariant():code,watch.ElapsedMilliseconds);
             }
         }
-        var dnsTask=Probe("DNS",dns,true);
+        var dnsTask=Probe("DNS",dns,!requireDns);
         var udpTask=Probe("UDP",udp,true);
         var httpsTask=Probe("HTTPS",https,false);
         var result=await httpsTask;
         if(result.Status!="ready")lifetime.Cancel();
         await Task.WhenAll(dnsTask,udpTask);
         token.ThrowIfCancellationRequested();
-        return new(result.Status=="ready",result,await dnsTask,await udpTask);
+        var dnsResult=await dnsTask;
+        return new(result.Status=="ready"&&(!requireDns||dnsResult.Status=="ready"),result,dnsResult,await udpTask);
     }
     internal static string ProbeErrorCode(Exception error)
     {

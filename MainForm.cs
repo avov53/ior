@@ -14,7 +14,7 @@ namespace HappBox;
 
 public sealed partial class MainForm : Form
 {
-    private const string AppVersion = "1.2.2";
+    private static readonly string AppVersion = UpdateReleasePolicy.InstalledVersion(typeof(MainForm).Assembly);
     private const string GitHubRepositoryUrl = "https://github.com/avov53/ior";
     private const string GitHubLatestReleaseApiUrl = "https://api.github.com/repos/avov53/ior/releases/latest";
     private const int SingBoxStartupTimeoutMs = 6000;
@@ -182,6 +182,7 @@ public sealed partial class MainForm : Form
         SaveState();
 
         Text = "ior";
+        Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         AutoScaleMode = AutoScaleMode.Dpi;
         AutoScaleDimensions = new SizeF(96f, 96f);
         var workingArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1220, 810);
@@ -191,7 +192,7 @@ public sealed partial class MainForm : Form
             (int)Math.Round(900 * DeviceDpi / 96d),
             (int)Math.Round(620 * DeviceDpi / 96d));
         StartPosition = FormStartPosition.CenterScreen;
-        FormBorderStyle = FormBorderStyle.Sizable;
+        FormBorderStyle = FormBorderStyle.None;
         BackColor = Bg;
         Font = new Font("Segoe UI", 9.5f);
         DoubleBuffered = true;
@@ -201,6 +202,7 @@ public sealed partial class MainForm : Form
         _trafficTimer.Tick += async (_, _) =>
         {
             UpdateTrafficStats();
+            await RefreshLanAsync();
             await UpdatePingAndServicesAsync();
         };
         _serverTree.ProfileSelected += (_, profile) => SelectProfile(profile, save: true);
@@ -217,7 +219,7 @@ public sealed partial class MainForm : Form
         _latencyMonitor.Updated += (_, _) =>
         {
             if (IsDisposed || !IsHandleCreated) return;
-            BeginInvoke(new Action(RefreshLatencyUi));
+            BeginInvoke(new Action(()=>{RefreshLatencyUi();PushWebSnapshot(includeLogs:false);}));
         };
         _profileDragHoldTimer.Tick += (_, _) => BeginProfileDrag();
         _navResponsiveTimer.Tick += (_, _) =>
@@ -240,6 +242,8 @@ public sealed partial class MainForm : Form
         ResetTrafficCounters();
         RecoverConnectionState();
         RegisterXrayNetworkRecovery();
+        if(_state.Lan.AllowedClientIps is null){_state.Lan.Enabled=false;_state.Lan.AllowedClientIps=[];SaveState();}
+        _=Diagnostics.ConfigureAsync(_state.Journal);
         QueueCountryLookups(_state.Profiles);
         _latencyMonitor.SetProfiles(_state.Profiles, _state.SelectedProfileId);
         ApplyPowerSavingMode();
@@ -250,8 +254,9 @@ public sealed partial class MainForm : Form
         {
             var skipStartupNetwork = string.Equals(Environment.GetEnvironmentVariable("IOR_SKIP_STARTUP_NETWORK"), "1", StringComparison.Ordinal);
             if (!skipStartupNetwork) _ = CheckForStartupUpdateAsync();
-            if (!skipStartupNetwork)
-                await RefreshDueSubscriptionsAsync();
+            if (!skipStartupNetwork&&!Program.UpdateRestart)
+                {if(Program.WindowsAutostart){await RunWindowsStartupAsync();}else{await RefreshDueSubscriptionsAsync();await RunSubscriptionStartupAsync();}}
+            if(_state.LaunchWithWindows){_windowsStartupStatus=await WindowsStartup.StatusAsync();PushWebSnapshot();}
         };
     }
 
@@ -278,6 +283,7 @@ public sealed partial class MainForm : Form
         _trayIcon.Dispose();
         _statusProbeCts?.Cancel();
         _serviceProbeClient.Dispose();
+        _subscriptionClient.Dispose();
         FlushPendingProcessLogs();
         _logFlushTimer.Stop();
         _logFlushTimer.Dispose();
@@ -3280,21 +3286,23 @@ public sealed partial class MainForm : Form
         return panel;
     }
 
-    private async Task CheckForStartupUpdateAsync()
+    private async Task CheckForStartupUpdateAsync(bool manual=false)
     {
         try
         {
             var release = await GetLatestReleaseAsync();
-            if (release is null) return;
+            if (release is null){if(manual){_availableUpdate=null;_updateUiState=UpdateUiState.NotChecked;PushWebSnapshot();}return;}
             if (IsNewerVersion(release.Tag, AppVersion))
             {
-                _availableUpdate = release;
+                if(manual)_dismissedUpdateTags.Remove(release.Tag);
+                _updateError=null;_availableUpdate = release;
                 _updateUiState = UpdateUiState.Available;
                 PushWebSnapshot(includeLogs: false);
-            }
+            }else if(manual){_availableUpdate=null;_updateUiState=UpdateUiState.NotChecked;PushWebSnapshot();}
         }
         catch (Exception ex)
         {
+            if(manual)throw;
             Log($"Startup update check failed: {FormatExceptionChain(ex)}");
         }
     }
@@ -3360,9 +3368,13 @@ public sealed partial class MainForm : Form
         return UpdateReleasePolicy.Parse(root, GitHubRepositoryUrl + "/releases/latest", IsWindows10Package());
     }
 
+    private readonly HashSet<string> _dismissedUpdateTags=new(StringComparer.Ordinal);
+    private async Task DownloadAndApplyUpdateAsync(){if(_updateDownloadRunning||_shutdownRequested)return;await DownloadUpdateAsync();if(_updateUiState==UpdateUiState.Ready)ApplyStagedUpdate();}
     private async Task DownloadUpdateAsync()
     {
         var release = _availableUpdate ?? throw new InvalidOperationException("Сведения об обновлении отсутствуют.");
+        if (!IsNewerVersion(release.Tag, AppVersion))
+            throw new InvalidOperationException("Установлена актуальная версия приложения.");
         if (string.IsNullOrWhiteSpace(release.AssetDownloadUrl))
         {
             OpenExternalUrl(release.ReleaseUrl);
@@ -3371,7 +3383,7 @@ public sealed partial class MainForm : Form
         if (_updateDownloadRunning) return;
         _updateDownloadRunning = true;
         var updateRoot = Path.Combine(Path.GetTempPath(), "ior-update-" + Guid.NewGuid().ToString("N"));
-        var zipPath = Path.Combine(updateRoot, release.AssetName ?? "ior-update.zip");
+        var zipPath = Path.Combine(updateRoot, "package.zip");
         var extractPath = Path.Combine(updateRoot, "files");
 
         try
@@ -3411,6 +3423,14 @@ public sealed partial class MainForm : Form
                 throw new InvalidOperationException(T("update.exe.missing"));
             }
 
+            var marker=IsWindows10Package()?"ior.win10":"ior.win11";var wrongMarker=IsWindows10Package()?"ior.win11":"ior.win10";
+            if(!File.Exists(Path.Combine(sourcePath,marker))||File.Exists(Path.Combine(sourcePath,wrongMarker))||!File.Exists(Path.Combine(sourcePath,"ior.dll"))||!File.Exists(Path.Combine(sourcePath,"core","ior-core","ior-core.exe")))throw new InvalidOperationException("Архив обновления не соответствует пакету Windows или неполон.");
+            var managedVersion=System.Reflection.AssemblyName.GetAssemblyName(Path.Combine(sourcePath,"ior.dll")).Version?.ToString()??"";
+            if(!UpdateReleasePolicy.CanInstall(release.Tag,managedVersion,AppVersion))throw new InvalidOperationException("Версия библиотеки приложения не соответствует релизу.");
+            var downloadedVersion = FileVersionInfo.GetVersionInfo(Path.Combine(sourcePath, "ior.exe")).ProductVersion ?? "";
+            if (!UpdateReleasePolicy.CanInstall(release.Tag, downloadedVersion, AppVersion))
+                throw new InvalidOperationException("Версия приложения в архиве не соответствует новому релизу GitHub.");
+
             _stagedUpdatePath = sourcePath;
             _stagedUpdateRoot = updateRoot;
             _updatePercent = 100;
@@ -3435,8 +3455,9 @@ public sealed partial class MainForm : Form
         if (_updateUiState != UpdateUiState.Ready || string.IsNullOrWhiteSpace(_stagedUpdatePath))
             throw new InvalidOperationException("Обновление ещё не подготовлено.");
         if (string.IsNullOrWhiteSpace(_stagedUpdateRoot)) throw new InvalidOperationException("Не найдена папка подготовленного обновления.");
-        StartUpdateScript(_stagedUpdatePath, _stagedUpdateRoot);
-        Application.Exit();
+        var source=_stagedUpdatePath;var root=_stagedUpdateRoot;
+        _afterNetworkShutdown=()=>WindowsUpdateInstaller.Start(source,root);
+        _allowExit=true;Close();
     }
 
     private static string ResolveExtractedUpdateRoot(string extractPath)
@@ -3460,40 +3481,6 @@ public sealed partial class MainForm : Form
 
         var nestedExe = Directory.GetFiles(extractPath, "ior.exe", SearchOption.AllDirectories).FirstOrDefault();
         return nestedExe is null ? extractPath : Path.GetDirectoryName(nestedExe) ?? extractPath;
-    }
-
-    private static void StartUpdateScript(string sourcePath, string updateRoot)
-    {
-        var appDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        var scriptPath = Path.Combine(Path.GetTempPath(), "ior-update-" + Guid.NewGuid().ToString("N") + ".cmd");
-        var pid = Environment.ProcessId;
-        var script = $"""
-@echo off
-setlocal
-set "SRC={sourcePath}"
-set "DST={appDir}"
-set "UPDATEROOT={updateRoot}"
-set "PID={pid}"
-:wait
-tasklist /FI "PID eq %PID%" | find "%PID%" >nul
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto wait
-)
-robocopy "%SRC%" "%DST%" /E /R:3 /W:1 /NFL /NDL /NJH /NJS >nul
-rmdir /S /Q "%UPDATEROOT%" >nul 2>&1
-start "" "%DST%\ior.exe"
-endlocal
-del "%~f0"
-""";
-        File.WriteAllText(scriptPath, script);
-        Process.Start(new ProcessStartInfo
-        {
-            FileName = scriptPath,
-            UseShellExecute = true,
-            WorkingDirectory = appDir,
-            WindowStyle = ProcessWindowStyle.Hidden
-        });
     }
 
     private static bool IsNewerVersion(string latest, string current) => UpdateReleasePolicy.IsNewer(latest, current);
@@ -4575,8 +4562,19 @@ del "%~f0"
         {
             try
             {
-                var fetched = await SubscriptionService.FetchAsync(_httpClient, importText);
+                var fetched = await FetchSubscriptionAsync(importText);
                 return CommitSubscription(importText, requestedSubscriptionName, fetched);
+            }
+            catch (SubscriptionHwidException ex)
+            {
+                var url = SubscriptionService.NormalizeUrl(importText);
+                var sub = _state.Subscriptions.FirstOrDefault(item => item.Url.Equals(url, StringComparison.Ordinal));
+                if (sub is null)
+                {
+                    sub = new ProxySubscription { RouteConsent="ask", Url = url, Name = requestedSubscriptionName ?? SubscriptionService.DefaultName(url), NameIsCustom = !string.IsNullOrWhiteSpace(requestedSubscriptionName) };
+                    _state.Subscriptions.Add(sub);
+                }
+                RememberHwidFailure(sub, ex, prompt: true); return true;
             }
             catch (Exception ex)
             {
@@ -4618,6 +4616,7 @@ del "%~f0"
         }
 
         _state.SelectedProfileId = parsed[0].Id;
+        ConnectionWorkspaceService.AttachConfigurations(_state, parsed);
         RefreshProfiles();
         RefreshMainPreview();
         SaveState();
@@ -4630,14 +4629,14 @@ del "%~f0"
         url = SubscriptionService.NormalizeUrl(url);
         if (fetched.Profiles.Count == 0)
         {
-            MessageBox.Show(T("import.none"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(fetched.RemovedProtocolCount>0?RemovedProtocolPolicy.Message:T("import.none"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
             return false;
         }
 
         var subscription = _state.Subscriptions.FirstOrDefault(x =>
-            x.Url.Equals(url, StringComparison.OrdinalIgnoreCase));
+            x.Url.Equals(url, StringComparison.Ordinal));
         var isNew = subscription is null;
-        subscription ??= new ProxySubscription { Url = url };
+        subscription ??= new ProxySubscription { RouteConsent="ask", Url = url };
         if (!string.IsNullOrWhiteSpace(requestedName))
         {
             subscription.Name = requestedName.Trim();
@@ -4669,7 +4668,14 @@ del "%~f0"
         }
     }
 
-    private async Task RefreshSubscriptionAsync(ProxySubscription subscription, bool showErrors = false)
+    private readonly Dictionary<string,Task> _subscriptionRefreshTasks=new();
+    private Task RefreshSubscriptionAsync(ProxySubscription subscription,bool showErrors=false,bool requestHwidConsent=false){
+        if(_subscriptionRefreshTasks.TryGetValue(subscription.Id,out var pending))return pending;
+        var completion=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);_subscriptionRefreshTasks[subscription.Id]=completion.Task;
+        async Task Run(){try{await RefreshSubscriptionCoreAsync(subscription,showErrors,requestHwidConsent);completion.SetResult();}catch(Exception e){completion.SetException(e);}finally{_subscriptionRefreshTasks.Remove(subscription.Id);}}
+        _=Run();return completion.Task;
+    }
+    private async Task RefreshSubscriptionCoreAsync(ProxySubscription subscription, bool showErrors = false, bool requestHwidConsent = false)
     {
         if (!_subscriptionsRefreshing.Add(subscription.Id)) return;
         var stopwatch = Stopwatch.StartNew();
@@ -4677,13 +4683,17 @@ del "%~f0"
         RefreshProfiles();
         try
         {
-            var fetched = await SubscriptionService.FetchAsync(_httpClient, subscription.Url);
+            var fetched = await FetchSubscriptionAsync(subscription.Url, subscription: subscription);
             subscription.LastResponseMs = stopwatch.ElapsedMilliseconds;
             var previousSelectedId = _state.SelectedProfileId;
             var merged = SubscriptionService.Apply(_state, subscription, fetched);
             ConnectionWorkspaceService.ReconcileAfterRefresh(_state, subscription, previousSelectedId);
             if (!string.IsNullOrWhiteSpace(merged.Warning)) Log(merged.Warning);
             Log($"Subscription {subscription.Name} refreshed: +{merged.Added}, updated {merged.Updated}, removed {merged.Removed}.");
+        }
+        catch (SubscriptionHwidException ex)
+        {
+            RememberHwidFailure(subscription, ex, requestHwidConsent || showErrors);
         }
         catch (Exception ex)
         {
@@ -4714,7 +4724,7 @@ del "%~f0"
         var tasks = _state.Subscriptions.ToList().Select(async subscription =>
         {
             await gate.WaitAsync();
-            try { await RefreshSubscriptionAsync(subscription, showErrors: false); }
+            try { if (!startup || !AwaitingHwidPermission(subscription)) await RefreshSubscriptionAsync(subscription, showErrors: false, requestHwidConsent: !startup); }
             finally { gate.Release(); }
         });
         await Task.WhenAll(tasks);
@@ -4793,8 +4803,9 @@ del "%~f0"
         SaveState();
     }
 
-    private async Task<bool> ToggleConnectionAsync()
+    private async Task<bool> ToggleConnectionAsync(bool fromStartup=false)
     {
+        if(!fromStartup){_subscriptionStartupCancellation.Cancel();CancelBackgroundConnectionActions();}
         if (_shutdownRequested) return false;
         if (IsNativeTunValidationRunning()) { Log("Дождитесь завершения базовой проверки Reality TUN."); return false; }
         if (_connectionTransitionInProgress) return false;
@@ -4818,6 +4829,7 @@ del "%~f0"
             else
             {
                 SetConnectionVisualState(ConnectionVisualState.Connecting);
+                RoutingSelectionPolicy.ForServer(_state, SelectedProfile());
                 if (!await StartSingBoxAsync())
                 {
                     await ShowConnectionFailedAsync();
@@ -4852,8 +4864,9 @@ del "%~f0"
     private static bool IsWindows10Package()
     {
         var baseDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        return File.Exists(Path.Combine(baseDir, "ior.win10")) ||
-               Path.GetFileName(baseDir).Equals("windows-10", StringComparison.OrdinalIgnoreCase);
+        var marked = File.Exists(Path.Combine(baseDir, "ior.win10")) ||
+                     Path.GetFileName(baseDir).Equals("windows-10", StringComparison.OrdinalIgnoreCase);
+        return WindowsPackagePolicy.UseWindows10Compatibility(Environment.OSVersion.Version, marked);
     }
 
     private async Task<bool> ApplyConnectionModeAsync(bool tunEnabled)
@@ -5042,6 +5055,7 @@ del "%~f0"
 
     private Task<bool> StartSingBoxAsync(ProxyProfile? overrideProfile = null)
     {
+        if(overrideProfile is null)RoutingSelectionPolicy.ForServer(_state,SelectedProfile());
         Interlocked.Increment(ref _processLogGeneration);
         _runtimeConnectionWarning = null;
         return _state.SelectedCore switch
@@ -5120,6 +5134,13 @@ del "%~f0"
 
         if (!TryWriteConfig(profile, resolvedServer, outboundInterface) || !ValidateSingBoxConfig())
         {  return false; }
+
+        if (_state.TunEnabled)
+        {
+            using var config = JsonDocument.Parse(File.ReadAllText(_configPath));
+            var tun = config.RootElement.GetProperty("inbounds").EnumerateArray().First(item => item.GetProperty("type").GetString() == "tun");
+            Log($"sing-box TUN: Windows={Environment.OSVersion.Version.Build} · compatibility={_state.Windows10TunCompatibilityMode} · mtu={tun.GetProperty("mtu")} · stack={tun.GetProperty("stack")} · autoRoute={tun.GetProperty("auto_route")} · strictRoute={tun.GetProperty("strict_route")}");
+        }
 
         var startInfo = new ProcessStartInfo
         {
@@ -5492,6 +5513,8 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
 
     private void SetConnected()
     {
+        var connectedProfile=_state.Profiles.FirstOrDefault(p=>p.Id==_state.RunningServerId)??SelectedProfile();if(connectedProfile?.SubscriptionId is {} subId){var subscription=_state.Subscriptions.FirstOrDefault(s=>s.Id==subId);if(subscription is not null)subscription.LastUsedServerId=connectedProfile.Id;}
+        _lanSignature="";
         _connectedAt = _state.ActiveConnectionStartedUtc is { } startedUtc
             ? startedUtc.ToLocalTime()
             : DateTime.Now;
@@ -5523,7 +5546,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
     {
         _statusProbeCts?.Cancel();
         var previous = _serviceProbeClient;
-        var useProxy = connected && !_state.TunEnabled && _state.MixedProxyEnabled;
+        var useProxy = connected && (_state.MixedProxyEnabled || _state.RunningCore == CoreKind.IorCore);
         _serviceProbeClient = new HttpClient(new SocketsHttpHandler
         {
             UseProxy = useProxy,
@@ -5766,9 +5789,9 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
             var profile = SelectedProfile();
             if (profile is not null)
             {
-                var latency = _latencyMonitor.SnapshotFor(profile)?.Current;
-                _lastLatencyMs = latency;
-                _pingValue.Text = latency is null ? "-" : $"{latency.Value} ms";
+                var snapshot = _latencyMonitor.SnapshotFor(profile);
+                _lastLatencyMs = snapshot?.Current;
+                _pingValue.Text = snapshot?.Display ?? "—";
             }
 
             _healthyServiceCount = 0;
@@ -5776,7 +5799,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
             var targets = _state.ServiceMonitorTargets.ToArray();
             await Task.WhenAll(targets.Select(target => UpdateServiceStatusAsync(target, token)));
             if (token.IsCancellationRequested || version != _statusProbeVersion) return;
-            UpdateConnectionQuality(profile);
+            UpdateConnectionQuality(profile);PushWebSnapshot(includeLogs:false);
         }
         finally
         {
@@ -6012,7 +6035,8 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
         var snapshot = _latencyMonitor.SnapshotFor(selected);
         _latencyChart.SetSnapshot(snapshot);
         _lastLatencyMs = snapshot?.Current;
-        _pingValue.Text = snapshot?.Current is { } latency ? $"{latency} ms" : "-";
+        _pingValue.Text = snapshot?.Display ?? "—";
+        _navToolTip.SetToolTip(_pingValue,"Задержка до сервера, не скорость VPN. Обновляется по клику на конфигурацию.");
         UpdateConnectionQuality(selected);
     }
 
@@ -6102,7 +6126,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
                 if (LooksLikeSubscriptionUrl(text))
                 {
                     previewLabel.Text = _state.Language == AppLanguage.Russian ? "Загрузка подписки..." : "Loading subscription...";
-                    var fetched = await SubscriptionService.FetchAsync(_httpClient, text, token);
+                    var fetched = await FetchSubscriptionAsync(text, token);
                     if (token.IsCancellationRequested) return;
                     previewResult = fetched;
                     previewUrl = text;
@@ -6563,9 +6587,8 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
             var state = File.Exists(path)
                 ? JsonSerializer.Deserialize<AppState>(File.ReadAllText(path), JsonOptions()) ?? new AppState()
                 : new AppState();
-            if (File.Exists(path) && state.Profiles.Any(RemovedProtocolPolicy.IsRemoved) && !File.Exists(path + ".pre-amnezia-removal.backup"))
-                File.Copy(path, path + ".pre-amnezia-removal.backup", overwrite: false);
-            RemovedProtocolPolicy.Migrate(state);
+
+            if(!File.Exists(path)){state.RoutingDefaultsSeeded=true;state.RoutingBypassSites.Clear();state.SelectedHappRoutingProfileId=null;state.RoutingToggleMigrated=true;}
             SeedDefaultRoutingSites(state);
             NormalizeSubscriptions(state);
             NormalizeHappRoutingProfiles(state);
@@ -6576,6 +6599,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
         catch
         {
             var state = new AppState();
+            if(!File.Exists(path)){state.RoutingDefaultsSeeded=true;state.RoutingBypassSites.Clear();state.SelectedHappRoutingProfileId=null;state.RoutingToggleMigrated=true;}
             SeedDefaultRoutingSites(state);
             NormalizeSubscriptions(state);
             NormalizeHappRoutingProfiles(state);
@@ -6587,6 +6611,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
 
     private static void MigrateWebUiState(AppState state)
     {
+        AwgClientPolicy.Migrate(state);
         state.ConnectionProfiles ??= [];
         state.HappRoutingProfiles ??= [];
         foreach (var route in state.HappRoutingProfiles)
@@ -6600,11 +6625,12 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
             route.BlockIp ??= [];
         }
 
-        if (state.HappRoutingProfiles.Count == 0)
+        if (state.HappRoutingProfiles.Count == 0 && !state.RoutingToggleMigrated && state.SelectedHappRoutingProfileId!="none")
         {
             var localRoute = new HappRoutingProfile
             {
-                Name = "Умный маршрут",
+                Id = state.SelectedHappRoutingProfileId=="none"?"none":Guid.NewGuid().ToString("N"),
+                Name = state.SelectedHappRoutingProfileId=="none"?"none":"Умный маршрут",
                 Source = RoutingProfileSource.Ior,
                 GlobalProxy = true,
                 ProxySites = state.RoutingProxySites.Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
@@ -6614,26 +6640,21 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
             state.SelectedHappRoutingProfileId ??= localRoute.Id;
         }
 
-        if (state.ConnectionProfiles.Count == 0)
-        {
-            var selected = state.Profiles.FirstOrDefault(profile => profile.Id == state.SelectedProfileId) ?? state.Profiles.FirstOrDefault();
-            state.ConnectionProfiles.Add(new ConnectionWorkspaceProfile
-            {
-                Name = "Основной",
-                SubscriptionId = selected?.SubscriptionId,
-                RoutingProfileId = state.SelectedHappRoutingProfileId,
-                DefaultServerId = selected?.Id,
-                ConfigIds = state.Profiles.Where(profile => string.IsNullOrWhiteSpace(profile.SubscriptionId)).Select(profile => profile.Id).ToList()
-            });
-        }
+
 
         state.SelectedConnectionProfileId = state.ConnectionProfiles.Any(profile => profile.Id == state.SelectedConnectionProfileId)
             ? state.SelectedConnectionProfileId
             : state.ConnectionProfiles.FirstOrDefault()?.Id;
         foreach (var subscription in state.Subscriptions)
         {
+            subscription.HwidApprovedOrigins ??= [];
+            if(!state.SubscriptionOptionsMigrated&&!state.AutoRefreshSubscriptions)subscription.AutoRefreshEnabled=false;
+            subscription.RequestTimeoutMs=Math.Clamp(subscription.RequestTimeoutMs,5000,15000);
             SubscriptionRefreshSchedule.Normalize(subscription, DateTime.UtcNow);
         }
+        state.SubscriptionOptionsMigrated=true;
+        state.SelectedConnectionProfileId=null;
+        RoutingSelectionPolicy.Migrate(state);
         state.SchemaVersion = 2;
     }
 
@@ -6662,7 +6683,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
         // Keep a single profile and redirect subscription/workspace references to it.
         var duplicates = state.HappRoutingProfiles
             .Where(profile => profile.Source == RoutingProfileSource.Happ)
-            .GroupBy(profile => (profile.ManagedBySubscriptionId is null ? "user:" : "managed:") +
+            .GroupBy(profile => (profile.ManagedBySubscriptionId is null ? "user:" : "managed:"+profile.ManagedBySubscriptionId+":") +
                 string.Join('\n', profile.Links.OrderBy(link => link, StringComparer.OrdinalIgnoreCase)), StringComparer.OrdinalIgnoreCase)
             .Where(group => group.Key.Length > 0 && group.Count() > 1);
         foreach (var group in duplicates)
@@ -6688,8 +6709,8 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
             state.SelectedHappRoutingProfileId = state.HappRoutingProfiles[0].Id;
         }
 
-        if (state.SelectedHappRoutingProfileId is null ||
-            state.HappRoutingProfiles.All(x => x.Id != state.SelectedHappRoutingProfileId))
+        if ((!state.RoutingToggleMigrated && state.SelectedHappRoutingProfileId is null) ||
+            (state.SelectedHappRoutingProfileId is not null && state.HappRoutingProfiles.All(x => x.Id != state.SelectedHappRoutingProfileId)))
         {
             state.SelectedHappRoutingProfileId = state.HappRoutingProfiles.FirstOrDefault()?.Id;
         }
@@ -6892,11 +6913,9 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
         message = ConnectionDiagnostics.Redact(message, DiagnosticSecrets());
         var line = $"[{DateTime.Now:HH:mm:ss}] {AnsiEscapeRegex.Replace(message, "")}";
         _logs.Add(line);
-        if (_logs.Count > 600) _logs.RemoveRange(0, _logs.Count - 600);
         if (_webUiReady)
         {
             _webLogDelta.Add(line);
-            if (_webLogDelta.Count > 500) _webLogDelta.RemoveRange(0, _webLogDelta.Count - 500);
         }
         if (_activeLogViewer is { IsDisposed: false } viewer)
         {
@@ -7013,20 +7032,13 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
         public void ReplaceLogs(IEnumerable<string> lines)
         {
             _allLines.Clear();
-            _allLines.AddRange(lines.TakeLast(600));
+            _allLines.AddRange(lines);
             RebuildVisibleLines();
         }
 
         public void Append(string line)
         {
             _allLines.Add(line);
-            if (_allLines.Count > 600)
-            {
-                var removed = _allLines[0];
-                _allLines.RemoveAt(0);
-                var visibleIndex = _visibleLines.IndexOf(removed);
-                if (visibleIndex >= 0) _visibleLines.RemoveAt(visibleIndex);
-            }
 
             if (Matches(line))
             {

@@ -26,7 +26,7 @@ public sealed class CoreEngineServiceTests
         var profile = protocol == ProxyProtocol.Vless
             ? new ProxyProfile { Protocol = protocol, RealityEnabled = true, TlsEnabled = true, Server = "edge.example", Port = 443, ServerName = "cover.example", UserId = "11111111-1111-1111-1111-111111111111", PublicKey = "synthetic", Flow = "xtls-rprx-vision" }
             : new ProxyProfile { Protocol = protocol, Server = "edge.example", Port = 443, ServerName = "cover.example", Password = "synthetic", TlsEnabled = true };
-        var supported = !tun || OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000);
+        var supported = !tun || NativeWindowsPlatform.TunAvailable;
         Assert.Equal(supported, CoreEngineService.CanRun(state, profile, out _));
     }
 
@@ -37,7 +37,7 @@ public sealed class CoreEngineServiceTests
         var profile = new ProxyProfile { Protocol = ProxyProtocol.Vmess, Server = "edge.example", Port = 443, ServerName = "cover.example", UserId = "11111111-1111-1111-1111-111111111111" };
         Assert.False(CoreEngineService.CanRun(state, profile, out _));
         state.ExperimentalCoreTesting = true;
-        Assert.True(CoreEngineService.CanRun(state, profile, out var reason), reason);
+        Assert.False(CoreEngineService.CanRun(state, profile, out var reason));Assert.Contains("пока не поддерживаются",reason);
     }
 
     [Fact]
@@ -48,12 +48,12 @@ public sealed class CoreEngineServiceTests
         var rows = matrix.RootElement.EnumerateArray().ToArray();
         foreach (var row in rows.Where(row => row.GetProperty("protocol").GetString() is "VLESS Reality" or "Hysteria2"))
         {
-            var tunSupported = row.GetProperty("mode").GetString() != "tun" || OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000);
+            var tunSupported = row.GetProperty("mode").GetString() != "tun" || NativeWindowsPlatform.TunAvailable;
             Assert.Equal(tunSupported ? "supported" : "unverifiedWindowsVersion", row.GetProperty("status").GetString());
-            Assert.Equal(tunSupported, row.GetProperty("verified").GetBoolean());
+            Assert.Equal(tunSupported && (row.GetProperty("mode").GetString() != "tun" || NativeWindowsPlatform.IsWindows11(Environment.OSVersion.Version)), row.GetProperty("verified").GetBoolean());
         }
         Assert.All(rows.Where(row => row.GetProperty("protocol").GetString() is "Vmess" or "Shadowsocks" or "Trojan" or "WireGuard"),
-            row => Assert.Equal("disabled", row.GetProperty("status").GetString()));
+            row => Assert.Equal("supported", row.GetProperty("status").GetString()));
     }
     [Fact]
     public void NativeBackendCanConnectButProfileCapabilityChecksRemainSeparate()
@@ -84,11 +84,11 @@ public sealed class CoreEngineServiceTests
     }
 
     [Fact]
-    public void XrayCapabilitiesExposeTunOnlyOnLiveTestedWindowsFamily()
+    public void XrayCapabilitiesExposeTunOnSupportedWindowsVersions()
     {
         var capabilities = CoreEngineService.Capability(CoreKind.XrayCore);
         Assert.True(capabilities.Proxy);
-        Assert.Equal(OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000), capabilities.Tun);
+        Assert.Equal(NativeWindowsPlatform.TunAvailable, capabilities.Tun);
         Assert.True(capabilities.Udp);
         Assert.Contains(ProxyProtocol.Hysteria2, capabilities.Protocols);
     }

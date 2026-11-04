@@ -25,22 +25,22 @@ public static class ProfileParser
         {
             var wg = TryParseWireGuardConfig(text, "WireGuard");
             if (wg is not null) profiles.Add(wg);
-            return new ProfileParseResult(profiles, wg is null ? 1 : 0, wg is null && HasRemovedConfiguration(text) ? 1 : 0);
+            return new ProfileParseResult(profiles, wg is null ? 1 : 0, 0);
         }
 
         var rejected = 0;
         var removed = 0;
         foreach (var line in ExpandSubscription(text))
         {
+            if(line.Trim().Split("://",2)[0].ToLowerInvariant() is "vmess" or "ss" or "trojan"){removed++;rejected++;continue;}
             var profile = TryParseLine(line.Trim());
             if (profile is not null)
             {
-                profiles.Add(profile);
+                if(RemovedProtocolPolicy.IsRemoved(profile)){removed++;rejected++;}else profiles.Add(profile);
             }
             else
             {
                 rejected++;
-                if (IsRemovedLine(line.Trim())) removed++;
             }
         }
 
@@ -70,6 +70,7 @@ public static class ProfileParser
     {
         try
         {
+            if (line.StartsWith("ior-profile://", StringComparison.OrdinalIgnoreCase)) return ProfileShareCodec.Import(line);
             if (line.StartsWith("vless://", StringComparison.OrdinalIgnoreCase)) return ParseVless(line);
             if (line.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase)) return ParseVmess(line);
             if (line.StartsWith("trojan://", StringComparison.OrdinalIgnoreCase)) return ParseTrojan(line);
@@ -78,7 +79,7 @@ public static class ProfileParser
                 line.StartsWith("hy2://", StringComparison.OrdinalIgnoreCase)) return ParseHysteria2(line);
             if (line.StartsWith("wireguard://", StringComparison.OrdinalIgnoreCase)) return ParseWireGuardLink(line);
             if (line.StartsWith("vpn://", StringComparison.OrdinalIgnoreCase)) return ParseWireGuardLink(line);
-            if (line.StartsWith("awg://", StringComparison.OrdinalIgnoreCase) || line.StartsWith("amneziawg://", StringComparison.OrdinalIgnoreCase)) return null;
+            if (line.StartsWith("awg://", StringComparison.OrdinalIgnoreCase) || line.StartsWith("amneziawg://", StringComparison.OrdinalIgnoreCase)) return ParseWireGuardLink(line);
             if (line.StartsWith("socks://", StringComparison.OrdinalIgnoreCase) || line.StartsWith("socks5://", StringComparison.OrdinalIgnoreCase) ||
                 line.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || line.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 return ParseForwardProxy(line);
@@ -114,7 +115,7 @@ public static class ProfileParser
         var q = Query(uri);
         var security = Get(q, "security");
 
-        return new ProxyProfile
+        var profile = new ProxyProfile
         {
             Name = NameFromUri(uri, uri.Host),
             Protocol = ProxyProtocol.Vless,
@@ -130,10 +131,16 @@ public static class ProfileParser
             ShortId = Get(q, "sid") ?? Get(q, "shortId"),
             Fingerprint = Get(q, "fp") ?? "chrome",
             Network = Get(q, "type") ?? Get(q, "network"),
-            Host = Get(q, "host"),
+            Host = Get(q, "host") ?? Get(q,"authority"),
             Path = Get(q, "path"),
-            ServiceName = Get(q, "serviceName")
+            ServiceName = Get(q, "serviceName"),
+            Alpn=Get(q,"alpn")?.Split(',',StringSplitOptions.RemoveEmptyEntries|StringSplitOptions.TrimEntries),
+            UnsupportedParameters = q.Keys.Where(key=>key is not ("security" or "allowInsecure" or "insecure" or "sni" or "serverName" or "fp" or "type" or "network" or "host" or "path" or "serviceName" or "flow" or "pbk" or "publicKey" or "sid" or "shortId" or "mode" or "multiMode" or "extra" or "encryption" or "packetEncoding" or "spx" or "authority" or "alpn")).ToList()
         };
+        profile.VlessTransport=NativeVlessTransportSettings.Parse(q,profile);
+        if(Get(q,"encryption") is {Length:>0} encryption&&encryption!="none")profile.UnsupportedParameters.Add("encryption");
+        if(Get(q,"packetEncoding") is {Length:>0} packet&&packet!="xudp")profile.UnsupportedParameters.Add("packetEncoding");
+        return profile;
     }
 
     private static ProxyProfile ParseVmess(string line)
@@ -262,15 +269,17 @@ public static class ProfileParser
         var parts=line[(line.IndexOf("://",StringComparison.Ordinal)+3)..].Split('#',2);
         var decoded=TryBase64Decode(Uri.UnescapeDataString(parts[0]));
         var name=parts.Length==2?WebUtility.UrlDecode(parts[1]):"WireGuard";
-        return decoded is null ? null : TryParseWireGuardConfig(decoded,string.IsNullOrWhiteSpace(name)?"WireGuard":name);
+        var profile = decoded is null ? null : TryParseWireGuardConfig(decoded,string.IsNullOrWhiteSpace(name)?"WireGuard":name);
+        if(profile is not null && (line.StartsWith("awg://",StringComparison.OrdinalIgnoreCase) || line.StartsWith("amneziawg://",StringComparison.OrdinalIgnoreCase))) profile.Protocol=ProxyProtocol.AmneziaWG;
+        return profile;
     }
 
     private static ProxyProfile? TryParseWireGuardConfig(string text, string name)
     {
         var map = ParseWireGuardSections(text);
-        if (map.Keys.Any(key => RemovedProtocolPolicy.IsParameter(key[(key.IndexOf('.') + 1)..]))) return null;
+        var awg = map.Where(item => item.Key.StartsWith("Interface.",StringComparison.OrdinalIgnoreCase) && RemovedProtocolPolicy.IsParameter(item.Key[10..])).ToDictionary(item=>AwgParameterNames.First(pair=>pair.Key.Equals(item.Key[10..],StringComparison.OrdinalIgnoreCase)||pair.Value.Equals(item.Key[10..],StringComparison.OrdinalIgnoreCase)).Value,item=>item.Value,StringComparer.OrdinalIgnoreCase);
         var known = new HashSet<string>(["Interface.PrivateKey", "Interface.Address", "Interface.DNS", "Interface.MTU", "Peer.PublicKey", "Peer.PresharedKey", "Peer.Endpoint", "Peer.AllowedIPs", "Peer.PersistentKeepalive"], StringComparer.OrdinalIgnoreCase);
-        var unknown = map.Keys.Where(key => !known.Contains(key) && !(key.StartsWith("Interface.",StringComparison.OrdinalIgnoreCase) && AwgParameterNames.ContainsKey(key[10..]))).ToList();
+        var unknown = map.Keys.Where(key => !known.Contains(key) && !(key.StartsWith("Interface.",StringComparison.OrdinalIgnoreCase) && RemovedProtocolPolicy.IsParameter(key[10..]))).ToList();
         if (!map.TryGetValue("Interface.PrivateKey", out var privateKey) ||
             !map.TryGetValue("Peer.PublicKey", out var publicKey) ||
             !map.TryGetValue("Peer.Endpoint", out var endpoint))
@@ -281,8 +290,9 @@ public static class ProfileParser
         var hostPort = SplitHostPort(endpoint);
         return new ProxyProfile
         {
-            Name = name,
-            Protocol = ProxyProtocol.WireGuard,
+            Name = name == "WireGuard" && awg.Count > 0 ? "AmneziaWG" : name,
+            Protocol = awg.Count > 0 ? ProxyProtocol.AmneziaWG : ProxyProtocol.WireGuard,
+            Awg = awg,
             UnsupportedParameters = unknown,
             TunnelDns = map.GetValueOrDefault("Interface.DNS"),
             ServerName = hostPort.host,

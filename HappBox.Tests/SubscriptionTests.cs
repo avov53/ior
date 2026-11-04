@@ -73,7 +73,7 @@ public sealed class SubscriptionTests
         Assert.Equal(RoutingProfileSource.Clash, route.Source);
         Assert.Equal(subscription.Id, route.ManagedBySubscriptionId);
         Assert.Equal(subscription.RoutingProfileId, route.Id);
-        Assert.Equal(route.Id, Assert.Single(state.ConnectionProfiles).RoutingProfileId);
+        Assert.Empty(state.ConnectionProfiles); // Retired workspaces are not recreated by imports.
         Assert.Equal(3, route.ClashOrderedRules.Count);
         Assert.Contains("rule-providers:", route.OriginalClashYaml);
         Assert.NotNull(merge.Warning); // complex groups/rule sets are saved, never silently flattened
@@ -178,7 +178,7 @@ public sealed class SubscriptionTests
         var result = await SubscriptionService.FetchAsync(client, "https://example.com/sub/token");
 
         Assert.Equal("My subscription", result.SuggestedName);
-        Assert.Equal(2, result.Profiles.Count);
+        Assert.Single(result.Profiles);Assert.Equal(1,result.RemovedProtocolCount);
         Assert.Equal(100, result.TotalBytes);
         Assert.True(result.HasUserInfo);
         Assert.True(result.HasTotal);
@@ -377,7 +377,7 @@ public sealed class SubscriptionTests
     }
 
     [Fact]
-    public void IdenticalSubscriptionRoutingSharesOneProfile()
+    public void IdenticalSubscriptionRoutingKeepsSeparateOwners()
     {
         var first = new ProxySubscription { Name = "First" };
         var second = new ProxySubscription { Name = "Second" };
@@ -386,8 +386,8 @@ public sealed class SubscriptionTests
 
         SubscriptionService.Apply(state, first, Fetch());
         SubscriptionService.Apply(state, second, Fetch());
-        Assert.Single(state.HappRoutingProfiles);
-        Assert.Equal(first.RoutingProfileId, second.RoutingProfileId);
+        Assert.Equal(2,state.HappRoutingProfiles.Count);
+        Assert.NotEqual(first.RoutingProfileId, second.RoutingProfileId);
 
         SubscriptionService.Remove(state, first);
         Assert.Single(state.HappRoutingProfiles);

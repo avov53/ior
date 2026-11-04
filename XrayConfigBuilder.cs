@@ -17,17 +17,12 @@ public static class XrayConfigBuilder
         if (!CanBuild(state, profile, allowTunCandidate: true, out reason)) return false;
         if (profile!.Protocol == ProxyProtocol.Http)
         { reason = "HTTP-прокси не передаёт UDP. Xray TUN для него закрыт до отдельной интеграции DNS; используйте Proxy."; return false; }
-        if (profile!.Protocol is not ProxyProtocol.Hysteria2 &&
-            !(profile.Protocol == ProxyProtocol.Vless && profile.RealityEnabled) && !state.ExperimentalCoreTesting)
-        { reason = "Для TUN с этим протоколом включите экспериментальное тестирование в дополнительных настройках. Проверенные VLESS Reality и Hysteria2 доступны без него."; return false; }
-        var route = state.HappRoutingProfiles.FirstOrDefault(item => item.Id == state.SelectedHappRoutingProfileId);
-        if (!string.IsNullOrWhiteSpace(state.SelectedHappRoutingProfileId) && route is null)
+        var route = RoutingSelectionPolicy.Effective(state);
+        if (state.RoutingEnabled && !string.IsNullOrWhiteSpace(state.SelectedHappRoutingProfileId) && route is null)
         { reason = "Выбранный маршрут не найден. Xray TUN не может запускаться с другим маршрутом без подтверждения."; return false; }
         if (route is not null)
         {
             if (!XrayClashRuleCompiler.TryCompile(route, out _, out var hasDirect, out reason)) return false;
-            if (hasDirect && !state.ExperimentalCoreTesting)
-            { reason = $"Маршрут «{route.Name}» содержит DIRECT (direct-выход). Включите экспериментальное тестирование в дополнительных настройках: физический выход проверяется до и после запуска. Правило не будет заменено VPN."; return false; }
         }
         reason = "";
         return true;
@@ -36,6 +31,7 @@ public static class XrayConfigBuilder
     private static bool CanBuild(AppState state, ProxyProfile? profile, bool allowTunCandidate, out string reason)
     {
         if (profile is null) { reason = "Сначала выберите сервер."; return false; }
+        if(RemovedProtocolPolicy.IsRemoved(profile)){reason=RemovedProtocolPolicy.Message;return false;}
         if (state.TunEnabled && !allowTunCandidate) { reason = "Xray TUN пока не прошёл проверку восстановления маршрутов Windows 10/11. Используйте Proxy."; return false; }
         if (!state.MixedProxyEnabled) { reason = "Для Xray нужен включённый локальный прокси."; return false; }
         if (state.MixedProxyPort >= 65535) { reason = "Для Xray нужны два соседних порта HTTP и SOCKS; выберите порт до 65535."; return false; }
@@ -50,8 +46,6 @@ public static class XrayConfigBuilder
         { reason = "Reality в этой модели профилей поддерживается только для VLESS."; return false; }
         if (profile.Protocol == ProxyProtocol.WireGuard)
         {
-            if (!state.ExperimentalCoreTesting)
-            { reason = "WireGuard в Xray доступен для экспериментального тестирования; включите его в дополнительных настройках."; return false; }
             if (!ValidWireGuardKey(profile.PrivateKey) || !ValidWireGuardKey(profile.PeerPublicKey) ||
                 (!string.IsNullOrWhiteSpace(profile.PreSharedKey) && !ValidWireGuardKey(profile.PreSharedKey)))
             { reason = "WireGuard: ключи должны быть Base64 длиной 32 байта."; return false; }
@@ -83,7 +77,7 @@ public static class XrayConfigBuilder
         { reason = "Для Xray Reality нужны public key и SNI."; return false; }
         if (profile.Protocol is ProxyProtocol.Vless or ProxyProtocol.Trojan && !profile.TlsEnabled && !profile.RealityEnabled && !IPAddress.TryParse(profile.Server, out _))
         { reason = "Незащищённый VLESS/Trojan для публичного домена отключён."; return false; }
-        var route = state.HappRoutingProfiles.FirstOrDefault(item => item.Id == state.SelectedHappRoutingProfileId);
+        var route = RoutingSelectionPolicy.Effective(state);
         if (route is { Source: RoutingProfileSource.Happ } && route.Links.Count > 0)
         {
             foreach (var link in route.Links)
@@ -167,7 +161,7 @@ public static class XrayConfigBuilder
             AddIpRule(rules, [endpoint.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? $"{endpoint}/128" : $"{endpoint}/32"], "direct");
         else AddDomainRule(rules, [$"full:{profile.Server}"], "direct");
         AddIpRule(rules, ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10"], "direct");
-        var route = state.HappRoutingProfiles.FirstOrDefault(item => item.Id == state.SelectedHappRoutingProfileId);
+        var route = RoutingSelectionPolicy.Effective(state);
         if (route is not null)
         {
             if (!XrayClashRuleCompiler.TryCompile(route, out var orderedRules, out _, out var clashReason))
