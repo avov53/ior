@@ -1,13 +1,31 @@
-use std::{future::Future, io, pin::Pin};
+use std::{future::Future, io, pin::Pin, sync::Arc};
 
 pub type UdpFuture = Pin<Box<dyn Future<Output = io::Result<Box<dyn DatagramRelay>>> + Send>>;
 pub type SendFuture<'a> = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>;
 pub type ReceiveFuture<'a> = Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send + 'a>>;
 
+#[derive(Clone,Copy)]
+pub struct ReceiveQueueDiagnostics {
+    pub session_id:u32,
+    pub queued_datagrams:usize,
+    pub capacity:usize,
+    pub high_water:usize,
+    pub dropped_datagrams:u64,
+}
+
 /// A connected destination flow; each relay belongs to one ingress association.
 pub trait DatagramRelay: Send {
     fn send<'a>(&'a mut self, data: &'a [u8]) -> SendFuture<'a>;
     fn receive(&mut self) -> ReceiveFuture<'_>;
+    fn independent_sender(&self)->Option<Arc<dyn IndependentDatagramSender>> {None}
+    fn receive_queue_diagnostics(&self)->Option<ReceiveQueueDiagnostics>{None}
+}
+pub trait IndependentDatagramSender:Send+Sync {
+    fn send_owned(self:Arc<Self>,data:Vec<u8>)->SendFuture<'static>;
+}
+struct HysteriaSender { sender:rsteria2::UdpSender, destination:String }
+impl IndependentDatagramSender for HysteriaSender {
+    fn send_owned(self:Arc<Self>,data:Vec<u8>)->SendFuture<'static>{Box::pin(async move{self.sender.send(&data,&self.destination).await.map_err(|_|io::Error::new(io::ErrorKind::ConnectionAborted,"HY2_UDP_SEND_FAILED"))})}
 }
 
 pub struct HysteriaDatagram {
@@ -15,9 +33,14 @@ pub struct HysteriaDatagram {
     pub destination: String,
 }
 impl DatagramRelay for HysteriaDatagram {
+    fn receive_queue_diagnostics(&self)->Option<ReceiveQueueDiagnostics>{
+        let stats=self.session.receive_metrics();
+        Some(ReceiveQueueDiagnostics{session_id:stats.session_id,queued_datagrams:stats.queued_datagrams,capacity:stats.capacity,high_water:stats.high_water,dropped_datagrams:stats.dropped_datagrams})
+    }
+    fn independent_sender(&self)->Option<Arc<dyn IndependentDatagramSender>>{Some(Arc::new(HysteriaSender{sender:self.session.sender(),destination:self.destination.clone()}))}
     fn send<'a>(&'a mut self, data: &'a [u8]) -> SendFuture<'a> {
         Box::pin(async move {
-            self.session.send(data, &self.destination).map_err(|_| {
+            self.session.sender().send(data, &self.destination).await.map_err(|_| {
                 io::Error::new(io::ErrorKind::ConnectionAborted, "HY2_UDP_SEND_FAILED")
             })
         })
@@ -32,6 +55,20 @@ impl DatagramRelay for HysteriaDatagram {
                     io::Error::new(io::ErrorKind::ConnectionAborted, "HY2_UDP_RECEIVE_FAILED")
                 })
         })
+    }
+}
+
+impl Drop for HysteriaDatagram {
+    fn drop(&mut self){
+        let stats=self.session.receive_metrics();
+        crate::trace::emit(serde_json::json!({"stage":"transport","code":"HYSTERIA2_UDP_FLOW_CLOSED","operation":"final","udpSessionId":stats.session_id,"destination":self.destination,"rxQueuedDatagrams":stats.queued_datagrams,"rxQueueCapacity":stats.capacity,"rxQueueHighWater":stats.high_water,"receiveQueueDrops":stats.dropped_datagrams}));
+    }
+}
+
+pub(crate) fn trace_receive_queue(relay:&dyn DatagramRelay,destination:std::net::SocketAddr,previous_drops:&mut u64){
+    if let Some(stats)=relay.receive_queue_diagnostics(){
+        let new_drops=stats.dropped_datagrams.saturating_sub(*previous_drops);*previous_drops=stats.dropped_datagrams;
+        crate::trace::emit(serde_json::json!({"stage":"transport","code":"HYSTERIA2_UDP_FLOW_METRICS","operation":"periodic","udpSessionId":stats.session_id,"destination":destination.to_string(),"rxQueuedDatagrams":stats.queued_datagrams,"rxQueueCapacity":stats.capacity,"rxQueueHighWater":stats.high_water,"receiveQueueDrops":stats.dropped_datagrams,"newReceiveQueueDrops":new_drops}));
     }
 }
 

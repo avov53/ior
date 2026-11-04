@@ -148,17 +148,19 @@ impl Reassembly {
         };
         let (key, offset, more, header, payload) = match version {
             4 => {
-                if packet.len() < 20 || packet[0] & 15 != 5 {
+                let header_length=(packet[0]&15) as usize*4;
+                if packet.len() < 20 || header_length<20 || header_length>packet.len() {
                     return Err(bad());
                 }
                 let length = u16::from_be_bytes([packet[2], packet[3]]) as usize;
-                if length != packet.len() || checksum(&packet[..20]) != 0 {
+                if length != packet.len() || checksum(&packet[..header_length]) != 0 {
                     return Err(bad());
                 }
                 let flags = u16::from_be_bytes([packet[6], packet[7]]);
                 if flags & 0x3fff == 0 {
                     return Ok(Some(packet.to_vec()));
                 }
+                if header_length!=20{return Err(io::Error::new(io::ErrorKind::Unsupported,"TUNNEL_FRAGMENT_OPTIONS_UNSUPPORTED"));}
                 (
                     Key {
                         family: 4,
@@ -292,6 +294,13 @@ impl Reassembly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unfragmented_ipv4_options_are_not_corrupt_fragments(){
+        let mut p=vec![0u8;32];p[0]=0x46;p[2..4].copy_from_slice(&32u16.to_be_bytes());p[8]=64;p[9]=2;p[20..24].copy_from_slice(&[148,4,0,0]);let c=checksum(&p[..24]);p[10..12].copy_from_slice(&c.to_be_bytes());
+        assert_eq!(Reassembly::default().accept(&p).unwrap().unwrap(),p);
+        p[6]=0x20;p[10..12].fill(0);let c=checksum(&p[..24]);p[10..12].copy_from_slice(&c.to_be_bytes());assert_eq!(Reassembly::default().accept(&p).unwrap_err().kind(),io::ErrorKind::Unsupported);
+        p[10]^=1;assert_eq!(Reassembly::default().accept(&p).unwrap_err().kind(),io::ErrorKind::InvalidData);
+    }
     #[test]
     fn ipv6_extensions_are_bounded_and_checked() {
         let mut packet = vec![0; 52];

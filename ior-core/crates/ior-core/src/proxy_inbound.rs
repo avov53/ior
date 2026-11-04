@@ -19,6 +19,7 @@ use tokio::{
 const MAX_CLIENTS: usize = 256;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) static UDP_QUEUE_DROPS:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
 
 async fn during_handshake<T>(
     deadline: Instant,
@@ -34,6 +35,11 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RelayStream
 pub type ConnectFuture = Pin<Box<dyn Future<Output = io::Result<Box<dyn RelayStream>>> + Send>>;
 pub type AddressFuture = Pin<Box<dyn Future<Output = io::Result<Vec<std::net::IpAddr>>> + Send>>;
 pub trait OutboundConnector: Send + Sync {
+    /// Stream protocols can let the proxy server resolve a known TUN name.
+    /// IP tunnels override this to retain their profile DNS and packet path.
+    fn named_tun_destination(&self)->bool {false}
+    fn dns_response_cache(&self)->Option<std::sync::Arc<crate::dns_response_cache::DnsResponseCache>> {None}
+    fn dns_observations(&self)->Option<std::sync::Arc<crate::tun_names::NameCache>> {None}
     fn dns_hedge_delay(&self) -> Duration {
         Duration::from_millis(500)
     }
@@ -46,6 +52,8 @@ pub trait OutboundConnector: Send + Sync {
     fn resolve_candidates(&self, _host: String) -> Option<AddressFuture> {
         None
     }
+    fn raw_packet(&self, _source: std::net::SocketAddr, _destination: std::net::SocketAddr, _protocol:u8) -> Option<crate::awg_packets::OpenFuture> { None }
+    fn packet_path_enabled(&self)->bool {false}
     fn connect(&self, host: String, port: u16) -> ConnectFuture;
     fn udp(&self, _host: String, _port: u16) -> crate::udp_relay::UdpFuture {
         Box::pin(async {
@@ -130,9 +138,9 @@ async fn handle_client_authenticated(
     }
     match first {
         0x04 => handle_socks4(client, connector, deadline).await,
-        0x05 => handle_socks5(client, connector, deadline, auth).await,
+        0x05 => handle_socks5(client, connector, deadline, auth, true).await,
         b'C' | b'G' | b'P' | b'H' | b'D' | b'O' => {
-            handle_http_connect(client, connector, deadline, first).await
+            handle_http_connect(client, connector, deadline, first, None).await
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -202,6 +210,7 @@ async fn handle_http_connect(
     connector: Arc<dyn OutboundConnector>,
     deadline: Instant,
     first: u8,
+    auth: Option<crate::ipc_contract::IngressAuth>,
 ) -> io::Result<()> {
     let mut request = vec![first];
     while !request.ends_with(b"\r\n\r\n") {
@@ -215,6 +224,13 @@ async fn handle_http_connect(
     }
     let text = std::str::from_utf8(&request)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP header"))?;
+    if let Some(auth)=auth {
+        use base64::Engine;use sha2::{Digest,Sha256};
+        let values:Vec<_>=text.lines().skip(1).filter_map(|line|line.split_once(':')).filter(|(name,_)|name.eq_ignore_ascii_case("Proxy-Authorization")).collect();
+        let supplied=values.first().and_then(|(_,value)|value.trim().split_once(' ')).filter(|(scheme,_)|scheme.eq_ignore_ascii_case("Basic")).and_then(|(_,value)|base64::engine::general_purpose::STANDARD.decode(value).ok()).unwrap_or_default();
+        let expected=Sha256::digest(format!("{}:{}",auth.username,auth.password).as_bytes());let received=Sha256::digest(supplied);
+        if values.len()!=1||expected.iter().zip(received.iter()).fold(0u8,|a,(x,y)|a|(x^y))!=0 {client.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"ior\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;return Err(io::Error::other("LAN_AUTH_REJECTED"))}
+    }
     let line = text.lines().next().unwrap_or("");
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
@@ -333,6 +349,7 @@ async fn handle_socks5(
     connector: Arc<dyn OutboundConnector>,
     deadline: Instant,
     auth: Option<crate::ipc_contract::IngressAuth>,
+    allow_udp:bool,
 ) -> io::Result<()> {
     let count = during_handshake(deadline, client.read_u8()).await? as usize;
     if count == 0 {
@@ -425,6 +442,7 @@ async fn handle_socks5(
         }
     };
     let port = during_handshake(deadline, client.read_u16()).await?;
+    if header[1]==3&&!allow_udp{client.write_all(&[5,7,0,1,0,0,0,0,0,0]).await?;return Err(io::Error::other("LAN_UDP_UNSUPPORTED"))}
     if header[1] == 3 {
         return serve_udp_association(client, connector, host, port).await;
     }
@@ -522,20 +540,25 @@ async fn serve_udp_association(
                 let mut relay=timeout(CONNECT_TIMEOUT,connector.udp(host.clone(),port)).await
                     .map_err(|_|io::ErrorKind::TimedOut)??;
                 let mut prefix=vec![0,0,0];prefix.extend(crate::udp_relay::encode_address(&host,port)?);
+                let independent=relay.independent_sender();let mut pending:Option<crate::udp_relay::SendFuture<'static>>=None;
                 loop {
-                    tokio::select! {
-                        payload=rx.recv()=>match payload {Some(data)=>relay.send(&data).await?,None=>return Ok::<(),io::Error>(())},
+                    if independent.is_none(){tokio::select!{
+                        payload=rx.recv()=>match payload{Some(data)=>relay.send(&data).await?,None=>return Ok::<(),io::Error>(())},
+                        payload=timeout(Duration::from_secs(60),relay.receive())=>{let data=payload.map_err(|_|io::ErrorKind::TimedOut)??;let mut reply=prefix.clone();reply.extend(data);socket.send_to(&reply,source).await?;}
+                    }}else{tokio::select! {
+                        result=async{pending.as_mut().unwrap().await},if pending.is_some()=>{result?;pending=None;},
+                        payload=rx.recv(),if pending.is_none()=>match payload {Some(data)=>{if let Some(sender)=&independent{pending=Some(sender.clone().send_owned(data));}else{relay.send(&data).await?;}},None=>return Ok::<(),io::Error>(())},
                         payload=timeout(Duration::from_secs(60),relay.receive())=>{
                             let data=payload.map_err(|_|io::ErrorKind::TimedOut)??;
                             let mut reply=prefix.clone();reply.extend(data);
                             socket.send_to(&reply,source).await?;
                         }
-                    }
+                    }}
                 }
             });
         }
         if let Some(sender) = flows.get(&(host, port)) {
-            let _ = sender.try_send(packet[offset..n].to_vec());
+            if matches!(sender.try_send(packet[offset..n].to_vec()),Err(tokio::sync::mpsc::error::TrySendError::Full(_))){UDP_QUEUE_DROPS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
         }
     }
 }
@@ -725,4 +748,21 @@ mod tests {
         assert!(parse_authority("example.com").is_err());
         assert!(parse_authority("example.com:0").is_err());
     }
+}
+
+pub(crate) async fn handle_lan_client(mut client:TcpStream,connector:Arc<dyn OutboundConnector>,auth:Option<crate::ipc_contract::IngressAuth>)->io::Result<()> {let deadline=Instant::now()+HANDSHAKE_TIMEOUT;let first=during_handshake(deadline,client.read_u8()).await?;match first{5=>handle_socks5(client,connector,deadline,auth,false).await,b'C'|b'G'|b'P'|b'H'|b'D'|b'O'=>handle_http_connect(client,connector,deadline,first,auth).await,_=>Err(io::Error::other("LAN_PROTOCOL_UNSUPPORTED"))}}
+
+#[cfg(test)]
+mod lan_tests {
+ use super::*;
+ struct Echo;
+ impl OutboundConnector for Echo{fn connect(&self,_:String,_:u16)->ConnectFuture{Box::pin(async{let(client,mut peer)=tokio::io::duplex(65536);tokio::spawn(async move{let mut buffer=[0;4096];while let Ok(n)=peer.read(&mut buffer).await{if n==0{break}if peer.write_all(&buffer[..n]).await.is_err(){break}}});Ok(Box::new(client) as Box<dyn RelayStream>)})}}
+ async fn client(auth:bool)->(TcpStream,tokio::task::JoinHandle<io::Result<()>>){let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let socket=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let (accepted,_)=listener.accept().await.unwrap();let task=tokio::spawn(handle_lan_client(accepted,Arc::new(Echo),if auth{Some(crate::ipc_contract::IngressAuth{username:"ior".into(),password:"test".into()})}else{None}));(socket,task)}
+ #[tokio::test] async fn http_auth_rejects_and_never_forwards_credentials(){
+  let(mut socket,task)=client(true).await;socket.write_all(b"GET http://example.test/a HTTP/1.1\r\nHost: example.test\r\n\r\n").await.unwrap();let mut response=Vec::new();socket.read_to_end(&mut response).await.unwrap();assert!(String::from_utf8_lossy(&response).contains("407"));assert!(task.await.unwrap().is_err());
+  let(mut socket,task)=client(true).await;socket.write_all(b"GET http://example.test/a HTTP/1.1\r\nHost: example.test\r\nProxy-Authorization: Basic aW9yOnRlc3Q=\r\n\r\n").await.unwrap();let mut buffer=[0;4096];let n=socket.read(&mut buffer).await.unwrap();let response=String::from_utf8_lossy(&buffer[..n]);assert!(response.contains("GET /a HTTP/1.1"));assert!(!response.to_lowercase().contains("proxy-authorization"));socket.shutdown().await.unwrap();task.await.unwrap().unwrap();
+ }
+ #[tokio::test] async fn socks_no_auth_connect_and_udp_refusal(){let(mut socket,task)=client(false).await;socket.write_all(&[5,1,0]).await.unwrap();let mut reply=[0;2];socket.read_exact(&mut reply).await.unwrap();assert_eq!(reply,[5,0]);socket.write_all(&[5,3,0,1,127,0,0,1,0,80]).await.unwrap();let mut response=[0;10];socket.read_exact(&mut response).await.unwrap();assert_eq!(response[1],7);assert!(task.await.unwrap().is_err());
+  let(mut socket,task)=client(true).await;socket.write_all(&[5,1,2]).await.unwrap();socket.read_exact(&mut reply).await.unwrap();assert_eq!(reply,[5,2]);socket.write_all(b"\x01\x03ior\x04test").await.unwrap();socket.read_exact(&mut reply).await.unwrap();assert_eq!(reply,[1,0]);socket.write_all(&[5,1,0,1,127,0,0,1,0,80]).await.unwrap();let mut response=[0;10];socket.read_exact(&mut response).await.unwrap();assert_eq!(response[1],0);socket.write_all(b"integrity").await.unwrap();let mut echo=[0;9];socket.read_exact(&mut echo).await.unwrap();assert_eq!(&echo,b"integrity");socket.shutdown().await.unwrap();task.await.unwrap().unwrap();
+ }
 }

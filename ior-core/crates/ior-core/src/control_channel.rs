@@ -15,6 +15,7 @@ struct Command {
     api_version: u16,
     request_id: String,
     operation: String,
+    #[serde(default)] lan:Option<crate::lan_proxy::LanProxySettings>,
 }
 
 #[derive(Serialize)]
@@ -104,6 +105,7 @@ pub async fn serve(
         .validate_shape()
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     crate::trace::set_run(&request.request_id);
+    if request.profile.protocol=="amneziawg" {crate::trace::emit(serde_json::json!({"stage":"routing","code":"AWG_ROUTING_MODE","operation":request.profile.options.awg_routing_mode.as_deref().unwrap_or("rules")}));}
     if !matches!(
         request.profile.protocol.as_str(),
         "vless_tls"
@@ -112,7 +114,7 @@ pub async fn serve(
             | "vmess"
             | "shadowsocks"
             | "trojan"
-            | "wireguard"
+            | "wireguard" | "amneziawg"
     ) {
         emit(
             writer,
@@ -134,7 +136,7 @@ pub async fn serve(
     let bootstrap = std::net::SocketAddr::new(bootstrap, 53);
     if request.operation == "validate" {
         // Compile routes and validate credentials without starting any network transport.
-        if matches!(request.profile.protocol.as_str(), "wireguard") {
+        if matches!(request.profile.protocol.as_str(), "wireguard" | "amneziawg") {
             crate::tunnel_outbound::TunnelConnector::validate_profile(&request.profile)?;
         } else if matches!(
             request.profile.protocol.as_str(),
@@ -174,8 +176,9 @@ pub async fn serve(
         .await?;
         return Ok(());
     }
+    if request.profile.protocol == "amneziawg" && request.tun.is_none() { return Err(io::Error::new(io::ErrorKind::Unsupported,"AWG_TUN_REQUIRED")); }
     crate::trace::emit(
-        serde_json::json!({"stage":"transport","code":"NATIVE_PROTOCOL_SELECTED","protocol":request.profile.protocol,"implementation":"ior-core-rust"}),
+        serde_json::json!({"stage":"transport","code":"NATIVE_PROTOCOL_SELECTED","protocol":request.profile.protocol,"implementation":if request.profile.protocol=="amneziawg"{if request.profile.options.awg_engine.as_deref()==Some("rust"){"ior-core-awg-rust"}else{"ior-core+awg-go"}}else{"ior-core-rust"}}),
     );
     let build_connector = async {
         let connector: Arc<dyn proxy_inbound::OutboundConnector> =
@@ -198,7 +201,7 @@ pub async fn serve(
                         return Err(error);
                     }
                 }
-            } else if matches!(request.profile.protocol.as_str(), "wireguard") {
+            } else if matches!(request.profile.protocol.as_str(), "wireguard" | "amneziawg") {
                 Arc::new(
                     crate::tunnel_outbound::TunnelConnector::new(
                         &request.profile,
@@ -247,7 +250,7 @@ pub async fn serve(
                 Arc::new(VlessTlsConnector::from_profile(
                     &request.profile,
                     bootstrap,
-                )?)
+                )?.with_network(request.network.clone()))
             };
         Ok::<_, io::Error>(connector)
     };
@@ -274,7 +277,7 @@ pub async fn serve(
         request.routes.clone(),
         bootstrap,
         request.network.clone(),
-    )?);
+    )?.with_full_awg_family_policy(request.profile.protocol=="amneziawg").with_route_dns(&request.dns));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let mut tun_task = if let Some(options) = &request.tun {
         Some(crate::tun::start(options, connector.clone(), &request.dns).await?)
@@ -286,6 +289,7 @@ pub async fn serve(
         connector.clone(),
         request.ingress_auth.clone(),
     ));
+    let mut lan=None;
     let result = async {
         emit_runtime(
             writer,
@@ -318,6 +322,10 @@ pub async fn serve(
                 ));
             }
             match command.operation.as_str() {
+                "configureLan"=>{
+                    let code=match command.lan{Some(settings)=>match crate::lan_proxy::configure(&mut lan,settings,connector.clone()).await{Ok(())=>"LAN_CONFIGURED",Err(_)=>"LAN_CONFIGURATION_FAILED"},None=>"LAN_CONFIGURATION_FAILED"};
+                    emit(writer,&command.request_id,"configureLan",code).await?;
+                },
                 "probeDirect"=>{
                     let code=if crate::dns_engine::probe_direct(&connector).await.is_ok(){"DIRECT_TCP_UDP_VERIFIED"}else{"DIRECT_TCP_UDP_PROBE_FAILED"};
                     crate::trace::code("probe",code);

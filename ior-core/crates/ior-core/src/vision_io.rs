@@ -15,6 +15,7 @@ pub struct RecordSocket {
     handshake_read_us: u64,
     header: Vec<u8>,
     remaining: usize,
+    nonblocking:bool,
 }
 impl RecordSocket {
     pub fn new(tcp: TcpStream) -> Self {
@@ -26,6 +27,7 @@ impl RecordSocket {
             handshake_read_us: 0,
             header: Vec::new(),
             remaining: 0,
+            nonblocking:false,
         }
     }
     /// Before sending VLESS data there can be no raw Vision payload to over-read.
@@ -56,6 +58,7 @@ impl Read for RecordSocket {
                 .saturating_add(started.elapsed().as_micros().min(u64::MAX as u128) as u64);
             return result;
         }
+        if self.nonblocking{self.tcp.set_nonblocking(false)?;self.nonblocking=false;}
         if self.raw {
             return self.tcp.read(buffer);
         }
@@ -117,6 +120,10 @@ mod record_tests {
 }
 impl Write for RecordSocket {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        // Windows timed blocking sends can lose the partial-write count on timeout.
+        // This socket has one owner. Writes stay nonblocking; reads retain the bounded
+        // idle wait. WouldBlock preserves the exact encrypted tail for the next flush.
+        if !self.handshake&&!self.nonblocking{self.tcp.set_nonblocking(true)?;self.nonblocking=true;}
         self.tcp.write(data)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -135,8 +142,23 @@ pub struct VlessCarrier<C: Connection> {
     first_block: bool,
     unpadding: bool,
     raw_read: bool,
+    first_frame:Option<(Vec<u8>,usize,usize)>,
 }
 impl<C: Connection> VlessCarrier<C> {
+    fn read_plaintext(&mut self,buffer:&mut [u8])->io::Result<usize>{
+        loop{
+            match self.tls.conn.reader().read(buffer){
+                Err(error) if error.kind()==io::ErrorKind::WouldBlock=>(),
+                result=>return result,
+            }
+            // Receiving must not depend on flushing a saturated outbound socket.
+            self.tls.conn.read_tls(&mut self.tls.sock)?;
+            self.tls.conn.process_new_packets().map_err(|error|io::Error::new(io::ErrorKind::InvalidData,error))?;
+        }
+    }
+    pub fn transport(tls: reality_util::StreamOwned<C, RecordSocket>) -> Self {
+        let mut carrier=Self::new(tls,None);carrier.response_done=true;carrier
+    }
     pub fn new(tls: reality_util::StreamOwned<C, RecordSocket>, id: Option<[u8; 16]>) -> Self {
         Self {
             tls,
@@ -149,6 +171,7 @@ impl<C: Connection> VlessCarrier<C> {
             first_block: true,
             unpadding: id.is_some(),
             raw_read: false,
+            first_frame:None,
         }
     }
     fn ingest(&mut self, data: &[u8]) -> io::Result<()> {
@@ -230,14 +253,14 @@ impl<C: Connection> Read for VlessCarrier<C> {
                 return if self.raw_read {
                     self.tls.sock.read(&mut buffer[..length])
                 } else {
-                    self.tls.read(&mut buffer[..length])
+                    self.read_plaintext(&mut buffer[..length])
                 };
             }
             let mut data = [0u8; 16384];
             let n = if self.raw_read {
                 self.tls.sock.read(&mut data)?
             } else {
-                self.tls.read(&mut data)?
+                self.read_plaintext(&mut data)?
             };
             if n == 0 {
                 return Ok(0);
@@ -319,7 +342,9 @@ mod carrier_tests {
 }
 impl<C: Connection> Write for VlessCarrier<C> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.is_empty(){return Ok(0);}
         if self.first_write && self.id.is_some() {
+            if self.first_frame.is_none(){
             let n = data.len().min(8192);
             let mut frame = self.id.unwrap().to_vec();
             // END keeps this direction in certificate-verified outer TLS.
@@ -330,15 +355,23 @@ impl<C: Connection> Write for VlessCarrier<C> {
             let mut padding = [0u8; 64];
             getrandom::getrandom(&mut padding).map_err(io::Error::other)?;
             frame.extend(padding);
-            self.tls.conn.writer().write_all(&frame)?;
+            self.first_frame=Some((frame,0,n));
+            }
+            let(frame,offset,n)=self.first_frame.as_mut().unwrap();
+            while *offset<frame.len(){let written=self.tls.conn.writer().write(&frame[*offset..])?;if written==0{return Err(io::ErrorKind::WouldBlock.into());}*offset+=written;}
+            let n=*n;self.first_frame=None;
             self.first_write = false;
             Ok(n)
         } else {
             self.first_write = false;
-            self.tls.conn.writer().write(data)
+            // rustls' bounded plaintext writer returns zero when its buffer is full.
+            // The worker must flush/retry, rather than tear down a live carrier.
+            match self.tls.conn.writer().write(data)?{0=>Err(io::ErrorKind::WouldBlock.into()),n=>Ok(n)}
         }
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.tls.flush()
+        self.tls.conn.writer().flush()?;
+        while self.tls.conn.wants_write(){if self.tls.conn.write_tls(&mut self.tls.sock)?==0{return Err(io::ErrorKind::WriteZero.into());}}
+        self.tls.sock.flush()
     }
 }

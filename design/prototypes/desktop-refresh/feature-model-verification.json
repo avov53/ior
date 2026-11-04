@@ -1,0 +1,21 @@
+{
+  "kind": "non-browser event and markup simulation",
+  "importDrafts": true,
+  "profileLinks": true,
+  "profileSelection": true,
+  "routeRules": true,
+  "routeOrderValidation": true,
+  "routeImport": true,
+  "routeSelection": true,
+  "dirtyGuard": true,
+  "subscriptionSettings": true,
+  "hwidLocalOnly": true,
+  "services": true,
+  "configCopy": true,
+  "share": true,
+  "deleteReferences": true,
+  "settingsInventory": true,
+  "unavailableOperationsHonest": true,
+  "backupValidation": true,
+  "visualChecks": "not performed: local file browser restriction"
+}

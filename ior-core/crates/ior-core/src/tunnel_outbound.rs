@@ -30,29 +30,81 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::mpsc,
 };
-type Packet = Vec<u8>;
+type Packet = crate::packet_budget::Packet;
 pub(crate) type Flows = Arc<Mutex<HashMap<(u8, u16), (SocketAddr, PacketSender)>>>;
 #[derive(Clone)]
 pub(crate) struct PacketSender {
+    counters:Option<Arc<IngressCounters>>,
     sender: mpsc::Sender<Packet>,
+    budget: Option<Arc<crate::packet_budget::Budget>>,
+    native_budget: Option<Arc<crate::packet_budget::Budget>>,
+    native_ingress: Arc<std::sync::OnceLock<NativeIngress>>,
+}
+const NATIVE_PENDING_PACKETS:usize=2048;
+#[derive(Default)]
+struct IngressCounters{received:std::sync::atomic::AtomicU64,delivered:std::sync::atomic::AtomicU64,dropped_bytes:std::sync::atomic::AtomicU64,dropped:std::sync::atomic::AtomicU64,wait_us:std::sync::atomic::AtomicU64,closed:std::sync::atomic::AtomicBool}
+impl IngressCounters{
+    fn discard(&self,bytes:usize){self.dropped_bytes.fetch_add(bytes as u64,Ordering::Relaxed);self.dropped.fetch_add(1,Ordering::Relaxed);}
+    fn snapshot(&self)->[u64;6]{let received=self.received.load(Ordering::Relaxed);let delivered=self.delivered.load(Ordering::Relaxed);let closed=self.closed.load(Ordering::Relaxed);[received,delivered,if closed{0}else{received.saturating_sub(delivered).saturating_sub(self.dropped_bytes.load(Ordering::Relaxed))},self.dropped.load(Ordering::Relaxed),self.wait_us.load(Ordering::Relaxed),closed as u64]}
+}
+struct NativeIngress {sender:mpsc::Sender<Packet>,task:tokio::task::AbortHandle,counters:Option<Arc<IngressCounters>>}
+impl Drop for NativeIngress {fn drop(&mut self){if let Some(c)=&self.counters{c.closed.store(true,Ordering::Relaxed);}self.task.abort();}}
+impl NativeIngress {
+    fn start(output:mpsc::Sender<Packet>,counters:Option<Arc<IngressCounters>>)->Self{
+        let(sender,mut input)=mpsc::channel::<Packet>(NATIVE_PENDING_PACKETS);
+        let stats=counters.clone();
+        let task=tokio::spawn(async move{while let Some(packet)=input.recv().await{let size=packet.len();let started=stats.as_ref().map(|_|std::time::Instant::now());let result=output.send(packet).await;if let Some(c)=&stats{c.wait_us.fetch_add(started.unwrap().elapsed().as_micros().min(u64::MAX as u128) as u64,Ordering::Relaxed);if result.is_ok(){c.delivered.fetch_add(size as u64,Ordering::Relaxed);}else{c.discard(size);c.closed.store(true,Ordering::Relaxed);}}if result.is_err(){break;}}});
+        Self{sender,task:task.abort_handle(),counters}
+    }
 }
 impl PacketSender {
+    fn new(sender:mpsc::Sender<Packet>,budget:Option<Arc<crate::packet_budget::Budget>>,native_budget:Option<Arc<crate::packet_budget::Budget>>)->Self{let counters=(native_budget.is_some()&&crate::resource_diagnostics::active()).then(||Arc::new(IngressCounters::default()));Self{sender,budget,native_budget,native_ingress:Default::default(),counters}}
+    async fn deliver_native(&self,bytes:&[u8]) {
+        if let Some(budget)=&self.native_budget {
+            if let Some(c)=&self.counters{c.received.fetch_add(bytes.len() as u64,Ordering::Relaxed);}
+            // Never await a single consumer in the shared crypto/timer loop.
+            // This FIFO is lazy, count-bounded and charged to the session budget.
+            if self.native_ingress.get().is_none(){
+                match self.sender.try_reserve(){
+                    Ok(slot)=>{match budget.copy(bytes){Ok(packet)=>{slot.send(packet);if let Some(c)=&self.counters{c.delivered.fetch_add(bytes.len() as u64,Ordering::Relaxed);}},Err(_)=>if let Some(c)=&self.counters{c.discard(bytes.len());}}return;},
+                    Err(mpsc::error::TrySendError::Closed(_))=>{if let Some(c)=&self.counters{c.discard(bytes.len());c.closed.store(true,Ordering::Relaxed);}return;},
+                    Err(mpsc::error::TrySendError::Full(_))=>(),
+                }
+            }
+            // Once staged, all following packets use the same FIFO until close.
+            // Do not let a newly free output slot overtake retained packets.
+            let ingress=self.native_ingress.get_or_init(||NativeIngress::start(self.sender.clone(),self.counters.clone()));
+            match ingress.sender.try_reserve(){
+                Ok(slot)=>match budget.copy(bytes){Ok(packet)=>slot.send(packet),Err(_)=>if let Some(c)=&self.counters{c.discard(bytes.len());}},
+                Err(mpsc::error::TrySendError::Full(_))=>{if let Some(c)=&self.counters{c.discard(bytes.len());}budget.queue_drop();crate::tunnel_metrics::RX_DROPPED.fetch_add(1,Ordering::Relaxed);},
+                Err(mpsc::error::TrySendError::Closed(_))=>if let Some(c)=&self.counters{c.discard(bytes.len());c.closed.store(true,Ordering::Relaxed);},
+            }
+        }else{self.deliver(bytes);}
+    }
     fn deliver(&self, bytes: &[u8]) {
+        if let Some(c)=&self.counters{c.received.fetch_add(bytes.len() as u64,Ordering::Relaxed);}
         if let Ok(slot) = self.sender.try_reserve() {
-            slot.send(bytes.to_vec());
+            let packet=match &self.budget {Some(budget)=>match budget.copy(bytes){Ok(packet)=>packet,Err(_)=>{if let Some(c)=&self.counters{c.discard(bytes.len());}return;}},None=>bytes.to_vec().into()};
+            slot.send(packet);
+            if let Some(c)=&self.counters{c.delivered.fetch_add(bytes.len() as u64,Ordering::Relaxed);}
         } else {
+            if let Some(c)=&self.counters{c.discard(bytes.len());if self.sender.is_closed(){c.closed.store(true,Ordering::Relaxed);}}
             crate::tunnel_metrics::RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if let Some(budget)=&self.budget {budget.queue_drop();}
         }
     }
 }
 #[derive(Clone)]
 pub struct TunnelConnector {
+    names: Arc<crate::tun_names::NameCache>,
     session: Arc<Session>,
     upstreams: Vec<SocketAddr>,
     dns_cache: Arc<crate::dns_response_cache::DnsResponseCache>,
     dns_inflight: Arc<Mutex<HashMap<(String, u16), std::sync::Weak<tokio::sync::Mutex<()>>>>>,
 }
 struct Session {
+    packet_budget: Arc<crate::packet_budget::Budget>,
+    awg: bool,
     tcp_tuning: crate::tunnel_tcp::Tuning,
     receive_budget: Arc<tokio::sync::Semaphore>,
     ip: Ipv4Addr,
@@ -146,7 +198,8 @@ impl TunnelConnector {
         if !(1280..=1500).contains(&profile.options.mtu.unwrap_or(1380)) {
             return Err(fail("TUNNEL_MTU_INVALID"));
         }
-        if profile.protocol != "wireguard" {
+        if profile.protocol == "amneziawg" {crate::awg_adapter::validate_options(profile)?;}
+        else if profile.protocol != "wireguard" {
             return Err(fail("PROTOCOL_UNSUPPORTED"));
         }
         Ok(())
@@ -233,7 +286,12 @@ impl TunnelConnector {
         getrandom::getrandom(&mut port_seed).map_err(io::Error::other)?;
         let initial_port = 1024 + u16::from_ne_bytes(port_seed) % 50000;
         let flows: Flows = Arc::new(Mutex::new(HashMap::new()));
-        let task = {
+        let packet_budget=Arc::new(crate::packet_budget::Budget::default());
+        let metrics_budget=packet_budget.clone();
+        let awg=profile.protocol == "amneziawg";
+        let task = if profile.protocol == "amneziawg" {
+            if profile.options.awg_engine.as_deref()==Some("rust"){crate::awg_rust::start(profile,bootstrap,network,rx,flows.clone(),ip,ip6,packet_budget.clone()).await?}else{crate::awg_adapter::start(profile,bootstrap,network,rx,flows.clone(),ip,ip6).await?}
+        } else {
             let endpoint = SocketAddr::new(
                 crate::dns_engine::resolve_server_ip_bound(&profile.server, bootstrap, &network)
                     .await?
@@ -272,11 +330,15 @@ impl TunnelConnector {
                 guard,
             ))
         };
-        crate::trace::code("transport", "WIREGUARD_ENGINE_READY");
+        crate::trace::code("transport", if awg {"AWG_PACKET_ENGINE_READY"}else{"WIREGUARD_ENGINE_READY"});
+        if awg {crate::trace::emit(serde_json::json!({"stage":"transport","code":"AWG_FALLBACK_TCP_PARAMETERS","receiveBytes":crate::tunnel_tcp::LARGE_RECEIVE,"sendBytes":crate::tunnel_tcp::BASE_RECEIVE,"additionalBudgetBytes":crate::tunnel_tcp::EXTRA_BUDGET,"nagleEnabled":false}));}
         Ok(Self {
+            names: Arc::new(crate::tun_names::NameCache::default()),
             session: Arc::new(Session {
+                packet_budget,
+                awg: profile.protocol == "amneziawg",
                 tcp_tuning: crate::tunnel_tcp::Tuning {
-                    receive_bytes: crate::tunnel_tcp::BASE_RECEIVE,
+                    receive_bytes: if awg {crate::tunnel_tcp::AWG_RECEIVE}else{crate::tunnel_tcp::BASE_RECEIVE},
                     cubic: false,
                     reassembly_segments: 4,
                 },
@@ -298,13 +360,14 @@ impl TunnelConnector {
                     loop {
                         timer.tick().await;
                         crate::tunnel_metrics::report();
+                        if awg {metrics_budget.report();crate::tunnel_metrics::pipe_report();}
                     }
                 })
                 .abort_handle(),
                 pmtu: crate::tunnel_pmtu::Cache::default(),
             }),
             upstreams: vec![bootstrap],
-            dns_cache: Arc::new(crate::dns_response_cache::DnsResponseCache::default()),
+            dns_cache: Arc::new(if awg {crate::dns_response_cache::DnsResponseCache::shared_awg()}else{crate::dns_response_cache::DnsResponseCache::default()}),
             dns_inflight: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -350,7 +413,9 @@ impl TunnelConnector {
             crate::dns_exchange::hedged_with_delay(&servers, self.dns_hedge_delay(), |server| {
                 let query = &query;
                 async move {
-                    if let Some(answer) = self.dns_cache.get(query, &server, false) {
+                    let scope=if self.session.awg {format!("PROXY|{server}")}else{server.clone()};
+                    if let Some(answer) = self.dns_cache.get(query,&scope,false) {
+                        if self.session.awg {crate::trace::emit(serde_json::json!({"stage":"dns","code":"AWG_DNS_SHARED_CACHE_HIT","resolver":server,"queryType":kind}));}
                         return Ok(answer);
                     }
                     let mut relay =
@@ -362,11 +427,16 @@ impl TunnelConnector {
                             io::Error::new(io::ErrorKind::TimedOut, "TUNNEL_DNS_TIMEOUT")
                         })??;
                     crate::dns_engine::decode_address_answers(&answer, query)?;
-                    self.dns_cache.insert(query, &server, false, &answer);
+                    self.dns_cache.insert(query, &scope, false, &answer);
                     Ok(answer)
                 }
             })
-            .await?;
+        .await?;
+        if self.session.awg {
+            if let Ok(question)=crate::tun_names::question(&query) {
+                if self.names.observe(&answer,&question).is_err(){crate::trace::code("dns","AWG_TRANSPORT_NAME_OBSERVATION_REJECTED");}
+            }
+        }
         let mut result = Vec::new();
         for ip in crate::dns_engine::decode_address_answers(&answer, &query)? {
             let allowed = match ip {
@@ -551,7 +621,7 @@ impl TunnelConnector {
             }
             if !flows.contains_key(&(protocol, port)) {
                 let (tx, rx) = mpsc::channel(capacity);
-                flows.insert((protocol, port), (remote, PacketSender { sender: tx }));
+                flows.insert((protocol, port), (remote, PacketSender::new(tx,if _raw {Some(self.session.packet_budget.clone())}else{None},if self.session.awg {Some(self.session.packet_budget.clone())}else{None})));
                 return Ok((
                     port,
                     rx,
@@ -571,6 +641,10 @@ pub(crate) async fn dispatch(
     local6: Option<Ipv6Addr>,
     packet: &[u8],
 ) -> io::Result<()> {
+    dispatch_impl(flows,local,local6,packet,false).await
+}
+pub(crate) async fn dispatch_native(flows:&Flows,local:Ipv4Addr,local6:Option<Ipv6Addr>,packet:&[u8])->io::Result<()>{dispatch_impl(flows,local,local6,packet,true).await}
+async fn dispatch_impl(flows:&Flows,local:Ipv4Addr,local6:Option<Ipv6Addr>,packet:&[u8],native:bool)->io::Result<()> {
     let local_ip = if packet.first().is_some_and(|byte| byte >> 4 == 6) {
         local6.map(IpAddr::V6)
     } else {
@@ -579,6 +653,7 @@ pub(crate) async fn dispatch(
     let quoted = local_ip
         .and_then(|local| crate::tunnel_pmtu::message(packet, local))
         .map(|(protocol, port, remote, _)| (protocol, port, remote))
+        .or_else(||local_ip.and_then(|local|crate::awg_packets::error_tuple(packet,local)).filter(|(protocol,port,remote)|flows.lock().is_ok_and(|flows|flows.get(&(*protocol,*port)).is_some_and(|(address,sender)|address==remote&&sender.budget.is_some()))))
         .or_else(|| crate::tunnel_pmtu::error_flow(packet, local));
     if let Some((protocol, port, remote)) = quoted {
         let sender = flows
@@ -588,7 +663,7 @@ pub(crate) async fn dispatch(
             .filter(|(address, _)| *address == remote)
             .map(|(_, sender)| sender.clone());
         if let Some(sender) = sender {
-            sender.deliver(packet);
+            if native{sender.deliver_native(packet).await;}else{sender.deliver(packet);}
         }
         return Ok(());
     }
@@ -635,7 +710,7 @@ pub(crate) async fn dispatch(
         .filter(|(remote, _)| remote.ip() == remote_ip && remote.port() == source)
         .map(|(_, sender)| sender.clone());
     if let Some(sender) = sender {
-        sender.deliver(packet);
+        if native{sender.deliver_native(packet).await;}else{sender.deliver(packet);}
     }
     Ok(())
 }
@@ -720,8 +795,23 @@ impl Drop for FlowLease {
     }
 }
 impl OutboundConnector for TunnelConnector {
+    fn named_tun_destination(&self)->bool {false}
+    fn dns_response_cache(&self)->Option<Arc<crate::dns_response_cache::DnsResponseCache>> {self.session.awg.then(||self.dns_cache.clone())}
+    fn dns_observations(&self)->Option<Arc<crate::tun_names::NameCache>> {self.session.awg.then(||self.names.clone())}
+    fn packet_path_enabled(&self)->bool {self.session.awg}
+    fn raw_packet(&self, source:SocketAddr,remote:SocketAddr,protocol:u8)->Option<crate::awg_packets::OpenFuture> {
+        if !self.session.awg {return None;}
+        let this=self.clone();
+        Some(Box::pin(async move {
+            match remote.ip(){IpAddr::V4(ip)=>this.check_allowed(ip)?,IpAddr::V6(ip)=>this.check_allowed6(ip)?};
+            if source.is_ipv6()!=remote.is_ipv6(){return Err(fail("AWG_PACKET_FAMILY_MISMATCH"));}
+            let (port,rx,lease)=this.register_capacity(protocol,remote,64,true)?;
+            let ip=if remote.is_ipv6(){this.session.ip6.ok_or_else(||fail("TUNNEL_IPV6_LOCAL_ADDRESS_REQUIRED"))?.into()}else{this.session.ip.into()};
+            Ok(Box::new(RawPacketRelay{session:this.session.clone(),source,local:SocketAddr::new(ip,port),remote,protocol,rx:tokio::sync::Mutex::new(rx),_lease:lease}) as Box<dyn crate::awg_packets::PacketRelay>)
+        }))
+    }
     fn dns_hedge_delay(&self) -> Duration {
-        Duration::from_millis(500)
+        Duration::from_millis(if self.session.awg {150}else{500})
     }
     fn ipv4_only(&self) -> bool {
         self.session.ip6.is_none() || self.session.allowed6.is_empty()
@@ -814,6 +904,42 @@ impl OutboundConnector for TunnelConnector {
     }
 }
 
+struct RawPacketRelay {
+    session: Arc<Session>,source:SocketAddr,local:SocketAddr,remote:SocketAddr,protocol:u8,
+    rx:tokio::sync::Mutex<mpsc::Receiver<Packet>>,_lease:FlowLease,
+}
+impl crate::awg_packets::PacketRelay for RawPacketRelay {
+    fn delivery_snapshot(&self)->Option<[u64;6]>{self.session.flows.lock().ok().and_then(|flows|flows.get(&(self.protocol,self.local.port())).and_then(|(_,sender)|sender.counters.as_ref().map(|c|c.snapshot())))}
+    fn send<'a>(&'a self,bytes:&'a [u8])->crate::awg_packets::SendFuture<'a> {
+        Box::pin(async move {
+            let t=crate::awg_packets::tuple(bytes).ok_or(io::ErrorKind::InvalidData)?;
+            if t.source!=self.source || t.destination!=self.remote || t.protocol!=self.protocol{return Err(fail("AWG_PACKET_TUPLE_MISMATCH"));}
+            let mut packet=self.session.packet_budget.copy(bytes)?;
+            crate::awg_packets::translate(&mut packet,self.local,true)?;
+            let mtu=self.session.pmtu.get(self.remote,self.session.mtu);
+            if packet.len()<=mtu {
+                self.session.tx.try_send(packet).map_err(|error|match error {mpsc::error::TrySendError::Full(_)=>{self.session.packet_budget.queue_drop();io::Error::new(io::ErrorKind::WouldBlock,"AWG_PACKET_QUEUE_FULL")},mpsc::error::TrySendError::Closed(_)=>io::Error::new(io::ErrorKind::BrokenPipe,"AWG_PACKET_ENGINE_STOPPED")})?;
+            } else {
+                for bytes in crate::tunnel_fragments::fragment(&packet,mtu)? {
+                    let packet=self.session.packet_budget.copy(&bytes)?;
+                    self.session.tx.try_send(packet).map_err(|error|match error {mpsc::error::TrySendError::Full(_)=>{self.session.packet_budget.queue_drop();io::Error::new(io::ErrorKind::WouldBlock,"AWG_PACKET_QUEUE_FULL")},mpsc::error::TrySendError::Closed(_)=>io::Error::new(io::ErrorKind::BrokenPipe,"AWG_PACKET_ENGINE_STOPPED")})?;
+                }
+            }
+            Ok(())
+        })
+    }
+    fn receive(&self)->crate::awg_packets::PacketFuture<'_> {
+        Box::pin(async move {
+            let mut rx=self.rx.lock().await;
+            let mut packet=rx.recv().await.ok_or(io::ErrorKind::BrokenPipe)?;
+            if let Some((protocol,port,remote,mtu))=crate::tunnel_pmtu::message(&packet,self.local.ip()) {
+                if protocol==self.protocol && port==self.local.port() && remote==self.remote {self.session.pmtu.update(remote,mtu,self.session.mtu);}
+            }
+            crate::awg_packets::translate_reply(&mut packet,self.source)?;
+            Ok(packet)
+        })
+    }
+}
 struct TunnelDatagram {
     session: Arc<Session>,
     port: u16,
@@ -1090,7 +1216,8 @@ async fn tcp_flow(
         smoltcp::socket::tcp::SocketBuffer::new(vec![0; receive_size]),
         smoltcp::socket::tcp::SocketBuffer::new(vec![0; 128 * 1024]),
     );
-    socket.set_nagle_enabled(true);
+    // Preserve the accepted AWG fallback tuning; other tunnels keep Nagle.
+    socket.set_nagle_enabled(!session.awg);
     assert!(socket.set_reassembly_limit(session.tcp_tuning.reassembly_segments));
     socket.set_congestion_control(session.tcp_tuning.congestion());
     let handle = sockets.add(socket);
@@ -1238,7 +1365,7 @@ async fn tcp_flow(
             packet=packets.recv()=>match packet{Some(packet)=>{
                 if let Some((_,_,address,mtu))=crate::tunnel_pmtu::message(&packet,local){
                     if address==remote && session.pmtu.update(remote,mtu,session.mtu){device.mtu=session.pmtu.get(remote,session.mtu);crate::trace::code("tunnel","TUNNEL_PATH_MTU_UPDATED");}
-                }else{device.rx.push_back(packet);}
+                }else{device.rx.push_back(packet.into_vec());}
             },None=>return Err(io::ErrorKind::BrokenPipe.into())},
             size=app_read.read(&mut buffer),if !eof && ready.is_none() && pending.len()<128*1024=>{let n=size?;if n==0{eof=true;}else{pending.extend(&buffer[..n]);}},
             result=&mut writer,if !writer_done=>{result.map_err(io::Error::other)??;writer_done=true;},
@@ -1250,6 +1377,47 @@ async fn tcp_flow(
 }
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn diagnostic_ingress_counters_distinguish_waiting_from_delivered_data(){
+        let budget=Arc::new(crate::packet_budget::Budget::default());let(tx,mut rx)=mpsc::channel(1);
+        let mut sender=PacketSender::new(tx,Some(budget.clone()),Some(budget.clone()));let counters=Arc::new(IngressCounters::default());sender.counters=Some(counters.clone());
+        sender.deliver_native(b"one").await;assert_eq!(&counters.snapshot()[..3],&[3,3,0]);
+        sender.deliver_native(b"two").await;assert_eq!(&counters.snapshot()[..3],&[6,3,3]);
+        drop(rx.recv().await.unwrap());let packet=tokio::time::timeout(Duration::from_millis(100),rx.recv()).await.unwrap().unwrap();assert_eq!(&packet[..],b"two");drop(packet);
+        assert_eq!(&counters.snapshot()[..3],&[6,6,0]);drop(sender);drop(rx);assert_eq!(counters.snapshot()[5],1);
+        tokio::time::timeout(Duration::from_secs(1),async{while budget.used()!=0{tokio::task::yield_now().await;}}).await.unwrap();
+    }
+    #[tokio::test]
+    async fn native_queue_pressure_is_bounded_and_does_not_stop_another_receiver(){
+        let budget=Arc::new(crate::packet_budget::Budget::default());
+        let (slow,slow_rx)=mpsc::channel(1);let (fast,mut fast_rx)=mpsc::channel(1);
+        let slow=PacketSender::new(slow,Some(budget.clone()),Some(budget.clone()));let fast=PacketSender::new(fast,None,Some(budget.clone()));
+        slow.deliver_native(b"held").await;
+        let before=crate::tunnel_metrics::RX_DROPPED.load(Ordering::Relaxed);
+        for _ in 0..10000{slow.deliver_native(&[7;1024]).await;}
+        assert!(budget.used()<=crate::packet_budget::LIMIT);
+        assert!(crate::tunnel_metrics::RX_DROPPED.load(Ordering::Relaxed)>before,"overflow must be counted");
+        fast.deliver_native(b"still alive").await;
+        let packet=tokio::time::timeout(Duration::from_millis(100),fast_rx.recv()).await.unwrap().unwrap();assert_eq!(&packet[..],b"still alive");drop(packet);
+        drop(slow);drop(fast);drop(slow_rx);drop(fast_rx);
+        tokio::time::timeout(Duration::from_secs(1),async{while budget.used()!=0{tokio::task::yield_now().await;}}).await.unwrap();
+    }
+    #[tokio::test]
+    async fn native_slow_reader_does_not_block_other_flows_and_releases_pending_packets(){
+        let budget=Arc::new(crate::packet_budget::Budget::default());
+        let (tx_a,mut rx_a)=mpsc::channel(1);let (tx_b,mut rx_b)=mpsc::channel(1);
+        let a=PacketSender::new(tx_a,Some(budget.clone()),Some(budget.clone()));let b=PacketSender::new(tx_b,None,Some(budget.clone()));
+        a.deliver_native(b"initial").await;
+        tokio::time::timeout(Duration::from_millis(100),async{
+            for index in 0..128u8{a.deliver_native(&[index]).await;}
+            b.deliver_native(b"independent").await;
+        }).await.expect("native engine must not wait on one paused receiver");
+        let received=tokio::time::timeout(Duration::from_millis(100),rx_b.recv()).await.unwrap().unwrap();assert_eq!(&received[..],b"independent");drop(received);
+        let received=rx_a.recv().await.unwrap();assert_eq!(&received[..],b"initial");drop(received);
+        for index in 0..128u8{let received=rx_a.recv().await.unwrap();assert_eq!(&received[..],&[index]);}
+        a.deliver_native(b"cancelled").await;drop(a);drop(b);drop(rx_a);drop(rx_b);
+        tokio::time::timeout(Duration::from_secs(1),async{while budget.used()!=0{tokio::task::yield_now().await;}}).await.expect("cancel must free all pending packet storage");
+    }
     use super::*;
     use futures::{SinkExt, StreamExt};
     #[tokio::test]
@@ -1288,7 +1456,10 @@ mod tests {
         let budget = Arc::new(tokio::sync::Semaphore::new(crate::tunnel_tcp::EXTRA_BUDGET));
         let flows = Arc::new(Mutex::new(HashMap::new()));
         let connector = TunnelConnector {
+            names: Arc::new(crate::tun_names::NameCache::default()),
             session: Arc::new(Session {
+                packet_budget:Arc::new(crate::packet_budget::Budget::default()),
+                awg:false,
                 tcp_tuning: crate::tunnel_tcp::Tuning {
                     receive_bytes: crate::tunnel_tcp::LARGE_RECEIVE,
                     cubic: false,
@@ -1650,3 +1821,7 @@ mod tests {
         tasks.abort_all();
     }
 }
+
+#[cfg(test)]
+#[path="awg_packet_lab.rs"]
+mod awg_packet_lab;

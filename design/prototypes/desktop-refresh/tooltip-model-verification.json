@@ -1,0 +1,12 @@
+{
+  "kind": "pure event and timer simulation",
+  "delay300ms": true,
+  "singleTooltip": true,
+  "clickSuppression": true,
+  "leaveReenter": true,
+  "noCurrentTabRerender": true,
+  "keyboardFocusOnly": true,
+  "scrollCancels": true,
+  "expandedNavigationNoDuplicate": true,
+  "visualFlicker": "not checked in browser"
+}

@@ -1,7 +1,7 @@
 [workspace]
-members = ["crates/ior-core", "vendor-netstack"]
+members = ["crates/ior-core", "crates/ior-android", "vendor-netstack"]
 default-members = ["crates/ior-core"]
-exclude = ["vendor-reality", "vendor-vmess", "vendor-hysteria", "vendor-smoltcp"]
+exclude = ["vendor-reality", "vendor-vmess", "vendor-hysteria", "vendor-smoltcp", "vendor-awg"]
 resolver = "2"
 
 

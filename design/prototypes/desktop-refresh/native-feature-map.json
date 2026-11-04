@@ -1,0 +1,308 @@
+[
+  {
+    "command": "state.get",
+    "surface": "Оболочка и локальные данные",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "backup.export",
+    "surface": "Настройки → Данные",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "backup.import",
+    "surface": "Настройки → Данные",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "external.open",
+    "surface": "Меню приложения",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "connection.toggle",
+    "surface": "Главная → Подключение",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "connection.mode",
+    "surface": "Главная → Подключение",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "server.select",
+    "surface": "Меню сервера и редактор",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "server.import",
+    "surface": "Меню сервера и редактор",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "server.rename",
+    "surface": "Меню сервера и редактор",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "server.get",
+    "surface": "Меню сервера и редактор",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "server.share",
+    "surface": "Меню сервера и редактор",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "subscription.share",
+    "surface": "Меню подписки, редактор и разрешения HWID",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "server.copy",
+    "surface": "Меню сервера и редактор",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "server.save",
+    "surface": "Меню сервера и редактор",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "server.delete",
+    "surface": "Меню сервера и редактор",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "subscription.refresh",
+    "surface": "Меню подписки, редактор и разрешения HWID",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "subscription.hwid.approve",
+    "surface": "Меню подписки, редактор и разрешения HWID",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "subscription.hwid.prompt",
+    "surface": "Меню подписки, редактор и разрешения HWID",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "subscription.hwid.current",
+    "surface": "Меню подписки, редактор и разрешения HWID",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "subscription.hwid.dismiss",
+    "surface": "Меню подписки, редактор и разрешения HWID",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "subscription.hwid.settings",
+    "surface": "Меню подписки, редактор и разрешения HWID",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "subscription.rename",
+    "surface": "Меню подписки, редактор и разрешения HWID",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "subscription.delete",
+    "surface": "Меню подписки, редактор и разрешения HWID",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "settings.update",
+    "surface": "Настройки",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "connectionProfile.save",
+    "surface": "Профили",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "connectionProfile.select",
+    "surface": "Профили",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "iorTrafficMode.set",
+    "surface": "Профиль → Только Standard, удалённый Gaming не возвращается",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "connectionProfile.delete",
+    "surface": "Профили",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "route.save",
+    "surface": "Маршруты и редактор правил",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "route.select",
+    "surface": "Маршруты и редактор правил",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "route.rename",
+    "surface": "Маршруты и редактор правил",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "route.delete",
+    "surface": "Маршруты и редактор правил",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "route.import",
+    "surface": "Маршруты и редактор правил",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "route.convert",
+    "surface": "Маршруты и редактор правил",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "route.share",
+    "surface": "Маршруты и редактор правил",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "service.save",
+    "surface": "Главная → Отслеживаемые сервисы",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "service.visibility",
+    "surface": "Главная → Отслеживаемые сервисы",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "service.delete",
+    "surface": "Главная → Отслеживаемые сервисы",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "logs.clear",
+    "surface": "Журнал",
+    "prototypeBehavior": "Локальный аналог интерфейса; хранилище прототипа, без вызова C#",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "diagnostics.export",
+    "surface": "Дополнительно → Обновление и диагностика",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "config.get",
+    "surface": "Меню сервера → Конфигурация ядра",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "config.preview",
+    "surface": "Меню сервера → Конфигурация ядра",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "config.validatePreview",
+    "surface": "Меню сервера → Конфигурация ядра",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "config.validate",
+    "surface": "Меню сервера → Конфигурация ядра",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "app.update.download",
+    "surface": "Обновление и диагностика / элементы оболочки",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "window.drag",
+    "surface": "Кнопки заголовка, недоступны вне приложения",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "window.minimize",
+    "surface": "Кнопки заголовка, недоступны вне приложения",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "window.maximize",
+    "surface": "Кнопки заголовка, недоступны вне приложения",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "window.close",
+    "surface": "Кнопки заголовка, недоступны вне приложения",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "app.exit",
+    "surface": "Обновление и диагностика / элементы оболочки",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  },
+  {
+    "command": "app.update.apply",
+    "surface": "Обновление и диагностика / элементы оболочки",
+    "prototypeBehavior": "Представлено как недоступная системная операция; объяснение требуется приложением",
+    "nativeCommandSent": false
+  }
+]

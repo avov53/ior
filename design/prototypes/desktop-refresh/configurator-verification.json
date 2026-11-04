@@ -1,0 +1,28 @@
+{
+  "tableConfigurator": true,
+  "filters": true,
+  "keyboardSelection": true,
+  "editorOnExplicitAction": true,
+  "vlessDecodeAndEncode": true,
+  "secretsHidden": true,
+  "portValidation": true,
+  "dirtyConfirmation": true,
+  "subscriptionReadOnly": true,
+  "wideInlineEditor": true,
+  "narrowOverlay": true,
+  "focusContainment": true,
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "widths": [
+    1389,
+    900,
+    460
+  ],
+  "reducedMotion": true,
+  "noAnimatedBackground": true,
+  "productionUnchanged": true,
+  "noNativeCalls": true,
+  "pageErrors": []
+}

@@ -102,6 +102,8 @@ pub(crate) fn build_endpoint(
         .into());
     }
     let std_sock = std::net::UdpSocket::bind(bind_addr)?;
+    #[cfg(target_os = "android")]
+    { use std::os::fd::AsRawFd; crate::android_socket::protect(std_sock.as_raw_fd())?; }
     #[cfg(windows)]
     if let Some(index) = interface_index {
         use std::os::windows::io::AsRawSocket;

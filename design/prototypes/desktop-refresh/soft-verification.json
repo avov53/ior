@@ -1,0 +1,26 @@
+{
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "widths": [
+    1389,
+    900,
+    460
+  ],
+  "singleNavigation": true,
+  "selection": true,
+  "import": true,
+  "editor": true,
+  "maskedSecrets": true,
+  "copyLogs": true,
+  "pendingGuard": true,
+  "errorInTopPanel": true,
+  "statsAfterList": true,
+  "stickyTopPanel": true,
+  "keyboard": true,
+  "reducedMotion": true,
+  "productionUnchanged": true,
+  "noNativeCommands": true,
+  "errors": []
+}

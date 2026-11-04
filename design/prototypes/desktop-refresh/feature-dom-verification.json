@@ -1,0 +1,20 @@
+{
+  "engine": "LinkeDOM, no layout or pixels",
+  "importDialogStable": true,
+  "textareaStable": true,
+  "draftsRetained": true,
+  "shellStable": true,
+  "navigationStable": true,
+  "contextMenus": [
+    "server",
+    "subscription",
+    "profile",
+    "route"
+  ],
+  "rightClickDoesNotSelect": true,
+  "keyboardContext": true,
+  "focusRestore": true,
+  "dirtyGuard": true,
+  "bundledQr": true,
+  "visualAnimationAndWindowSizes": "not checked in browser"
+}

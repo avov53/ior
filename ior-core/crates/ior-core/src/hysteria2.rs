@@ -7,6 +7,15 @@ use crate::{
 };
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
+pub(crate) fn validate_obfs(profile: &WireProfile) -> Result<(), &'static str> {
+ let kind=profile.options.obfs.as_deref().unwrap_or("");
+ let password=profile.options.obfs_password.as_deref().unwrap_or("");
+ if kind.is_empty() || kind=="none" {return if password.is_empty(){Ok(())}else{Err("HYSTERIA2_OBFS_PASSWORD_WITHOUT_TYPE")};}
+ if profile.protocol!="hysteria2" || kind!="salamander" {return Err("HYSTERIA2_OBFS_UNSUPPORTED");}
+ if !(4..=4096).contains(&password.len()){return Err("HYSTERIA2_OBFS_PASSWORD_INVALID");}
+ Ok(())
+}
+
 pub struct Hysteria2Connector {
     client: Arc<rsteria2::ReconnectableClient>,
 }
@@ -32,6 +41,7 @@ impl Hysteria2Connector {
                 "invalid Hysteria2 profile",
             ));
         }
+        validate_obfs(profile).map_err(|code|io::Error::new(io::ErrorKind::InvalidInput,code))?;
         let address =
             dns_engine::resolve_server_ip_bound(&profile.server, bootstrap, &network).await?;
         let start = std::time::Instant::now();
@@ -65,6 +75,7 @@ impl Hysteria2Connector {
             server_name: profile.server_name.clone(),
             auth: profile.credential.clone(),
             insecure: false,
+            obfs_password: profile.options.obfs_password.clone().unwrap_or_default(),
             // Some upstreams defer TCPResponse until the application sends data.
             // Do not deadlock HTTP CONNECT / TLS / WebSocket clients waiting for it.
             // DuplexStream still validates and strips the response on first read.
@@ -88,9 +99,16 @@ impl Hysteria2Connector {
         crate::trace::emit(
             serde_json::json!({"stage":"handshake","code":"HYSTERIA2_HANDSHAKE_AUTHENTICATED","durationMs":start.elapsed().as_millis() as u64}),
         );
-        Ok(Self {
-            client: Arc::new(client),
-        })
+        let client=Arc::new(client);
+        let weak=Arc::downgrade(&client);
+        let metrics_flow=crate::trace::new_flow();
+        tokio::spawn(crate::trace::FLOW.scope(metrics_flow,async move {loop{
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let Some(client)=weak.upgrade() else{return};
+            if let Some((rtt,cwnd,lost,sent,generation))=client.transport_metrics(){crate::trace::emit(serde_json::json!({"stage":"transport","code":"HYSTERIA2_TRANSPORT_METRICS","rttEstimateMs":rtt.as_millis() as u64,"cwndBytes":cwnd,"lostPackets":lost,"sentPackets":sent,"count":generation}));}
+            if let Some((queued,bytes,wait,drops))=client.udp_metrics(){crate::trace::emit(serde_json::json!({"stage":"transport","code":"HYSTERIA2_UDP_QUEUE_METRICS","queuedDatagrams":queued,"queuedBytes":bytes,"sendWaitUs":wait,"receiveQueueDrops":drops,"proxyQueueDrops":crate::proxy_inbound::UDP_QUEUE_DROPS.load(std::sync::atomic::Ordering::Relaxed),"tunQueueDrops":crate::tunnel_metrics::TUN_UDP_DROPPED.load(std::sync::atomic::Ordering::Relaxed)}));}
+        }}));
+        Ok(Self { client })
     }
 
     pub async fn udp_session(&self) -> io::Result<rsteria2::UdpSession> {
@@ -108,6 +126,7 @@ impl Hysteria2Connector {
 }
 
 impl OutboundConnector for Hysteria2Connector {
+    fn named_tun_destination(&self)->bool {true}
     fn udp(&self, host: String, port: u16) -> crate::udp_relay::UdpFuture {
         let client = self.client.clone();
         Box::pin(async move {
@@ -139,12 +158,15 @@ impl OutboundConnector for Hysteria2Connector {
             } else {
                 format!("{host}:{port}")
             };
+            let started=std::time::Instant::now();
             let stream = client.tcp_connect(&address).await.map_err(|_| {
+                crate::trace::code("handshake","HYSTERIA2_TCP_OPEN_FAILED");
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "HYSTERIA2_TCP_CONNECT_FAILED",
                 )
             })?;
+            crate::trace::emit(serde_json::json!({"stage":"handshake","code":"HYSTERIA2_TCP_STREAM_OPENED","durationMs":started.elapsed().as_millis() as u64,"count":client.try_connect_count()}));
             Ok(Box::new(stream) as Box<dyn RelayStream>)
         })
     }
@@ -240,4 +262,11 @@ mod tests {
         );
         connector.close().await;
     }
+}
+
+#[cfg(test)] mod obfs_options_tests {
+ #[test] fn salamander_validation(){
+ let mut p:crate::ipc_contract::WireProfile=serde_json::from_value(serde_json::json!({"protocol":"hysteria2","server":"edge.example","port":443,"credential":"test","serverName":"edge.example","publicKey":null,"shortId":null,"options":{"obfs":"salamander","obfsPassword":"test-obfs"}})).unwrap();
+ assert!(super::validate_obfs(&p).is_ok());p.options.obfs_password=Some("ab".into());assert_eq!(super::validate_obfs(&p),Err("HYSTERIA2_OBFS_PASSWORD_INVALID"));p.options.obfs=Some("unknown".into());assert_eq!(super::validate_obfs(&p),Err("HYSTERIA2_OBFS_UNSUPPORTED"));
+ }
 }
