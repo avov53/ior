@@ -1,5 +1,6 @@
 param([Parameter(Mandatory=$true)][string]$OutputDirectory)
 $ErrorActionPreference='Stop'
+. "$PSScriptRoot/Build-FileHash.ps1"
 $root=Split-Path $PSScriptRoot -Parent
 Set-Location $root
 function Run([string]$Tool,[string[]]$Arguments){

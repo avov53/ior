@@ -1,5 +1,6 @@
 param([switch]$Preflight,[string]$RunId,[string]$OutputDirectory='dist',[string]$Ref='')
 $ErrorActionPreference='Stop'
+. "$PSScriptRoot/Build-FileHash.ps1"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 $githubCommand=Get-Command gh.exe -CommandType Application -ErrorAction SilentlyContinue
 if(!$githubCommand -and (Test-Path -LiteralPath "$env:ProgramFiles/GitHub CLI/gh.exe")){$githubCommand=Get-Item -LiteralPath "$env:ProgramFiles/GitHub CLI/gh.exe"; $githubCommand | Add-Member -NotePropertyName Source -NotePropertyValue $githubCommand.FullName}

@@ -1,5 +1,6 @@
 param([switch]$WindowsOnly,[switch]$RequireMacOS)
 $ErrorActionPreference='Stop'
+. "$PSScriptRoot/Build-FileHash.ps1"
 $root=Split-Path $PSScriptRoot -Parent
 Set-Location $root
 $stage=Join-Path $root ('.local/dist-stage-'+[Guid]::NewGuid().ToString('N'))
