@@ -3,7 +3,7 @@ const host=window.chrome?.webview;
 let snapshot=null,nativeBusy=false,startupError='',nativeRenderSignature='';
 const requests=new Map(),operations=new Map();
 const settingNames={tray:'minimizeToTray',tun:'tunEnabled',proxy:'mixedProxyEnabled',sniff:'sniffEnabled',dns:'dnsServer',port:'mixedProxyPort'};
-const cores={'ior-core':'IorCore','sing-box':'SingBox','xray-core':'XrayCore'};
+const cores={'ior-core':'IorCore','xray-core':'XrayCore'};
 const enumCore=value=>Object.values(cores).find(v=>v.toLowerCase()===String(value).toLowerCase())||'IorCore';
 const uid=()=>crypto.randomUUID().replaceAll('-','');
 let localPrefs={};try{localPrefs=JSON.parse(localStorage.getItem('ior-ui-preferences')||'{}')||{};}catch{}

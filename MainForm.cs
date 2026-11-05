@@ -169,7 +169,7 @@ public sealed partial class MainForm : Form
         _state = LoadState(_statePath);
         // Earlier versions saved preview engines as a cosmetic preference while
         // always launching sing-box. Normalize that legacy value explicitly.
-        if (!CoreEngineService.CanSelect(_state.SelectedCore)) _state.SelectedCore = CoreKind.SingBox;
+        if (!CoreEngineService.CanSelect(_state.SelectedCore)) _state.SelectedCore = CoreKind.IorCore;
         _faviconCache = new ServiceFaviconCache(Path.Combine(_appDir, "favicons"), _httpClient);
         ApplyPackageCompatibilityDefaults(_state);
         ApplyAppearanceSettings();

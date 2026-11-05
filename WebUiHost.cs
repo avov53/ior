@@ -261,7 +261,7 @@ public sealed partial class MainForm
                 NormalizeHappRoutingProfiles(restored);
                 MigrateWebUiState(restored);
                 SubscriptionHwid.ClearImportedPermissions(restored);
-                if (!CoreEngineService.CanSelect(restored.SelectedCore)) restored.SelectedCore = CoreKind.SingBox;
+                if (!CoreEngineService.CanSelect(restored.SelectedCore)) restored.SelectedCore = CoreKind.IorCore;
                 ServiceMonitorCatalog.NormalizeTargets(restored);
                 if (IsConnectionRunning() && !await StopSingBoxAsync()) throw new InvalidOperationException("Не удалось остановить работающее ядро для импорта резервной копии.");
                 File.Copy(_statePath, _statePath + ".before-import." + DateTime.UtcNow.ToString("yyyyMMddHHmmssfff") + ".json", overwrite: false);

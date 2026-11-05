@@ -10,7 +10,7 @@
     <RootNamespace>HappBox</RootNamespace>
     <Product>ior</Product>
     <Title>ior</Title>
-    <Version>1.2.4</Version>
+    <Version>1.2.5</Version>
     <ApplicationIcon>assets\app-icon\icon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <DefaultItemExcludes>$(DefaultItemExcludes);.local\**;android\**;android-output\**;windows-output\**;distandroid\**</DefaultItemExcludes>

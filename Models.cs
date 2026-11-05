@@ -19,7 +19,7 @@ public sealed class AppState
     public NativeTunReadinessResult? NativeTunReadiness { get; set; }
     public int SchemaVersion { get; set; } = 2;
     public string SingBoxPath { get; set; } = "sing-box.exe";
-    public CoreKind SelectedCore { get; set; } = CoreKind.SingBox;
+    public CoreKind SelectedCore { get; set; } = CoreKind.IorCore;
     public CoreKind? RunningCore { get; set; }
     public string? RunningServerId { get; set; }
     public string? RunningServerName { get; set; }
@@ -121,6 +121,7 @@ public sealed class ProxyProfile
     public string? PublicKey { get; set; }
     public string? ShortId { get; set; }
     public string? Fingerprint { get; set; }
+    public string? SupportX25519Mlkem768 { get; set; }
     public string? Security { get; set; }
     public int? AlterId { get; set; }
     public string? Network { get; set; }

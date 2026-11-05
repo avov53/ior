@@ -146,6 +146,7 @@ public static class ClashSubscriptionParser
                     profile.TlsEnabled = true;
                     profile.PublicKey = Required(reality, "public-key");
                     profile.ShortId = Value(reality, "short-id");
+                    profile.SupportX25519Mlkem768 = Value(reality, "support-x25519mlkem768");
                 }
                 profile.Fingerprint = Value(item, "client-fingerprint") ?? "chrome";
                 ApplyStreamOptions(item, profile);

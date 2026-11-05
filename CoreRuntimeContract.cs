@@ -6,6 +6,19 @@ namespace HappBox;
 /// <summary>Version 3 of the private C# ↔ Rust payload: DNS lists and physical addresses of both families.</summary>
 public static class CoreRuntimeContract
 {
+    // These native fingerprints already advertise X25519MLKEM768. Reject requests
+    // for a different provider instead of silently ignoring the subscription flag.
+    public static bool ValidateHybridReality(ProxyProfile profile, out string reason)
+    {
+        reason = "";
+        if (profile.SupportX25519Mlkem768 is null) return true;
+        if (profile.Protocol == ProxyProtocol.Vless && profile.RealityEnabled &&
+            profile.SupportX25519Mlkem768 is "true" or "1" &&
+            profile.Fingerprint is null or "" or "chrome" or "firefox") return true;
+        reason = "support-x25519mlkem768 требует VLESS Reality, true/1 и fingerprint chrome/firefox.";
+        return false;
+    }
+
     public const int ApiVersion = 3;
     public static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -14,6 +27,7 @@ public static class CoreRuntimeContract
     {
         request = null;
         if (RemovedProtocolPolicy.IsRemoved(profile)) { reason = RemovedProtocolPolicy.Message; return false; }
+        if (!ValidateHybridReality(profile, out reason)) return false;
         if (profile.UnsupportedParameters.Count > 0)
         { reason = "Неподдерживаемый параметр: " + string.Join(", ", profile.UnsupportedParameters); return false; }
         var protocol = profile.Protocol switch

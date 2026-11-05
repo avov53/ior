@@ -21,18 +21,20 @@ public static class CoreEngineService
         _ => new(false, false, false, false, false, false, [])
     };
 
-    public static bool CanSelect(CoreKind core) => Enum.IsDefined(core);
+    public static bool CanSelect(CoreKind core) => core is CoreKind.IorCore or CoreKind.XrayCore;
 
-    public static bool CanConnect(CoreKind core) => core is CoreKind.SingBox or CoreKind.XrayCore or CoreKind.IorCore;
+    public static bool CanConnect(CoreKind core) => core is CoreKind.XrayCore or CoreKind.IorCore;
 
     public static bool CanRun(AppState state, ProxyProfile? profile, out string reason)
     {
         if (profile is null) { reason = "Сначала выберите сервер."; return false; }
+        if (!CoreRuntimeContract.ValidateHybridReality(profile, out reason)) return false;
         if(RemovedProtocolPolicy.IsRemoved(profile)){reason=RemovedProtocolPolicy.Message;return false;}
         if (profile.Protocol == ProxyProtocol.AmneziaWG && (state.SelectedCore != CoreKind.IorCore || !state.TunEnabled))
         { reason = "AmneziaWG доступен только с ior-core и TUN."; return false; }
         if (profile.Protocol == ProxyProtocol.AmneziaWG && state.AwgEngine==AwgEngine.Go && !NativeProtocolComponents.VerifyAwg())
         { reason = "AWG: отсутствует проверенный пакетный движок."; return false; }
+        if (!CanConnect(state.SelectedCore)) { reason = "Выберите ior-core или xray-core."; return false; }
         switch (state.SelectedCore)
         {
             case CoreKind.IorCore:
@@ -87,7 +89,6 @@ public static class CoreEngineService
     public static object[] AvailableCores(AppState state) =>
     [
         new { id = "iorCore", name = "ior-core", selectable = true, available = File.Exists(IorCorePath(state)), installed = File.Exists(IorCorePath(state)), version = FileVersion(IorCorePath(state)), backend = "ior-core", detail = "Proxy/TUN Windows 10/11: VLESS Reality, Hysteria2, WireGuard и AmneziaWG. Совместимость проверяется перед запуском.", capabilities = Capability(CoreKind.IorCore,state), combinations = NativeCombinations(state) },
-        new { id = "singBox", name = "sing-box", selectable = true, available = true, installed = File.Exists(state.SingBoxPath), version = FileVersion(state.SingBoxPath), backend = "sing-box", detail = "Рабочий сетевой движок", capabilities = Capability(CoreKind.SingBox) },
         new { id = "xrayCore", name = "xray-core", selectable = true, available = File.Exists(XrayCorePath(state)), installed = File.Exists(XrayCorePath(state)), version = FileVersion(XrayCorePath(state)), backend = "xray-core", detail = "Proxy/TUN Windows 10/11: VLESS Reality, Hysteria2, WireGuard", capabilities = Capability(CoreKind.XrayCore) }
     ];
 

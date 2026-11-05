@@ -58,10 +58,10 @@ public sealed class CoreEngineServiceTests
     [Fact]
     public void NativeBackendCanConnectButProfileCapabilityChecksRemainSeparate()
     {
-        Assert.True(CoreEngineService.CanSelect(CoreKind.SingBox));
+        Assert.False(CoreEngineService.CanSelect(CoreKind.SingBox));
         Assert.True(CoreEngineService.CanSelect(CoreKind.IorCore));
         Assert.True(CoreEngineService.CanSelect(CoreKind.XrayCore));
-        Assert.True(CoreEngineService.CanConnect(CoreKind.SingBox));
+        Assert.False(CoreEngineService.CanConnect(CoreKind.SingBox));
         Assert.True(CoreEngineService.CanConnect(CoreKind.IorCore));
         Assert.True(CoreEngineService.CanConnect(CoreKind.XrayCore));
     }
@@ -70,7 +70,7 @@ public sealed class CoreEngineServiceTests
     public void BackendIsShownOnlyWhileRunning()
     {
         var state = new AppState();
-        Assert.Equal(CoreKind.SingBox, state.SelectedCore);
+        Assert.Equal(CoreKind.IorCore, state.SelectedCore);
         Assert.Null(CoreEngineService.ActiveBackend(state, false));
         Assert.Equal("sing-box", CoreEngineService.ActiveBackend(state, true));
     }

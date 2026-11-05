@@ -20,7 +20,7 @@ public sealed class ClashProfileParserTests
         var server = new ProxyProfile { Protocol = ProxyProtocol.Vless, Server = "edge.example", Port = 443,
             UserId = "11111111-1111-1111-1111-111111111111" };
 
-        Assert.True(CoreEngineService.CanRun(state, server, out _));
+        // The legacy compiler remains usable internally, but its engine is retired.
         var rules = JsonNode.Parse(SingBoxConfigBuilder.Build(state, server))!["route"]!["rules"]!.AsArray();
         var ordered = rules.Where(rule => rule?["domain"] is not null)
             .Select(rule => rule!["domain"]![0]!.GetValue<string>()).ToArray();
@@ -41,7 +41,7 @@ public sealed class ClashProfileParserTests
         var state = new AppState { HappRoutingProfiles = [route], SelectedHappRoutingProfileId = route.Id };
         var server = new ProxyProfile { Protocol = ProxyProtocol.Hysteria2, Server = "edge.example", Port = 443 };
 
-        Assert.False(CoreEngineService.CanRun(state, server, out var reason));
+        Assert.False(SingBoxClashRuleCompiler.TryCompile(route, out _, out var reason));
         Assert.Contains("Группа", reason);
         Assert.Throws<FormatException>(() => SingBoxConfigBuilder.Build(state, server));
     }

@@ -7,8 +7,8 @@ android {
         applicationId = "app.ior.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 20
-        versionName = "1.2.4"
+        versionCode = 21
+        versionName = "1.2.5"
         ndk { abiFilters += "arm64-v8a" }
     }
     signingConfigs {

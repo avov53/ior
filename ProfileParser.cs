@@ -130,12 +130,13 @@ public static class ProfileParser
             PublicKey = Get(q, "pbk") ?? Get(q, "publicKey"),
             ShortId = Get(q, "sid") ?? Get(q, "shortId"),
             Fingerprint = Get(q, "fp") ?? "chrome",
+            SupportX25519Mlkem768 = Get(q, "support-x25519mlkem768"),
             Network = Get(q, "type") ?? Get(q, "network"),
             Host = Get(q, "host") ?? Get(q,"authority"),
             Path = Get(q, "path"),
             ServiceName = Get(q, "serviceName"),
             Alpn=Get(q,"alpn")?.Split(',',StringSplitOptions.RemoveEmptyEntries|StringSplitOptions.TrimEntries),
-            UnsupportedParameters = q.Keys.Where(key=>key is not ("security" or "allowInsecure" or "insecure" or "sni" or "serverName" or "fp" or "type" or "network" or "host" or "path" or "serviceName" or "flow" or "pbk" or "publicKey" or "sid" or "shortId" or "mode" or "multiMode" or "extra" or "encryption" or "packetEncoding" or "spx" or "authority" or "alpn")).ToList()
+            UnsupportedParameters = q.Keys.Where(key=>key is not ("security" or "allowInsecure" or "insecure" or "sni" or "serverName" or "fp" or "type" or "network" or "host" or "path" or "serviceName" or "flow" or "pbk" or "publicKey" or "sid" or "shortId" or "mode" or "multiMode" or "extra" or "encryption" or "packetEncoding" or "spx" or "authority" or "alpn" or "support-x25519mlkem768")).ToList()
         };
         profile.VlessTransport=NativeVlessTransportSettings.Parse(q,profile);
         if(Get(q,"encryption") is {Length:>0} encryption&&encryption!="none")profile.UnsupportedParameters.Add("encryption");
