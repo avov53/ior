@@ -96,6 +96,7 @@ impl NativeRouter {
     pub fn with_full_awg_family_policy(mut self, enabled:bool)->Self {self.reject_unsupported_packet_family=enabled;self}
     pub fn reject_packet_family(&self,destination:IpAddr)->bool {self.reject_unsupported_packet_family && ((destination.is_ipv6()&&self.proxy.ipv4_only())||(destination.is_ipv4()&&self.proxy.ipv6_only()))}
     pub fn packet_path_enabled(&self)->bool {self.proxy.packet_path_enabled()}
+    pub fn direct_family_fallback_enabled(&self)->bool {cfg!(target_os="windows") && self.network.as_ref().is_some_and(|n|n.direct_ipv4_fallback && n.physical_address6.is_none())}
     pub fn named_tun_targets(&self)->bool {self.proxy.named_tun_destination()}
     pub fn raw_packet(&self,source:SocketAddr,destination:SocketAddr,protocol:u8)->Result<crate::awg_packets::OpenFuture,&'static str> {
         if !self.packet_route_is_proxy(destination.ip(), &[]) {return Err("route_requires_name_or_nonproxy");}
@@ -364,12 +365,15 @@ impl NativeRouter {
         address: SocketAddr,
         domain: Option<String>,
     ) -> ConnectFuture {
-        self.connect_destination_policy(address,domain,false)
+        self.connect_destination_policy(address,domain,false,false)
     }
     pub fn connect_sniffed_destination(&self,address:SocketAddr,domain:Option<String>)->ConnectFuture {
-        self.connect_destination_policy(address,domain,true)
+        self.connect_destination_policy(address,domain,true,false)
     }
-    fn connect_destination_policy(&self,address:SocketAddr,domain:Option<String>,sniffed:bool)->ConnectFuture {
+    pub fn connect_observed_destination(&self,address:SocketAddr,domain:Option<String>,sniffed:bool,observed:bool)->ConnectFuture {
+        self.connect_destination_policy(address,domain,sniffed,observed)
+    }
+    fn connect_destination_policy(&self,address:SocketAddr,domain:Option<String>,sniffed:bool,observed:bool)->ConnectFuture {
         let this = self.owned();
         Box::pin(async move {
             let host = domain.unwrap_or_else(|| address.ip().to_string());
@@ -384,6 +388,11 @@ impl NativeRouter {
             if sniffed && decision.target=="PROXY" && this.proxy.named_tun_destination() && host.parse::<IpAddr>().is_err(){
                 crate::trace::code("routing","TUN_PROXY_NAMED_DESTINATION");
                 return this.connect_target("PROXY",&host,address.port()).await;
+            }
+            if direct_ipv4_fallback_allowed(&this.network,address,&host,&decision.target,observed) {
+                let stream=this.connect_target("DIRECT",&host,address.port()).await?;
+                crate::trace::emit(serde_json::json!({"stage":"connect","code":"DIRECT_IPV4_FALLBACK_READY","destinationName":host,"reason":"PHYSICAL_IPV6_ADDRESS_MISSING","addressFamily":"ipv4","transport":"tcp"}));
+                return Ok(stream);
             }
             // Keep the original address except for an IPv4-only proxy's named IPv6 flow.
             // Route selection above still uses the original destination and rule order.
@@ -493,6 +502,10 @@ impl NativeRouter {
             )),
         }
     }
+}
+pub(crate) fn direct_ipv4_fallback_allowed(network:&Option<WireNetwork>,address:SocketAddr,host:&str,target:&str,observed:bool)->bool {
+    cfg!(target_os="windows") && target=="DIRECT" && observed && address.is_ipv6() && host.parse::<IpAddr>().is_err() &&
+        network.as_ref().is_some_and(|n|n.direct_ipv4_fallback && n.physical_address6.is_none() && n.physical_address.parse::<std::net::Ipv4Addr>().is_ok())
 }
 fn validate_cidr(value: &str) -> io::Result<()> {
     let (ip, prefix) = value.split_once('/').ok_or(io::ErrorKind::InvalidInput)?;
@@ -613,6 +626,31 @@ pub(crate) fn bound_socket_family(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_family_policy_requires_verified_name_and_explicit_opt_in() {
+        let mut n:WireNetwork=serde_json::from_value(serde_json::json!({"physicalAddress":"127.0.0.1","interfaceIndex":1})).unwrap();
+        let address:SocketAddr="[2001:db8::7]:443".parse().unwrap();
+        assert!(!direct_ipv4_fallback_allowed(&Some(n.clone()),address,"video.test","DIRECT",true));
+        n.direct_ipv4_fallback=true;
+        assert_eq!(direct_ipv4_fallback_allowed(&Some(n.clone()),address,"video.test","DIRECT",true),cfg!(target_os="windows"));
+        for (host,target,observed) in [("video.test","PROXY",true),("video.test","REJECT",true),("video.test","DIRECT",false),("2001:db8::7","DIRECT",true)] {
+            assert!(!direct_ipv4_fallback_allowed(&Some(n.clone()),address,host,target,observed));
+        }
+        n.physical_address6=Some("::1".into());assert!(!direct_ipv4_fallback_allowed(&Some(n),address,"video.test","DIRECT",true));
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn direct_ipv4_reserve_reaches_only_local_direct_target() {
+        use tokio::io::{AsyncReadExt,AsyncWriteExt};
+        let target=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=target.local_addr().unwrap().port();
+        let responder=tokio::spawn(async move {let(mut stream,_)=target.accept().await.unwrap();let mut bytes=[0;5];stream.read_exact(&mut bytes).await.unwrap();assert_eq!(&bytes,b"proof");});
+        let dns=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();let bootstrap=dns.local_addr().unwrap();
+        let dns_task=tokio::spawn(async move{let mut data=[0;512];let(len,from)=dns.recv_from(&mut data).await.unwrap();let mut reply=data[..len].to_vec();reply[2]=0x81;reply[3]=0x80;reply[7]=1;reply.extend([0xc0,0x0c,0,1,0,1,0,0,0,30,0,4,127,0,0,1]);dns.send_to(&reply,from).await.unwrap();});
+        let network=serde_json::from_value(serde_json::json!({"physicalAddress":"127.0.0.1","interfaceIndex":1,"directIpv4Fallback":true})).unwrap();
+        let router=NativeRouter::new(Arc::new(RoutingDnsProxy),vec![rule("MATCH","","DIRECT")],bootstrap,Some(network)).unwrap();
+        let mut stream=tokio::time::timeout(std::time::Duration::from_secs(3),router.connect_observed_destination(SocketAddr::new("2001:db8::7".parse().unwrap(),port),Some("video.test".into()),true,true)).await.unwrap().unwrap();
+        stream.write_all(b"proof").await.unwrap();responder.await.unwrap();dns_task.await.unwrap();
+    }
     struct RoutingDnsProxy;
     struct RoutingDnsRelay(Option<Vec<u8>>);
     impl DatagramRelay for RoutingDnsRelay {

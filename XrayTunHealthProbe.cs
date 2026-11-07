@@ -14,15 +14,20 @@ public static class XrayTunHealthProbe
         IPAddress? dnsEndpoint = null, string coreLabel = "Xray", bool ipv6Only = false,
         Action<string,int,long,string>? measured=null, Func<string,bool>? proxyTrafficConfirmed=null, bool hedged=true,
         bool fastStart=false, Action<NativeTunReadinessResult>? readiness=null,string? optionalRouteError=null,
-        Func<string,bool>? proxyDnsConfirmed=null,Func<string,string,bool>? proxyPacketTrafficConfirmed=null,bool requireDns=false)
+        Func<string,bool>? proxyDnsConfirmed=null,Func<string,string,bool>? proxyPacketTrafficConfirmed=null,bool requireDns=false,Func<bool>? coreAlive=null)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(25));
+        var extendedCreation=coreLabel=="Xray" && OperatingSystem.IsWindows() && Environment.OSVersion.Version.Build is >=14393 and <22000;
+        if(!extendedCreation)timeout.CancelAfter(TimeSpan.FromSeconds(25));
         try
         {
-            if (!await TunAdapterDiscovery.WaitAsync(adapterName,timeout.Token))
-                return (false, $"{coreLabel} не создал активный TUN-адаптер {adapterName}. Состояние: {TunAdapterDiscovery.DescribeOwnedAdapters()}");
+            var creationBudget=TimeSpan.FromSeconds(extendedCreation?30:10);
+            var creationWatch=System.Diagnostics.Stopwatch.StartNew();
+            if (!await TunAdapterDiscovery.WaitAsync(adapterName,timeout.Token,limit:creationBudget,coreAlive:coreAlive))
+                return (false, $"{coreLabel} не создал активный TUN-адаптер {adapterName}. Состояние: {TunAdapterDiscovery.DescribeOwnedAdapters() + "; Windows=" + Environment.OSVersion.Version + "; ожидание="+creationBudget.TotalSeconds+"s; coreAlive="+(coreAlive?.Invoke().ToString()??"unknown")}");
 
+            measured?.Invoke("tun_adapter_ready",0,creationWatch.ElapsedMilliseconds,"OK");
+            if(extendedCreation)timeout.CancelAfter(TimeSpan.FromSeconds(25));
             // The TUN adapter can be up while the server's own route has already
             // moved into it. Check the actual Windows decision after TUN starts.
             var egress = PhysicalInterfaceResolver.ForAddress(serverEndpoint);
@@ -155,6 +160,15 @@ public static class XrayTunHealthProbe
         }
     }
 
+    public static string DescribeProbeFailure(Exception? error) => error switch
+    {
+        OperationCanceledException => "TIMEOUT",
+        SocketException socket => "SOCKET_" + socket.SocketErrorCode,
+        null => "OK",
+        _ when error.InnerException is not null => error.GetType().Name + "/" + DescribeProbeFailure(error.InnerException),
+        _ => error.GetType().Name
+    };
+
     public static async Task CheckTrafficStageAsync(string stage, Func<int, CancellationToken, Task> probe,
         CancellationToken token, TimeSpan? attemptTimeout = null, TimeSpan? hedgeDelay = null)
     {
@@ -183,7 +197,7 @@ public static class XrayTunHealthProbe
         var failure=await other;
         token.ThrowIfCancellationRequested();
         if(failure is null){race.Cancel();return;}
-        throw new IOException($"TUN_PROBE_{stage}_FAILED: обе попытки не прошли ({failure.GetType().Name}).",failure);
+        throw new IOException($"TUN_PROBE_{stage}_FAILED: обе попытки не прошли (attempt0={DescribeProbeFailure(await first)}, attempt1={DescribeProbeFailure(failure)}).",failure);
         } finally {race.Cancel();await Task.WhenAll(second is null ? [first] : [first,second]);}
     }
     // Retained only for opt-in before/after qualification of the old startup path.

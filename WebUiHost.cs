@@ -328,7 +328,7 @@ public sealed partial class MainForm
                     SelectProfile(target, save: true);
                     if (wasRunning && target.Id != _state.RunningServerId)
                     {
-                        if (!await StopSingBoxAsync())
+                        if (!await StopSingBoxAsync(preserveAgDns:true))
                         {
                             _state.SelectedProfileId = oldSelection;
                             SaveState(); RefreshProfiles(); RefreshMainPreview();
@@ -643,8 +643,7 @@ public sealed partial class MainForm
                 var query = OptionalString(payload, "query") ?? "";
                 var text = await Task.Run(() => string.Join(Environment.NewLine, entries.Where(line =>
                 {
-                    var severity = System.Text.RegularExpressions.Regex.IsMatch(line, "error|ошибк|fail", System.Text.RegularExpressions.RegexOptions.IgnoreCase) ? "error"
-                        : System.Text.RegularExpressions.Regex.IsMatch(line, "warn|предупреж", System.Text.RegularExpressions.RegexOptions.IgnoreCase) ? "warning" : "info";
+                    var severity = WindowsLogPolicy.Level(line);
                     return (level == "all" || level == severity) && line.Contains(query, StringComparison.OrdinalIgnoreCase);
                 })));
                 if (text.Length > 0) Clipboard.SetText(text);
@@ -812,6 +811,7 @@ public sealed partial class MainForm
             routingEnabled = _state.RoutingEnabled,
             activeConnectionProfileId = _state.SelectedConnectionProfileId,
             core = new { selected = _state.SelectedCore.ToString(), activeBackend = CoreEngineService.ActiveBackend(_state, connected), buildId = _state.RunningCore == CoreKind.IorCore || _state.SelectedCore == CoreKind.IorCore ? CoreEngineService.NativeBuildId(_state) : null, protocol = connected ? _state.RunningProfileSnapshot?.Protocol.ToString() : null, mode = _state.TunEnabled ? "TUN" : "Proxy", options = CoreEngineService.AvailableCores(_state) },
+            agDns = new { status = _agDns?.Status ?? "notRequired", warning = _agDns?.RulesReappeared ?? false },
             configValidation = new { checkedConfig = currentValidation.HasValue, valid = currentValidation },
             availableServerIds,
             traffic = new { download = _downloadSpeedValue.Text, upload = _uploadSpeedValue.Text, ping = _lastLatencyMs, pingStatus = _latencyMonitor.SnapshotFor(SelectedProfile())?.Status ?? "idle", quality = _qualityValue.Text },
@@ -1154,13 +1154,13 @@ public sealed partial class MainForm
         _state.RoutingEnabled=enabled;_state.SelectedHappRoutingProfileId=id;
         try {
             if(server is not null && !CoreEngineService.CanRun(_state,server,out var reason))throw new InvalidOperationException(reason);
-            if(running){if(!await StopSingBoxAsync())throw new InvalidOperationException("Не удалось остановить VPN");if(!await StartSingBoxAsync(server))throw new InvalidOperationException("Не удалось применить маршрут");}
+            if(running){if(!await StopSingBoxAsync(preserveAgDns:true))throw new InvalidOperationException("Не удалось остановить VPN");if(!await StartSingBoxAsync(server))throw new InvalidOperationException("Не удалось применить маршрут");}
             SaveState();PushWebSnapshot();
         } catch { _state.RoutingEnabled=oldEnabled;_state.SelectedHappRoutingProfileId=oldId;SaveState();if(running&&!IsConnectionRunning())await StartSingBoxAsync(server);PushWebSnapshot();throw; }
     }
     private async Task RestartConnectionAsync()
     {
-        if (!await StopSingBoxAsync()) throw new InvalidOperationException("Не удалось остановить прежнее подключение для перезапуска.");
+        if (!await StopSingBoxAsync(preserveAgDns:true)) throw new InvalidOperationException("Не удалось остановить прежнее подключение для перезапуска.");
         if (_state.Profiles.All(profile => profile.Id != _state.SelectedProfileId)) return;
         if (!await StartSingBoxAsync(SelectedProfile())) await ShowConnectionFailedAsync();
     }
@@ -1179,7 +1179,7 @@ public sealed partial class MainForm
         if (wasRunning && !supported) throw new InvalidOperationException(reason);
         if (!wasRunning) { _state.SelectedCore = target; return; }
 
-        if (!await StopSingBoxAsync()) throw new InvalidOperationException("Не удалось остановить прежнее ядро; переключение отменено.");
+        if (!await StopSingBoxAsync(preserveAgDns:true)) throw new InvalidOperationException("Не удалось остановить прежнее ядро; переключение отменено.");
         _state.SelectedCore = target;
         if (await StartSingBoxAsync(runningProfile)) return;
 

@@ -32,6 +32,8 @@ pub struct IngressAuth {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WireNetwork {
+    #[serde(default)]
+    pub direct_ipv4_fallback: bool,
     pub physical_address: String,
     pub interface_index: u32,
     #[serde(default)]

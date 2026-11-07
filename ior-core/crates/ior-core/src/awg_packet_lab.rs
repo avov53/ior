@@ -181,6 +181,7 @@ async fn setup_with_engine(path: &str, rtt: u64, loss_per_mille: u64, quic_targe
         "peerPublicKey":base64::engine::general_purpose::STANDARD.encode(server_public.as_bytes()),"localAddresses":["10.7.0.2/32","fd00:7::2/128"],"allowedIps":["10.7.0.0/24","fd00:7::/64"],"mtu":1280,"awgAdapterPath":path,"awgAdapterSha256":format!("{:x}",Sha256::digest(tokio::fs::read(path).await.unwrap())),
         "awg":{"jc":"2","jmin":"12","jmax":"24","s1":"16","s2":"16","s3":"16","s4":"16","content_padding_addition":"8-16","random_trailers":"true","i1":"<b ff><t><r 4><rc 3><rd 2><dz 2><d><ds>","header_protection_key":base64::engine::general_purpose::STANDARD.encode([9u8;32]),"h1":"12345678","h2":"23456789","h3":"34567890","h4":"45678901"}}})).unwrap();
     let network = Some(WireNetwork {
+        direct_ipv4_fallback: false,
         physical_address: "127.0.0.1".into(),
         interface_index: 1,
         physical_address6: Some("::1".into()),

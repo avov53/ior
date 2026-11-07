@@ -61,6 +61,9 @@ public sealed partial class MainForm
             ("tunSupported", NativeWindowsPlatform.TunAvailable.ToString()));
         using var networkRun=WindowsNetworkCommand.BeginRun(runId);
         request!.RequestId = runId;
+        var dnsServers=request.Dns.Upstreams.Count>0?request.Dns.Upstreams:[request.Dns.Upstream];
+        Diagnostics.Record("dns","DNS_EFFECTIVE_RESOLVERS",("source",TunnelDnsPolicy.Effective(_state,profile).Source),("count",dnsServers.Count.ToString()),("resolver",string.Join(",",dnsServers)));
+        Log("ior-core DNS: source="+TunnelDnsPolicy.Effective(_state,profile).Source+" · count="+dnsServers.Count+" · servers="+string.Join(",",dnsServers));
         if(profile.RealityEnabled)Diagnostics.Record("profile","REALITY_EFFECTIVE_FLOW",("flow",request.Profile.Flow ?? "none"));
         if(profile.RealityEnabled)Log("ior-core Reality: flow="+(request.Profile.Flow ?? "none")+" · UDP/443 experiment="+_state.RealityUdp443Enabled);
         var buildId=CoreEngineService.NativeBuildId(_state);
@@ -84,6 +87,7 @@ public sealed partial class MainForm
             request.Profile.Server = endpoint.ToString();
             var physical = PhysicalInterfaceResolver.ForAddress(endpoint);
             request.Network = PhysicalInterfaceResolver.Describe(physical);
+            request.Network.DirectIpv4Fallback = AgDnsEnabled;
             Diagnostics.Record("network", "PHYSICAL_EGRESS_SELECTED", ("interfaceIndex", request.Network.InterfaceIndex.ToString()));
             Stage("dns", "BOOTSTRAP_READY");
             if(profile.Protocol is ProxyProtocol.Vmess or ProxyProtocol.Shadowsocks or ProxyProtocol.Trojan or ProxyProtocol.WireGuard or ProxyProtocol.AmneziaWG)
@@ -212,7 +216,8 @@ public sealed partial class MainForm
         }
         catch (Exception error)
         {
-            var primaryCode=_iorControlClient?.DiagnosticCodes.Split(", ").LastOrDefault(code=>code.StartsWith("REALITY_",StringComparison.Ordinal) && code != "REALITY_TCP_CONNECTED" && code != "REALITY_TLS_COMPLETE");
+            var primaryCode=NativeFailureReason.TransportCode(_iorControlClient?.DiagnosticCodes);
+            var flowHint=profile?.RealityEnabled==true && _iorControlClient?.DiagnosticCodes.Contains("REALITY_TLS_COMPLETE",StringComparison.Ordinal)==true ? " TLS Reality завершился, но подключение не прошло проверку готовности. Проверьте flow пользователя на сервере: обычный xtls-rprx-vision; udp443 задаётся на клиенте. Причина отказа сервера этим журналом не доказана." : "";
             if (_iorControlClient?.DiagnosticCodes.Contains("TUN_EGRESS_RECAPTURED", StringComparison.Ordinal) == true)
                 primaryCode = "TUN_EGRESS_RECAPTURED";
             if(_iorControlClient is { } failedClient)
@@ -233,7 +238,7 @@ public sealed partial class MainForm
                 Diagnostics.Record("rollback", "NATIVE_ROLLBACK_PENDING", ("errorType", rollbackError.GetType().Name));
             }
             RestoreSystemProxyIfNeeded(); SetDisconnected();
-            throw new IOException(primaryCode is not null ? "ior-core: "+primaryCode : ConnectionDiagnostics.Redact(error.Message, DiagnosticSecrets()), error);
+            throw new IOException(primaryCode is not null ? ConnectionDiagnostics.Redact(error.Message, DiagnosticSecrets())+flowHint+" · transport="+primaryCode : ConnectionDiagnostics.Redact(error.Message, DiagnosticSecrets())+flowHint, error);
         }
     }
 }

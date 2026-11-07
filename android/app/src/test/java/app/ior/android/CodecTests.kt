@@ -6,6 +6,17 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 class CodecTests {
+    @Test fun realityUdpSettingPreservesImportedFlowAndOriginalProfile(){
+        for(flow in listOf("xtls-rprx-vision","xtls-rprx-vision-udp443"))for(enabled in listOf(false,true)){
+            val raw="vless://11111111-1111-1111-1111-111111111111@edge.example:443?security=reality&pbk=synthetic&sni=cover.example&type=tcp&flow="+flow
+            val server=ProfileCodec.parse(raw);val original=server.getJSONObject("wire");val before=original.toString()
+            val restored=JSONObject(original.toString());val effective=RealityUdpPolicy.effective(restored,enabled)
+            assertEquals(if(enabled)"xtls-rprx-vision-udp443"else flow,effective.getString("flow"));assertEquals(before,original.toString())
+        }
+        val hy=JSONObject().put("protocol","hysteria2").put("flow",JSONObject.NULL)
+        assertTrue(RealityUdpPolicy.effective(hy,true).isNull("flow"))
+    }
+
     @Test fun salamanderImportsWithoutDisablingTls(){
         val base="hysteria2://test-password@edge.example:443?sni=edge.example&obfs=salamander&obfs-password=test-obfs"
         val options=ProfileCodec.parse(base).getJSONObject("wire").getJSONObject("options")

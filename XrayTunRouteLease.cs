@@ -39,10 +39,20 @@ public sealed class XrayTunRouteLease
 
     public static string JournalPath(string appDirectory) => Path.Combine(appDirectory, "xray-tun-routes.json");
 
+    private static async Task<string> CaptureDnsPolicyReportAsync(string directory, CancellationToken token)
+    {
+        // Read-only, local report. Never send internal namespaces to the normal log.
+        var report = await RunPowerShellAsync("$effective=@(Get-DnsClientNrptPolicy -Effective -ErrorAction Stop); $rules=@(Get-DnsClientNrptRule -ErrorAction Stop); @{Windows=[Environment]::OSVersion.Version.ToString(); Effective=$effective; Rules=$rules} | ConvertTo-Json -Depth 8", token);
+        Directory.CreateDirectory(directory);
+        await File.WriteAllTextAsync(Path.Combine(directory,"dns-policy-report.json"),report,token);
+        return report;
+    }
+
     public static async Task<XrayTunRouteLease> AcquireAsync(string appDirectory, IPAddress server,
         IPAddress bootstrapDns, string interfaceName, CancellationToken cancellationToken = default, string? runId = null,
         bool allowTemporaryForwardingDisable = false,bool requireNativeDnsPolicyAvailable=false)
     {
+        var dnsReport = requireNativeDnsPolicyAvailable ? await CaptureDnsPolicyReportAsync(appDirectory,cancellationToken) : null;
         var network = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(item =>
             item.Name == interfaceName && item.OperationalStatus == OperationalStatus.Up &&
             item.NetworkInterfaceType is not (NetworkInterfaceType.Tunnel or NetworkInterfaceType.Loopback));
@@ -73,13 +83,13 @@ $inspected.Add(@{{Prefix='{route.Prefix}'; State=$routeState}})"));
         var inspection = JsonSerializer.Deserialize<EgressInspection>(await RunPowerShellAsync($@"
 $forwarding = if ({index} -gt 0) {{ (Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {index} -ErrorAction Stop).Forwarding.ToString() }} else {{ 'Disabled' }}
 $allRoutes = @(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop)
-$nativeDnsPolicies = {(requireNativeDnsPolicyAvailable?"@(Get-DnsClientNrptPolicy -Effective -ErrorAction Stop).Count + @(Get-DnsClientNrptRule -ErrorAction Stop).Count":"0")}
+$nativeDnsPolicies = {(requireNativeDnsPolicyAvailable?"@(Get-DnsClientNrptPolicy -Effective -ErrorAction Stop | Where-Object { $_.Namespace -and @($_.Namespace | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0 }).Count + @(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { $_.Namespace -and @($_.Namespace | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0 }).Count":"0")}
 $inspected = [System.Collections.Generic.List[object]]::new()
 {inspectRoutes}
 @{{Forwarding=$forwarding; Routes=@($inspected.ToArray()); NativeDnsPolicyCount=$nativeDnsPolicies}} | ConvertTo-Json -Depth 4 -Compress", cancellationToken))
             ?? throw new IOException("TUN_EGRESS_INSPECTION_FAILED");
         if(requireNativeDnsPolicyAvailable && inspection.NativeDnsPolicyCount!=0)
-            throw new InvalidOperationException("NATIVE_DNS_POLICY_CONFLICT: существует системная или корпоративная DNS-политика.");
+            throw new InvalidOperationException(DnsPolicyConflict.Message(dnsReport));
         var forwardingEnabled = inspection.Forwarding switch { "Enabled" => true, "Disabled" => false,
             _ => throw new IOException("TUN_FORWARDING_INSPECTION_FAILED") };
         if (forwardingEnabled && !allowTemporaryForwardingDisable)
@@ -221,7 +231,7 @@ Set-NetIPInterface -InterfaceIndex {index} -AddressFamily IPv6 -DadTransmits 0 -
             var applyRoutes = string.Join(Environment.NewLine, routes.Select(route =>
                 $"New-NetRoute -AddressFamily {(route.Prefix.Contains(':') ? "IPv6" : "IPv4")} -DestinationPrefix '{route.Prefix}' -InterfaceIndex {index} -NextHop '{route.NextHop}' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null"));
             await RunPowerShellAsync($@"
-if (@(Get-DnsClientNrptPolicy -Effective -ErrorAction Stop).Count + @(Get-DnsClientNrptRule -ErrorAction Stop).Count -ne 0) {{ throw 'NATIVE_DNS_POLICY_CONFLICT' }}
+if (@(Get-DnsClientNrptPolicy -Effective -ErrorAction Stop | Where-Object {{ $_.Namespace -and @($_.Namespace | Where-Object {{ -not [string]::IsNullOrWhiteSpace($_) }}).Count -gt 0 }}).Count + @(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object {{ $_.Namespace -and @($_.Namespace | Where-Object {{ -not [string]::IsNullOrWhiteSpace($_) }}).Count -gt 0 }}).Count -ne 0) {{ throw 'NATIVE_DNS_POLICY_CONFLICT' }}
 {addressPreparation}
 New-NetIPAddress -InterfaceIndex {index} -IPAddress '{ip}' -PrefixLength {parameters.PrefixLength} -AddressFamily IPv4 -ErrorAction Stop | Out-Null
 New-NetIPAddress -InterfaceIndex {index} -IPAddress 'fdfe:dcba:9876::1' -PrefixLength 64 -AddressFamily IPv6 -ErrorAction Stop | Out-Null
@@ -318,9 +328,9 @@ foreach ($route in $matching) {{ Remove-NetRoute -InputObject $route -Confirm:$f
 
     public static async Task EnsureNativeDnsPolicyAvailableAsync(CancellationToken token = default)
     {
-        var count = (await RunPowerShellAsync("@(Get-DnsClientNrptPolicy -Effective -ErrorAction Stop).Count + @(Get-DnsClientNrptRule -ErrorAction Stop).Count", token)).Trim();
+        var count = (await RunPowerShellAsync("@(Get-DnsClientNrptPolicy -Effective -ErrorAction Stop | Where-Object { $_.Namespace -and @($_.Namespace | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0 }).Count + @(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { $_.Namespace -and @($_.Namespace | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0 }).Count", token)).Trim();
         if (count != "0")
-            throw new InvalidOperationException("NATIVE_DNS_POLICY_CONFLICT: существует системная или корпоративная DNS-политика; собственный TUN не может заменить её.");
+            throw new InvalidOperationException(DnsPolicyConflict.Message(await RunPowerShellAsync("@{Rules=@(Get-DnsClientNrptRule -ErrorAction Stop); Effective=@(Get-DnsClientNrptPolicy -Effective -ErrorAction Stop)} | ConvertTo-Json -Depth 8",token)));
     }
     public static async Task<bool> VerifyNativeDnsPolicyAsync(string name, IPAddress dns, CancellationToken token = default)
     {

@@ -1,14 +1,22 @@
+function groupLogWarning(groups,entry){
+ if(entry.row.level!=='warning')return false;
+ const parts=entry.row.time.split(':').map(Number);const seconds=parts.length===3?parts[0]*3600+parts[1]*60+parts[2]:NaN;
+ if(!Number.isFinite(seconds))return false;
+ const key=entry.row.groupKey||entry.row.text;const old=groups.get(key);const delta=old?(seconds-old.seconds+86400)%86400:Infinity;
+ if(old&&delta<=60){old.entry.count++;old.entry.lastTime=entry.row.time;return true;}
+ entry.count=1;entry.firstTime=entry.row.time;entry.lastTime=entry.row.time;groups.set(key,{seconds,entry});return false;
+}
 // The complete model is independent from the bounded, measured DOM viewport.
-const virtualLog = {rows:[],prefix:[0],processed:0,key:'',frame:0,width:0,tree:new Float64Array(1024),measured:new Map()};
+const virtualLog = {rows:[],prefix:[0],processed:0,key:'',frame:0,width:0,tree:new Float64Array(1024),measured:new Map(),groups:new Map()};
 function logOffset(index){let correction=0;for(let i=index;i>0;i-=i&-i)correction+=virtualLog.tree[i];return virtualLog.prefix[index]+correction;}
 function correctLogHeight(index,height){const old=virtualLog.measured.get(index)||virtualLog.prefix[index+1]-virtualLog.prefix[index],delta=height-old;virtualLog.measured.set(index,height);for(let i=index+1;i<virtualLog.tree.length;i+=i&-i)virtualLog.tree[i]+=delta;}
 function growLogTree(){if(virtualLog.rows.length+1<virtualLog.tree.length)return;let size=virtualLog.tree.length;while(size<=virtualLog.rows.length+1)size*=2;virtualLog.tree=new Float64Array(size);const entries=[...virtualLog.measured];virtualLog.measured.clear();for(const [index,height]of entries)correctLogHeight(index,height);}
 function logHeight(row,width){return  Math.max(32,18*Math.ceil(row.text.length/Math.max(20,Math.floor((width-170)/7)))+14);}
 function indexLogRows(reset=false){
  const key=logLevel+'\n'+query.toLowerCase(),width=root.querySelector('.log-scroll')?.clientWidth||800;
- if(reset||key!==virtualLog.key||width!==virtualLog.width||virtualLog.processed>state.logs.length){virtualLog.rows=[];virtualLog.prefix=[0];virtualLog.processed=0;virtualLog.key=key;virtualLog.width=width;virtualLog.tree.fill(0);virtualLog.measured.clear();}
+ if(reset||key!==virtualLog.key||width!==virtualLog.width||virtualLog.processed>state.logs.length){virtualLog.rows=[];virtualLog.prefix=[0];virtualLog.processed=0;virtualLog.key=key;virtualLog.width=width;virtualLog.tree.fill(0);virtualLog.measured.clear();virtualLog.groups.clear();}
  const needle=query.toLowerCase();
- for(let i=virtualLog.processed;i<state.logs.length;i++){const row=state.logs[i];if((logLevel==='all'||row.level===logLevel)&&row.text.toLowerCase().includes(needle)){virtualLog.rows.push({row,id:i});virtualLog.prefix.push(virtualLog.prefix.at(-1)+logHeight(row,width));}}
+ for(let i=virtualLog.processed;i<state.logs.length;i++){const row=state.logs[i];if((logLevel==='all'||row.level===logLevel)&&row.text.toLowerCase().includes(needle)){const entry={row,id:i};if(!groupLogWarning(virtualLog.groups,entry)){virtualLog.rows.push(entry);virtualLog.prefix.push(virtualLog.prefix.at(-1)+logHeight(row,width));}}}
  virtualLog.processed=state.logs.length;
  growLogTree();
 }
@@ -19,7 +27,7 @@ function paintLogViewport(){
  indexLogRows();const {rows,prefix}=virtualLog;
  const first=Math.max(0,logIndexAt(scroll.scrollTop)-10),last=Math.min(rows.length,logIndexAt(scroll.scrollTop+(scroll.clientHeight||600))+11);
  const anchor=logIndexAt(scroll.scrollTop),offset=scroll.scrollTop-logOffset(anchor);
- list.innerHTML=`<div aria-hidden="true" style="height:${logOffset(first)}px"></div>`+rows.slice(first,last).map(({row,id})=>`<div class="log-entry" data-log-id="${id}"><time>${escape(row.time)}</time><span class="log-level level-${row.level}">${row.level.toUpperCase()}</span><span>${escape(row.text)}</span></div>`).join('')+`<div aria-hidden="true" style="height:${logOffset(rows.length)-logOffset(last)}px"></div>`;
+ list.innerHTML=`<div aria-hidden="true" style="height:${logOffset(first)}px"></div>`+rows.slice(first,last).map(({row,id,count,firstTime,lastTime})=>`<div class="log-entry" data-log-id="${id}"><time>${escape(row.time)}</time><span class="log-level level-${row.level}">${row.level.toUpperCase()}</span><span>${escape(row.text)}${count>1?escape(` · Повторов: ${count}; первое: ${firstTime}; последнее: ${lastTime}`):''}</span></div>`).join('')+`<div aria-hidden="true" style="height:${logOffset(rows.length)-logOffset(last)}px"></div>`;
  // Refine estimates with actual wrapped heights. Preserve the viewed row.
  let changed=false,index=first;for(const el of list.querySelectorAll('[data-log-id]')){const height=el.getBoundingClientRect().height;if(height>0&&Math.abs(height-(logOffset(index+1)-logOffset(index)))>.5){correctLogHeight(index,height);changed=true;}index++;}
  if(changed){list.firstElementChild.style.height=logOffset(first)+'px';list.lastElementChild.style.height=(logOffset(rows.length)-logOffset(last))+'px';if(!(logFollow&&logAtEnd))scroll.scrollTop=logOffset(anchor)+offset;}

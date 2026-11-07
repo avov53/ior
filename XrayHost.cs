@@ -53,7 +53,7 @@ public sealed partial class MainForm
                     var coreLabel = _state.RunningCore == CoreKind.IorCore ? "ior-core" : "Xray";
                     Diagnostics.Record("network", force ? "POWER_RESUME_RECONNECT" : "PHYSICAL_LINK_RECONNECT");
                     Log(coreLabel + " TUN: физическая сеть изменилась; переподключение с новыми маршрутами.");
-                    if (!await StopSingBoxAsync()) return;
+                    if (!await StopSingBoxAsync(preserveAgDns:true)) return;
                     await Task.Delay(600);
                     if (profile is null || !await StartSingBoxAsync(profile))
                         Log(coreLabel + " TUN не удалось восстановить после изменения сети.");
@@ -86,7 +86,7 @@ public sealed partial class MainForm
         Log($"Xray diagnostic run: {runId}.");
 
         var binary = CoreEngineService.XrayCorePath(_state);
-        var configPath = Path.Combine(_appDir, "config.xray.generated.json");
+        var configPath = Path.Combine(AgDnsEnabled?WindowsTransientFiles.RuntimeDirectory(_appDir):_appDir, "config.xray.generated.json");
         try
         {
             SaveSettings();
@@ -122,7 +122,7 @@ public sealed partial class MainForm
                 Log($"Xray TUN prepared on physical interface: {physicalInterface}.");
             }
             else config = XrayConfigBuilder.Build(_state, profile!);
-            await File.WriteAllTextAsync(configPath, config);
+            if(AgDnsEnabled)PrivateRuntimeFile.Write(configPath,config);else await File.WriteAllTextAsync(configPath, config);
             Diagnostics.Record("config", "CONFIG_GENERATED");
             var check = await CheckXrayConfigAsync(binary, configPath);
             if (!check.Valid)
@@ -195,11 +195,13 @@ public sealed partial class MainForm
             {
                 if (_xrayDirectHelper is not null) await _xrayDirectHelper.VerifyPhysicalEgressAsync("after-tun");
                 await Diagnostics.CaptureNetworkAsync("after-tun");
-                var probe = await XrayTunHealthProbe.CheckAsync(endpoint!, physicalInterface!);
+                var probe = await XrayTunHealthProbe.CheckAsync(endpoint!, physicalInterface!,
+                    cancellationToken:AgDnsEnabled?_agStartToken:default,coreAlive:AgDnsEnabled?()=>!started.HasExited:null,measured:AgDnsEnabled?(stage,attempt,ms,code)=>XrayProbeDiagnostics.Record(Diagnostics,stage,attempt,ms,code):null);
                 Diagnostics.Record("probe", probe.Ready ? "TUN_TRAFFIC_OK" : "TUN_TRAFFIC_FAILED");
                 if (!probe.Ready)
                 {
                     Log(probe.Reason);
+                    if(AgDnsEnabled)await CaptureWin10AdapterFailureAsync();
                     if (!started.HasExited) { started.Kill(entireProcessTree: true); await started.WaitForExitAsync(); }
                     await ReleaseXrayTunRoutesAsync();
                     SetDisconnected();
@@ -261,6 +263,7 @@ public sealed partial class MainForm
         }
         }
         finally { _xrayCleanupGate.Release(); }
+        await RestoreAgDnsAfterExitAsync();
     }
 
     private static async Task<(bool Valid, string Output)> CheckXrayConfigAsync(string binary, string configPath)

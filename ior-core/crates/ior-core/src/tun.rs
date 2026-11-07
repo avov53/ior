@@ -411,7 +411,7 @@ async fn relay_tcp<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     let connect_started=std::time::Instant::now();
     let outbound = tokio::time::timeout(
         Duration::from_secs(15),
-        if sniffed_name {router.connect_sniffed_destination(remote,name)}else{router.connect_destination(remote,name)},
+        {let observed=router.direct_family_fallback_enabled() && remote.is_ipv6() && name.as_ref().is_some_and(|host|dns.names.routing_names(remote.ip()).iter().any(|n|n.eq_ignore_ascii_case(host)));router.connect_observed_destination(remote,name,sniffed_name,observed)},
     )
     .await
     .map_err(|_| {

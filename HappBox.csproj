@@ -10,7 +10,7 @@
     <RootNamespace>HappBox</RootNamespace>
     <Product>ior</Product>
     <Title>ior</Title>
-    <Version>1.2.5</Version>
+    <Version>1.2.6</Version>
     <ApplicationIcon>assets\app-icon\icon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <DefaultItemExcludes>$(DefaultItemExcludes);.local\**;android\**;android-output\**;windows-output\**;distandroid\**</DefaultItemExcludes>
@@ -21,9 +21,6 @@
     <PackageReference Include="YamlDotNet" Version="18.1.0" />
     <Compile Remove="HappBox.Tests\**\*.cs" />
     <Compile Remove="verification-publish\**\*.cs" />
-    <Content Include="core\sing-box.exe" Condition="Exists('core\sing-box.exe')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
     <Content Include="core\xray\xray.exe;core\xray\wintun.dll;core\xray\geoip.dat;core\xray\geosite.dat;core\xray\LICENSE;core\xray\LICENSE-Wintun;core\xray\README.ior.md" Condition="Exists('core\xray\xray.exe')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>

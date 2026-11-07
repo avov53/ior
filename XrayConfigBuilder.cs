@@ -116,7 +116,7 @@ public static class XrayConfigBuilder
         {
             root["outbounds"]![1] = new JsonObject
             {
-                ["tag"] = "direct", ["protocol"] = "socks",
+                ["tag"] = "direct", ["protocol"] = "socks", ["sendThrough"] = "127.0.0.1",
                 ["settings"] = new JsonObject { ["servers"] = new JsonArray { new JsonObject
                 {
                     ["address"] = "127.0.0.1", ["port"] = directHelper.Port,

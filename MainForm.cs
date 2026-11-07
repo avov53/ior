@@ -165,7 +165,7 @@ public sealed partial class MainForm : Form
     {
         Directory.CreateDirectory(_appDir);
         _statePath = Path.Combine(_appDir, "state.json");
-        _configPath = Path.Combine(_appDir, "config.generated.json");
+        _configPath = Path.Combine(AgDnsEnabled?WindowsTransientFiles.RuntimeDirectory(_appDir):_appDir, "config.generated.json");
         _state = LoadState(_statePath);
         // Earlier versions saved preview engines as a cosmetic preference while
         // always launching sing-box. Normalize that legacy value explicitly.
@@ -241,6 +241,7 @@ public sealed partial class MainForm : Form
         _ = LoadServiceIconsAsync();
         ResetTrafficCounters();
         RecoverConnectionState();
+        InitializeTransientMaintenance();
         RegisterXrayNetworkRecovery();
         if(_state.Lan.AllowedClientIps is null){_state.Lan.Enabled=false;_state.Lan.AllowedClientIps=[];SaveState();}
         _=Diagnostics.ConfigureAsync(_state.Journal);
@@ -369,7 +370,7 @@ public sealed partial class MainForm : Form
             if (connected)
             {
                 SetConnectionVisualState(ConnectionVisualState.Disconnecting);
-                if (!await StopSingBoxAsync()) return;
+                if (!await StopSingBoxAsync(preserveAgDns:true)) return;
             }
             SelectProfile(profile, save: true);
             if (connected)
@@ -4894,7 +4895,7 @@ public sealed partial class MainForm : Form
         if (wasRunning)
         {
             SetConnectionVisualState(ConnectionVisualState.Disconnecting);
-            if (!await StopSingBoxAsync())
+            if (!await StopSingBoxAsync(preserveAgDns:true))
             {
                 SetConnectionVisualState(ConnectionVisualState.Connected);
                 return false;
@@ -4936,6 +4937,7 @@ public sealed partial class MainForm : Form
         if (TryGetTrackedSingBoxProcess(out var trackedProcess))
         {
             trackedProcess.Dispose();
+            if(AgDnsEnabled){try{var dns=AgDns;Task.Run(dns.AdoptActiveAsync).GetAwaiter().GetResult();}catch(Exception e){Log(e.Message);}}
             SetConnected();
             Log($"Recovered active {CoreEngineService.ActiveBackend(_state, true)} process: PID {_state.ActiveProcessId}.");
             return;
@@ -4947,6 +4949,7 @@ public sealed partial class MainForm : Form
             catch (Exception ex) { Log($"TUN network recovery failed: {ex.Message}"); }
         }
 
+        if (AgDnsEnabled) { try { var dns=AgDns; Task.Run(dns.RestoreAsync).GetAwaiter().GetResult(); } catch(Exception e){Log("AG_DNS_RECOVERY_REQUIRED: "+e.Message);} }
         if (_state.ActiveProcessId is not null || _state.SystemProxyApplied)
         {
             RestoreSystemProxyIfNeeded();
@@ -5053,7 +5056,7 @@ public sealed partial class MainForm : Form
         _ = StartSingBoxAsync();
     }
 
-    private Task<bool> StartSingBoxAsync(ProxyProfile? overrideProfile = null)
+    private Task<bool> StartConnectionCoreAsync(ProxyProfile? overrideProfile = null)
     {
         if(overrideProfile is null)RoutingSelectionPolicy.ForServer(_state,SelectedProfile());
         Interlocked.Increment(ref _processLogGeneration);
@@ -5304,7 +5307,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
         }
     }
 
-    private async Task<bool> StopSingBoxAsync()
+    private async Task<bool> StopConnectionCoreAsync()
     {
 
         if (_iorControlClient is { } nativeClient)
@@ -5651,7 +5654,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
         try
         {
             var generated = SingBoxConfigBuilder.Build(_state, profile, resolvedServer, outboundInterface);
-            File.WriteAllText(_configPath, generated);
+            if(AgDnsEnabled)PrivateRuntimeFile.Write(_configPath,generated);else File.WriteAllText(_configPath, generated);
             Log($"Config written: {_configPath}");
             return true;
         }
@@ -6911,7 +6914,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
     private void Log(string message)
     {
         message = ConnectionDiagnostics.Redact(message, DiagnosticSecrets());
-        var line = $"[{DateTime.Now:HH:mm:ss}] {AnsiEscapeRegex.Replace(message, "")}";
+        var line = $"[{DateTime.Now:HH:mm:ss}] {WindowsLogPolicy.Annotate(AnsiEscapeRegex.Replace(message, ""),_connectedAt is not null, _connectionTransitionInProgress||_shutdownRequested)}";
         _logs.Add(line);
         if (_webUiReady)
         {
@@ -7251,22 +7254,14 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
 
         private static bool IsError(string line)
         {
-            if (IsExpectedConnectionClose(line))
-            {
-                return false;
-            }
-
-            return line.Contains("ERROR", StringComparison.OrdinalIgnoreCase) ||
-                   line.Contains(" failed", StringComparison.OrdinalIgnoreCase) ||
-                   line.Contains("cannot ", StringComparison.OrdinalIgnoreCase) ||
-                   line.Contains("rejected", StringComparison.OrdinalIgnoreCase);
+            return WindowsLogPolicy.Level(line)=="error";
         }
 
         private static Color LogColor(string line)
         {
-            if (IsExpectedConnectionClose(line)) return Color.FromArgb(150, 154, 166);
+            if (WindowsLogPolicy.Level(line)=="info") return Color.FromArgb(150,154,166);
             if (IsError(line)) return Color.FromArgb(255, 135, 145);
-            if (line.Contains("WARN", StringComparison.OrdinalIgnoreCase) ||
+            if (WindowsLogPolicy.Level(line)=="warning" || line.Contains("WARN", StringComparison.OrdinalIgnoreCase) ||
                 line.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
                 line.Contains("retry", StringComparison.OrdinalIgnoreCase))
             {

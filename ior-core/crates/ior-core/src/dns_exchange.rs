@@ -167,4 +167,16 @@ mod tests {
         assert_eq!(result, vec![7]);
         assert!(start.elapsed() < Duration::from_secs(1));
     }
+    #[tokio::test]
+    async fn one_configured_resolver_does_not_invent_backups() {
+        let calls=std::sync::atomic::AtomicUsize::new(0);
+        let result=hedged(&["only".into()],|name|{assert_eq!(name,"only");calls.fetch_add(1,std::sync::atomic::Ordering::Relaxed);async{Err(std::io::Error::from(std::io::ErrorKind::TimedOut))}}).await;
+        assert!(result.is_err());assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed),1);
+    }
+    #[tokio::test]
+    async fn configured_resolver_total_failure_stays_failure() {
+        let result=hedged(&["one".into(),"two".into()],|_|async{Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))}).await;
+        assert!(result.is_err());
+    }
+
 }

@@ -20,7 +20,7 @@ class Repository private constructor(context:Context):SubscriptionStore {
     init{val subscriptions=state.optJSONArray("subscriptions")?:JSONArray();for(i in 0 until subscriptions.length()){HwidPolicy.migrate(subscriptions.getJSONObject(i),state.optBoolean("hwidEnabled"));SubscriptionOptions.migrate(subscriptions.getJSONObject(i),state.optBoolean("autoUpdateSubscriptions"));};val routes=state.optJSONArray("routes")?:JSONArray();for(i in 0 until routes.length())RouteSource.normalize(routes.getJSONObject(i))}
     init{if(!state.has("lan"))state.put("lan",JSONObject().put("enabled",false).put("authEnabled",true).put("port",2080).put("username","ior").put("password",java.util.UUID.randomUUID().toString().replace("-","")))}
     @Volatile var lanStatus="Отключён"
-    init{if(!state.has("saveMobileTraffic"))state.put("saveMobileTraffic",false);if(!state.has("journalMaxMb"))state.put("journalMaxMb",20);if(!state.has("journalDays"))state.put("journalDays",7)}
+    init{if(!state.has("realityUdp443Enabled"))state.put("realityUdp443Enabled",false);if(!state.has("saveMobileTraffic"))state.put("saveMobileTraffic",false);if(!state.has("journalMaxMb"))state.put("journalMaxMb",20);if(!state.has("journalDays"))state.put("journalDays",7)}
     private val journal=Diagnostics.get(context).also{it.configure(state.optInt("journalMaxMb",20),state.optInt("journalDays",7))}
     init{val retained=journal.consoleTail();if(retained.length()>0)state.put("logs",retained)else{val legacy=state.optJSONArray("logs")?:JSONArray();for(i in 0 until legacy.length())journal.console(legacy.getJSONObject(i))}}
     init{RepositoryDefaults.apply(state,savedState==null)}
@@ -51,7 +51,7 @@ class Repository private constructor(context:Context):SubscriptionStore {
     @Synchronized fun saveSettings(input:JSONObject){
         if(input.has("journalMaxMb"))require(input.getInt("journalMaxMb") in listOf(5,20,50))
         if(input.has("journalDays"))require(input.getInt("journalDays") in listOf(1,7,30))
-        for(key in listOf("journalMaxMb","journalDays","saveMobileTraffic"))if(input.has(key))state.put(key,input.get(key))
+        for(key in listOf("journalMaxMb","journalDays","saveMobileTraffic","realityUdp443Enabled"))if(input.has(key))state.put(key,input.get(key))
         if(input.has("pingMode"))require(input.getString("pingMode") in listOf("auto","icmp","tcp","head","get"))
         if(input.has("proxyPingTimeoutMs"))require(input.getInt("proxyPingTimeoutMs") in 5000..15000)
         if(input.has("language"))require(input.getString("language") in listOf("system","ru","en"))
@@ -157,7 +157,7 @@ class Repository private constructor(context:Context):SubscriptionStore {
         require(route?.has("error")!=true){"Выбранный маршрут несовместим с ядром"}
         val dns=server.optJSONArray("dns") ?: JSONArray()
         val resolvers=if(dns.length()>0)dns else JSONArray(listOf("8.8.8.8","1.1.1.1"))
-        return JSONObject().put("apiVersion",3).put("requestId",UUID.randomUUID().toString()).put("operation","start").put("profile",server.getJSONObject("wire"))
+        return JSONObject().put("apiVersion",3).put("requestId",UUID.randomUUID().toString()).put("operation","start").put("profile",RealityUdpPolicy.effective(server.getJSONObject("wire"),state.optBoolean("realityUdp443Enabled",false)))
             .put("routes",RouteCodec.rules(route)).put("dns",JSONObject().put("bootstrap","1.1.1.1").put("upstream",resolvers.getString(0)).put("upstreams",resolvers).put("ipv4Only",false))
     }
     fun status(value:String,message:String="",id:String=activeId){connection=value;error=message;activeId=id;if(value=="on")recordSuccessfulServer(id);changed()}

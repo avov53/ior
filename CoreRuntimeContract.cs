@@ -212,6 +212,8 @@ public sealed class CoreIngressAuth
 
 public sealed class CoreWireNetwork
 {
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public bool DirectIpv4Fallback { get; set; }
     public string PhysicalAddress { get; set; } = "";
     public uint InterfaceIndex { get; set; }
     public string? PhysicalAddress6 { get; set; }
