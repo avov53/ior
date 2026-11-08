@@ -197,7 +197,7 @@ public sealed class ConfigBuilderTests
         Assert.Throws<FormatException>(() => SingBoxConfigBuilder.Build(state, Vless()));
     }
 
-    [Theory]
+    [Theory(Skip = "Legacy sing-box integration: the retired engine is not distributed from 1.2.6.")]
     [InlineData("win10")]
     [InlineData("win11")]
     public void HappGeoIpConfigPassesBundledSingBoxCheck(string version)
@@ -222,7 +222,7 @@ public sealed class ConfigBuilderTests
         finally { File.Delete(path); }
     }
 
-    [Theory]
+    [Theory(Skip = "Legacy sing-box integration: the retired engine is not distributed from 1.2.6.")]
     [InlineData("win10")]
     [InlineData("win11")]
     public async Task BundledGeoIpRuleSetAllowsProxyStartupWithoutRemoteDownload(string version)
@@ -393,7 +393,7 @@ public sealed class ConfigBuilderTests
         Assert.DoesNotContain(rules, rule => rule!["action"]?.GetValue<string>() == "sniff");
     }
 
-    [Theory]
+    [Theory(Skip = "Legacy sing-box integration: the retired engine is not distributed from 1.2.6.")]
     [InlineData("win10")]
     [InlineData("win11")]
     public void TunConfigWithBootstrapIpPassesBundledSingBoxCheck(string version)

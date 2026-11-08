@@ -88,6 +88,8 @@ public sealed partial class MainForm
             var physical = PhysicalInterfaceResolver.ForAddress(endpoint);
             request.Network = PhysicalInterfaceResolver.Describe(physical);
             request.Network.DirectIpv4Fallback = AgDnsEnabled;
+            request.Profile.Options.AwgNamedIpv4Fallback = AgDnsEnabled && profile.Protocol == ProxyProtocol.AmneziaWG &&
+                NativeFeatureGate.Matches(Path.Combine(AppContext.BaseDirectory,"core","ior-core","awg-named-ipv4.sha256"),CoreEngineService.IorCorePath(_state));
             Diagnostics.Record("network", "PHYSICAL_EGRESS_SELECTED", ("interfaceIndex", request.Network.InterfaceIndex.ToString()));
             Stage("dns", "BOOTSTRAP_READY");
             if(profile.Protocol is ProxyProtocol.Vmess or ProxyProtocol.Shadowsocks or ProxyProtocol.Trojan or ProxyProtocol.WireGuard or ProxyProtocol.AmneziaWG)
@@ -134,7 +136,15 @@ public sealed partial class MainForm
                 var line="ior-core: "+message;
                 var accepted=_nativeLogLimiter.TryAccept(line,out var summary);
                 if((accepted || summary is not null) && !IsDisposed && IsHandleCreated)
-                    try { BeginInvoke(new Action(()=>{if(summary is not null)Log(summary);if(accepted)Log(line);})); }
+                    try
+                    {
+                        if (AgDnsEnabled)
+                        {
+                            var queuedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+                            BeginInvoke(new Action(() => DeliverNativeIncidentLogs(summary, accepted ? line : null, queuedAt)));
+                        }
+                        else BeginInvoke(new Action(()=>{if(summary is not null)Log(summary);if(accepted)Log(line);}));
+                    }
                     catch(InvalidOperationException) { /* The form closed while a diagnostic was in flight. */ }
             };
             _process = _iorControlClient.Process;

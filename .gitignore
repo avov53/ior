@@ -28,3 +28,4 @@ macos-output/
 
 # Local desktop release packages
 windows-output/
+**/TestResults/

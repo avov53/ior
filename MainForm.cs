@@ -242,6 +242,7 @@ public sealed partial class MainForm : Form
         ResetTrafficCounters();
         RecoverConnectionState();
         InitializeTransientMaintenance();
+        InitializeInternetIncident();
         RegisterXrayNetworkRecovery();
         if(_state.Lan.AllowedClientIps is null){_state.Lan.Enabled=false;_state.Lan.AllowedClientIps=[];SaveState();}
         _=Diagnostics.ConfigureAsync(_state.Journal);
@@ -256,7 +257,7 @@ public sealed partial class MainForm : Form
             var skipStartupNetwork = string.Equals(Environment.GetEnvironmentVariable("IOR_SKIP_STARTUP_NETWORK"), "1", StringComparison.Ordinal);
             if (!skipStartupNetwork) _ = CheckForStartupUpdateAsync();
             if (!skipStartupNetwork&&!Program.UpdateRestart)
-                {if(Program.WindowsAutostart){await RunWindowsStartupAsync();}else{await RefreshDueSubscriptionsAsync();await RunSubscriptionStartupAsync();}}
+                {if(Program.WindowsAutostart){await RunWindowsStartupAsync();}else{await RefreshDueSubscriptionsAsync(source:"startup");await RunSubscriptionStartupAsync();}}
             if(_state.LaunchWithWindows){_windowsStartupStatus=await WindowsStartup.StatusAsync();PushWebSnapshot();}
         };
     }
@@ -4691,6 +4692,8 @@ public sealed partial class MainForm : Form
             ConnectionWorkspaceService.ReconcileAfterRefresh(_state, subscription, previousSelectedId);
             if (!string.IsNullOrWhiteSpace(merged.Warning)) Log(merged.Warning);
             Log($"Subscription {subscription.Name} refreshed: +{merged.Added}, updated {merged.Updated}, removed {merged.Removed}.");
+            Log("SUBSCRIPTION_REFRESH_PROTOCOLS · " + string.Join(", ", _state.Profiles.Where(p => p.SubscriptionId == subscription.Id && !RemovedProtocolPolicy.IsRemoved(p))
+                .GroupBy(p => p.Protocol).Select(g => g.Key + "=" + g.Count())));
         }
         catch (SubscriptionHwidException ex)
         {
@@ -6596,6 +6599,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
             NormalizeSubscriptions(state);
             NormalizeHappRoutingProfiles(state);
             MigrateWebUiState(state);
+            LegacyRealityProfileMigration.ScheduleRefresh(state, DateTime.UtcNow);
             ServiceMonitorCatalog.NormalizeTargets(state);
             return state;
         }
@@ -6885,6 +6889,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
 
     private void FlushPendingProcessLogs()
     {
+        var incidentWatch = AgDnsEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
         var flushed = 0;
         while (flushed < 200 && _pendingProcessLogs.TryDequeue(out var entry))
         {
@@ -6901,6 +6906,11 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
             }
         }
 
+        if (incidentWatch is not null && (incidentWatch.ElapsedMilliseconds >= 50 || Environment.TickCount64 - _lastIncidentLogSample >= 5000))
+        {
+            _lastIncidentLogSample = Environment.TickCount64;
+            _internetIncident.Observe("log_flush_complete", incidentWatch.ElapsedMilliseconds, _pendingProcessLogs.Count);
+        }
         if (!_pendingProcessLogs.IsEmpty) return;
 
         _logFlushTimer.Stop();
@@ -6914,7 +6924,7 @@ MessageBox.Show(ex.Message, T("singbox.cannot.start"), MessageBoxButtons.OK, Mes
     private void Log(string message)
     {
         message = ConnectionDiagnostics.Redact(message, DiagnosticSecrets());
-        var line = $"[{DateTime.Now:HH:mm:ss}] {WindowsLogPolicy.Annotate(AnsiEscapeRegex.Replace(message, ""),_connectedAt is not null, _connectionTransitionInProgress||_shutdownRequested)}";
+        var line = $"[{DateTime.Now:HH:mm:ss}] {WindowsLogPolicy.Annotate(AnsiEscapeRegex.Replace(message, ""),_connectedAt is not null, _connectionTransitionInProgress||_shutdownRequested,windows10:AgDnsEnabled)}";
         _logs.Add(line);
         if (_webUiReady)
         {

@@ -35,7 +35,9 @@ try {
     if($LASTEXITCODE -ne 0){throw 'Android interface build failed'}
     & node android/build-geodata.mjs
     if($LASTEXITCODE -ne 0){throw 'Routing geodata build failed'}
-    if (!$SkipNative) {
+    $prebuiltNative=Join-Path $workspaceRoot 'core/android/libior_android.so'
+    $usePrebuilt=Test-Path -LiteralPath $prebuiltNative
+    if (!$SkipNative -and !$usePrebuilt) {
         $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=Join-Path $compiler 'aarch64-linux-android29-clang.cmd'
         $env:CC_aarch64_linux_android=$env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
         $env:CXX_aarch64_linux_android=Join-Path $compiler 'aarch64-linux-android29-clang++.cmd'
@@ -48,7 +50,11 @@ try {
         Push-Location ior-core
         try { Invoke-AndroidBuildTool 'cargo' @('build','-p','ior-android','--release','--locked','--target','aarch64-linux-android') (Join-Path $output 'rust-build.log') } finally { Pop-Location }
     }
-    $native=Join-Path $workspaceRoot 'ior-core/target/aarch64-linux-android/release/libior_android.so'
+    $native=if($usePrebuilt){$prebuiltNative}else{Join-Path $workspaceRoot 'ior-core/target/aarch64-linux-android/release/libior_android.so'}
+    if($usePrebuilt){
+        $manifest=Get-Content -LiteralPath (Join-Path $workspaceRoot 'core/native-package-manifest.json') -Raw|ConvertFrom-Json
+        if((Get-FileHash -LiteralPath $native).Hash -ne $manifest.'android-arm64'){throw 'Pinned Android native core mismatch'}
+    }
     if(!(Test-Path -LiteralPath $native)){throw 'Native ior-core library missing'}
     $jni=Join-Path $workspaceRoot 'android/app/src/main/jniLibs/arm64-v8a'
     New-Item -ItemType Directory -Force $jni | Out-Null
@@ -79,6 +85,5 @@ try {
     $apk=Join-Path $output 'ior-android-arm64.apk'
     Copy-Item -LiteralPath "android/app/build/outputs/apk/$variant/app-$variant.apk" -Destination $apk
     Invoke-AndroidBuildTool (Join-Path $env:ANDROID_HOME 'build-tools/36.0.0/apksigner.bat') @('verify',$apk)
-    ((Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLowerInvariant()+'  ior-android-arm64.apk') | Set-Content -LiteralPath (Join-Path $output 'checksums.sha256') -Encoding utf8
     Write-Host "APK ready: $apk"
 } finally { Pop-Location; Remove-Item Env:IOR_ANDROID_KEY_PASSWORD -ErrorAction SilentlyContinue }

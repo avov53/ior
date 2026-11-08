@@ -146,7 +146,18 @@ public static class SubscriptionService
 
             incoming.SubscriptionId = subscription.Id;
             ApplyUsage(incoming, result);
-            if (previousByIdentity.TryGetValue(identity, out var current))
+            previousByIdentity.TryGetValue(identity, out var current);
+            // AWG padding/junk parameters may rotate without changing the account.
+            // Preserve its UI identity only when both sides identify exactly one peer.
+            if (current is null && incoming.Protocol == ProxyProtocol.AmneziaWG &&
+                !string.IsNullOrWhiteSpace(incoming.PrivateKey) && !string.IsNullOrWhiteSpace(incoming.PeerPublicKey))
+            {
+                bool SamePeer(ProxyProfile p) => p.Protocol == incoming.Protocol && p.Server.Equals(incoming.Server,StringComparison.OrdinalIgnoreCase) &&
+                    p.Port == incoming.Port && p.PrivateKey == incoming.PrivateKey && p.PeerPublicKey == incoming.PeerPublicKey && p.PreSharedKey == incoming.PreSharedKey;
+                var peers = previous.Where(SamePeer).ToArray();
+                if (peers.Length == 1 && result.Profiles.Count(SamePeer) == 1) current = peers[0];
+            }
+            if (current is not null)
             {
                 incoming.Id = current.Id;
                 incoming.CountryCode = current.CountryCode;

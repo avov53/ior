@@ -41,6 +41,9 @@ public static class WindowsTransientFiles
             foreach(var name in new[]{"config.generated.json","config.xray.generated.json"})
             {RemoveOld(Path.Combine(appDirectory,name));RemoveOld(Path.Combine(runtimeDirectory,name));}
         }
+        var incidents=Path.Combine(appDirectory,"diagnostics","internet-incidents");AssertPlain(incidents);
+        if(Directory.Exists(incidents))foreach(var path in Directory.EnumerateFiles(incidents))
+            if(Regex.IsMatch(Path.GetFileName(path),"^[a-f0-9]{32}\\.json$"))RemoveOld(path);
         if(recoveryPending)return removed;
         foreach(var name in new[]{"dns-policy-report.json","win10-tun-failure.json"})RemoveOld(Path.Combine(appDirectory,name));
         AssertPlain(appDirectory);

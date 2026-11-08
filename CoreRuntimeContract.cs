@@ -28,6 +28,8 @@ public static class CoreRuntimeContract
         request = null;
         if (RemovedProtocolPolicy.IsRemoved(profile)) { reason = RemovedProtocolPolicy.Message; return false; }
         if (!ValidateHybridReality(profile, out reason)) return false;
+        if (LegacyRealityProfileMigration.NeedsRefresh(profile))
+        { reason = "В сохранённом VLESS-конфиге осталась отметка старой версии о support-x25519mlkem768. Обновите его подписку или заново импортируйте исходную ссылку; значение параметра будет проверено."; return false; }
         if (profile.UnsupportedParameters.Count > 0)
         { reason = "Неподдерживаемый параметр: " + string.Join(", ", profile.UnsupportedParameters); return false; }
         var protocol = profile.Protocol switch
@@ -244,6 +246,8 @@ public sealed class CoreWireProfile
 
 public sealed class CoreProtocolOptions
 {
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public bool AwgNamedIpv4Fallback { get; set; }
     public string? Obfs {get;set;}
     public string? ObfsPassword {get;set;}
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]

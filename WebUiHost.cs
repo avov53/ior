@@ -370,6 +370,20 @@ public sealed partial class MainForm
                 PushWebSnapshot(includeLogs: false);
                 return _latencyMonitor.SnapshotFor(profile);
             }
+            case "subscription.latency.refresh":
+            {
+                var subscription = FindSubscription(RequiredString(payload, "id"));
+                var profiles = _state.Profiles.Where(p => p.SubscriptionId == subscription.Id && !RemovedProtocolPolicy.IsRemoved(p)).ToArray();
+                using var gate = new SemaphoreSlim(2);
+                await Task.WhenAll(profiles.Select(async profile =>
+                {
+                    await gate.WaitAsync();
+                    try { await _latencyMonitor.RefreshAsync(profile); }
+                    finally { gate.Release(); }
+                }));
+                PushWebSnapshot(includeLogs: false);
+                return new { count = profiles.Length };
+            }
             case "server.share":
             {
                 var profile = FindProfile(RequiredString(payload, "id"));
@@ -427,8 +441,16 @@ public sealed partial class MainForm
                 SaveState(); RefreshProfiles(); PushWebSnapshot(); return null;
             }
             case "subscription.refresh":
-                await RefreshSubscriptionAsync(FindSubscription(RequiredString(payload, "id")), showErrors: false, requestHwidConsent: true);
-                PushWebSnapshot(); return null;
+            {
+                var subscription = FindSubscription(RequiredString(payload, "id"));
+                if (_subscriptionsRefreshing.Contains(subscription.Id)) return new { busy = true };
+                await RefreshSubscriptionAsync(subscription, showErrors: false, requestHwidConsent: true);
+                PushWebSnapshot();
+                if (subscription.LastError is { Length: > 0 } error) throw new InvalidOperationException(error);
+                return new { busy = false, count = subscription.LastImportedServers,
+                    protocols = _state.Profiles.Where(p => p.SubscriptionId == subscription.Id && !RemovedProtocolPolicy.IsRemoved(p))
+                        .GroupBy(p => p.Protocol).Select(g => new { protocol = g.Key.ToString(), count = g.Count() }).ToArray() };
+            }
             case "subscription.hwid.approve":
                 await ApproveSubscriptionHwidAsync(FindSubscription(RequiredString(payload, "id"))); return null;
             case "subscription.hwid.prompt":
@@ -650,6 +672,7 @@ public sealed partial class MainForm
                 return new { count = entries.Length };
             }
             case "diagnostics.export": return await ExportDiagnosticsAsync();
+            case "diagnostics.markInternet": return await MarkInternetIncidentAsync();
             case "config.get":
                 if (_state.AutoValidateConfig) ValidateSelectedConfig();
                 return SelectedProfile() is { } selected ? SingBoxConfigBuilder.Build(_state, selected) : "";
@@ -812,6 +835,7 @@ public sealed partial class MainForm
             activeConnectionProfileId = _state.SelectedConnectionProfileId,
             core = new { selected = _state.SelectedCore.ToString(), activeBackend = CoreEngineService.ActiveBackend(_state, connected), buildId = _state.RunningCore == CoreKind.IorCore || _state.SelectedCore == CoreKind.IorCore ? CoreEngineService.NativeBuildId(_state) : null, protocol = connected ? _state.RunningProfileSnapshot?.Protocol.ToString() : null, mode = _state.TunEnabled ? "TUN" : "Proxy", options = CoreEngineService.AvailableCores(_state) },
             agDns = new { status = _agDns?.Status ?? "notRequired", warning = _agDns?.RulesReappeared ?? false },
+            internetIncident = new { available = AgDnsEnabled, busy = _internetIncident.Busy },
             configValidation = new { checkedConfig = currentValidation.HasValue, valid = currentValidation },
             availableServerIds,
             traffic = new { download = _downloadSpeedValue.Text, upload = _uploadSpeedValue.Text, ping = _lastLatencyMs, pingStatus = _latencyMonitor.SnapshotFor(SelectedProfile())?.Status ?? "idle", quality = _qualityValue.Text },
@@ -845,6 +869,7 @@ public sealed partial class MainForm
             }),
             unsupportedStoredCount = _state.Profiles.Count(RemovedProtocolPolicy.IsRemoved),
             subscriptions = _state.Subscriptions,
+            refreshingSubscriptionIds = _subscriptionsRefreshing.ToArray(),
             hwidConsentSubscriptionId = _hwidConsentSubscriptionId,
             routes = _state.HappRoutingProfiles,
             connectionProfiles = Array.Empty<ConnectionWorkspaceProfile>(),
@@ -1205,7 +1230,7 @@ public sealed partial class MainForm
         catch { return false; }
     }
 
-    private async Task RefreshDueSubscriptionsAsync()
+    private async Task RefreshDueSubscriptionsAsync(string source = "timer")
     {
         if (_scheduledRefreshRunning) return;
         var due = _state.Subscriptions.Where(subscription => SubscriptionRefreshSchedule.IsDue(subscription, DateTime.UtcNow) && !AwaitingHwidPermission(subscription)).ToArray();
@@ -1215,8 +1240,12 @@ public sealed partial class MainForm
         {
             foreach (var subscription in due)
             {
+                if (_subscriptionsRefreshing.Contains(subscription.Id)) continue;
+                Log($"SUBSCRIPTION_AUTO_REFRESH_STARTED · source={source} · host={SubscriptionDisplayHost(subscription.Url)}");
                 await RefreshSubscriptionAsync(subscription, showErrors: false);
-                SubscriptionRefreshSchedule.ScheduleNext(subscription, DateTime.UtcNow);
+                Log(subscription.LastError is { Length: > 0 }
+                    ? "[IOR:warning] SUBSCRIPTION_AUTO_REFRESH_FAILED: список сохранён; причина указана в настройках подписки."
+                    : "SUBSCRIPTION_AUTO_REFRESH_COMPLETED");
             }
             SaveState(); PushWebSnapshot();
         }

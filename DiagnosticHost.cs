@@ -41,6 +41,16 @@ public sealed partial class MainForm
             foreach (var file in Directory.GetFiles(nativeReports, "*.json").OrderByDescending(File.GetLastWriteTimeUtc).Take(10))
                 System.IO.Compression.ZipFileExtensions.CreateEntryFromFile(archive, file, "native-start/" + Path.GetFileName(file));
         }
-        return "Обезличенный диагностический пакет сохранён.";
+        if (AgDnsEnabled)
+        {
+            var incidents = Path.Combine(_appDir, "diagnostics", "internet-incidents");
+            if (Directory.Exists(incidents))
+            {
+                using var archive = System.IO.Compression.ZipFile.Open(dialog.FileName, System.IO.Compression.ZipArchiveMode.Update);
+                foreach (var file in Directory.GetFiles(incidents, "*.json").Where(f => System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(f), "^[a-f0-9]{32}\\.json$")).OrderByDescending(File.GetLastWriteTimeUtc).Take(10))
+                    System.IO.Compression.ZipFileExtensions.CreateEntryFromFile(archive, file, "internet-incidents/" + Path.GetFileName(file));
+            }
+        }
+        return AgDnsEnabled ? "Диагностический пакет сохранён. Отметки проблем содержат локальные сведения о DNS и сети; проверьте их перед передачей." : "Обезличенный диагностический пакет сохранён.";
     }
 }

@@ -15,7 +15,16 @@ public sealed partial class MainForm
             _agDns=new AgDnsSuspension(_appDir,new AgDnsWindowsBackend());
             _agDns.Notice+=message=>{if(IsHandleCreated&&!IsDisposed)BeginInvoke(new Action(()=>{Log(message);PushWebSnapshot();}));};
             _agDnsTimer=new System.Windows.Forms.Timer{Interval=10000};
-            _agDnsTimer.Tick+=async(_,_)=>{if(_agLifecycleDepth==0&&IsConnectionRunning())try{await _agDns.MonitorAsync();}catch(Exception e){Log("AG_DNS_MONITOR_FAILED: "+e.GetType().Name);}};
+            _agDnsTimer.Tick+=async(_,_)=>
+            {
+                if(_agLifecycleDepth!=0||!IsConnectionRunning()||_agMonitorRunning)return;
+                _agMonitorRunning=true;
+                var watch=System.Diagnostics.Stopwatch.StartNew();
+                _internetIncident.Observe("ag_dns_monitor_started");
+                try{await _agDns.MonitorAsync();}
+                catch(Exception e){Log("AG_DNS_MONITOR_FAILED: "+e.GetType().Name);}
+                finally{_internetIncident.Observe("ag_dns_monitor_completed",watch.ElapsedMilliseconds);_agMonitorRunning=false;}
+            };
             _agDnsTimer.Start();
             Disposed+=(_,_)=>_agDnsTimer.Dispose();
             return _agDns;
@@ -52,6 +61,7 @@ public sealed partial class MainForm
     private async Task<bool> StopSingBoxAsync(bool preserveAgDns=false)
     {
         if(!AgDnsEnabled)return await StopConnectionCoreAsync();
+        CancelInternetIncidentOnStop();
         Interlocked.Increment(ref _agLifecycleDepth);
         _agPreserveForReconnect=preserveAgDns;
         try

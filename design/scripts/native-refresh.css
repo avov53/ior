@@ -13,3 +13,4 @@ html[data-theme=dark] select{color-scheme:dark}html[data-theme=light] select{col
 .setting-row input[type=checkbox][role=switch]:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .reduced .setting-row input[type=checkbox][role=switch],.reduced .setting-row input[type=checkbox][role=switch]::after{transition:none}
 @media(prefers-reduced-motion:reduce){.setting-row input[type=checkbox][role=switch],.setting-row input[type=checkbox][role=switch]::after{transition:none}}
+.subscription-group>header>.subscription-header-actions{display:flex;align-items:center;justify-content:flex-end;gap:4px;flex:0 0 auto;margin-left:auto}.subscription-header-actions>.ui-button.icon-button{flex:0 0 32px;margin:0}.subscription-group>header>.group-button{min-width:0;margin-right:8px}

@@ -29,7 +29,7 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
-    <Content Include="ior-core\target\release\ior-core.exe" Condition="Exists('ior-core\target\release\ior-core.exe')">
+    <Content Include="core\ior-core\ior-core-win10.exe" Condition="Exists('core\ior-core\ior-core-win10.exe')">
       <Link>core\ior-core\ior-core.exe</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
