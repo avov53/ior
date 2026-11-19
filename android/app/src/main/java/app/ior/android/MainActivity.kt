@@ -167,8 +167,7 @@ class MainActivity:ComponentActivity() {
     private fun dispatch(action:String,data:JSONObject,requestId:String=""){
         if(action in listOf("connect","select","confirm-server-switch","subscription-settings"))startupEpoch.incrementAndGet()
         when(action){
-            "check-app-update"->checkAppUpdate(true)
-            "load"->{pageReady=true;send("state",repo.snapshot());SubscriptionWorker.schedule(this,true);if(startupClaimed.compareAndSet(false,true)){startupWorker.execute{startupSubscriptions()};checkAppUpdate(false)}}
+            "load"->{pageReady=true;send("state",repo.snapshot());SubscriptionWorker.schedule(this,true);if(startupClaimed.compareAndSet(false,true))startupWorker.execute{startupSubscriptions()}}
             "connect"->{cancelPingChecks();if(repo.connection=="on"&&repo.activeId==repo.selectedServer()?.optString("id")){startService(Intent(this,IorVpnService::class.java).setAction(IorVpnService.STOP))}else if(repo.connection in listOf("pending","reconnecting")){startService(Intent(this,IorVpnService::class.java).setAction(IorVpnService.STOP))}else{val permission=VpnService.prepare(this);if(permission!=null)vpnPermission.launch(permission)else startVpn()}}
             "scan"->scanner.launch(Intent(this,QrActivity::class.java))
             "paste"->{val clipboard=getSystemService(ClipboardManager::class.java);clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.let{send("import",it)}}
@@ -260,29 +259,6 @@ class MainActivity:ComponentActivity() {
     private fun restore(bytes:ByteArray,password:CharArray?){worker.execute{try{val imported=BackupCodec.decode(bytes,password);val count=imported.getJSONArray("servers").length();runOnUiThread{AlertDialog.Builder(this).setTitle("Заменить данные приложения?").setMessage("Серверов: $count. Существующие конфигурации будут заменены. VPN должен быть отключён.").setPositiveButton("Восстановить"){_,_->worker.execute{try{repo.replace(imported);message("Данные восстановлены")}catch(_:Exception){message("Восстановление не выполнено")}}}.setNegativeButton("Отмена",null).localizedShow()}}catch(_:Exception){message("Неверный пароль или повреждённая копия")}finally{password?.fill('\u0000')}}}
     private fun password(title:String,callback:(CharArray)->Unit){val field=EditText(this).apply{inputType=android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD};AlertDialog.Builder(this).setTitle(title).setView(field).setPositiveButton("Продолжить"){_,_->val pass=field.text.toString().toCharArray();field.text.clear();callback(pass)}.setNegativeButton("Отмена",null).localizedShow()}
     private fun AlertDialog.Builder.localizedShow():AlertDialog {val dialog=show();dialog.window?.decorView?.let{Localization.apply(this@MainActivity,repo.snapshot(),it)};return dialog}
-    private val updateInProgress=java.util.concurrent.atomic.AtomicBoolean(false)
-    private fun checkAppUpdate(manual:Boolean){
-        if(!updateInProgress.compareAndSet(false,true))return
-        Thread({
-            try{
-                val link=AppUpdate.check()
-                runOnUiThread{
-                    if(isDestroyed || isFinishing)return@runOnUiThread
-                    if(link!=null)AlertDialog.Builder(this)
-                        .setTitle("Доступно обновление ior")
-                        .setMessage(link.substringAfterLast('/'))
-                        .setPositiveButton("Открыть релиз"){_,_->
-                            try{startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(link)))}
-                            catch(_:android.content.ActivityNotFoundException){message("Не удалось открыть страницу релиза")}
-                        }
-                        .setNegativeButton("Позже",null).localizedShow()
-                    else if(manual)message("Установлена актуальная версия ior")
-                }
-            }catch(_:Exception){
-                if(manual)message("Не удалось проверить обновление ior")
-            }finally{updateInProgress.set(false)}
-        },"ior-app-update").start()
-    }
     private fun message(text:String){send("message",Localization.translate(this,repo.snapshot(),text))}
     private fun send(event:String,data:Any){if(event=="state"&&data is JSONObject)data.put("appVersion",BuildConfig.VERSION_NAME);if(!uiVisible&&event in listOf("state","stats","latency","log"))return;val json=JSONObject().put("event",event).put("data",data).toString();runOnUiThread{if(::web.isInitialized&&pageReady&&!isFinishing&&!isDestroyed)web.evaluateJavascript("window.iorAndroidReceive($json)",null)}}
     private fun receiveIntent(intent:Intent?){

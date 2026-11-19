@@ -44,7 +44,7 @@ html=html.replace(anchor,anchor+`
   root.addEventListener('click',event=>{
     const button=event.target.closest('[data-action]');if(!button)return;
     const action=button.dataset.action,id=button.dataset.id||'';
-    const handled=['connect','select','confirm-server-switch','import-save','save-editor','duplicate','delete-object','validate-config','refresh','refresh-subscription','apps-examples','copy-share','copy-logs','clear-logs','paste','unavailable','examples','clear-data','android-share','android-backup','android-restore','android-auto-update','check-app-update','object-import-save','export-object','android-actions','ping-group','ping-cancel','hwid-mode','native-settings-save','export-diagnostics','video-stall-marker'];
+    const handled=['connect','select','confirm-server-switch','import-save','save-editor','duplicate','delete-object','validate-config','refresh','refresh-subscription','apps-examples','copy-share','copy-logs','clear-logs','paste','unavailable','examples','clear-data','android-share','android-backup','android-restore','android-auto-update','object-import-save','export-object','android-actions','ping-group','ping-cancel','hwid-mode','native-settings-save','export-diagnostics','video-stall-marker'];
     if(!handled.includes(action))return;
     event.preventDefault();event.stopImmediatePropagation();
     if(action==='android-actions'){const row=button.closest('[data-context]');openSheet('menu',{objectKind:row.dataset.context,id:row.dataset.object,position:{x:event.clientX,y:event.clientY}});return;}
@@ -53,7 +53,6 @@ html=html.replace(anchor,anchor+`
     if(action==='export-diagnostics'||action==='video-stall-marker'){event.stopImmediatePropagation();command(action);return;}
     if(action==='hwid-mode'){command(action,{id,mode:button.dataset.mode});return;}
     if(action==='native-settings-save'){saveNativeSettings();return;}
-    if(action==='check-app-update'){command(action);return;}
     if(action==='connect'){command('connect');return;}
     if(action==='select'||action==='confirm-server-switch'){command('select',{id:action==='select'?id:sheet.id});if(sheet)back();return;}
     if(action==='import-save'){const draft=state.drafts[sheet.tab];command('import',{...draft,tab:sheet.tab});back();return;}
