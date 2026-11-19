@@ -4541,6 +4541,8 @@ public sealed partial class MainForm : Form
             "fi" => "FI",
             "pl" => "PL",
             "my" => "MY",
+            "kg" => "KG",
+            "kz" => "KZ",
             _ => null
         };
         if (byTld is not null) return byTld;
@@ -4554,6 +4556,9 @@ public sealed partial class MainForm : Form
         if (source.Contains("russia") || source.Contains("moscow")) return "RU";
         if (source.Contains("finland") || source.Contains("helsinki")) return "FI";
         if (source.Contains("malaysia") || source.Contains("kuala lumpur")) return "MY";
+        if (source.Contains("🇰🇬") || source.Contains("бишкек") || source.Contains("bishkek") || source.Contains("кыргызстан") ||
+            source.Contains("киргизия") || source.Contains("киргистан") || source.Contains("киргизстан") || source.Contains("kyrgyzstan")) return "KG";
+        if (source.Contains("🇰🇿") || source.Contains("казахстан") || source.Contains("kazakhstan")) return "KZ";
         return "UN";
     }
 
@@ -4586,7 +4591,7 @@ public sealed partial class MainForm : Form
             }
         }
 
-        var importResult = ProfileParser.ParseManyDetailed(importText);
+        var importResult = ProfileParser.ParseManyDetailed(importText, includeClashRouting: !importAsProfile);
         var parsed = importResult.Profiles;
         if (importResult.RemovedProtocolCount > 0) Log(RemovedProtocolPolicy.Message);
         if (parsed.Count == 0)
@@ -4594,6 +4599,9 @@ public sealed partial class MainForm : Form
             MessageBox.Show(importResult.RemovedProtocolCount > 0 ? RemovedProtocolPolicy.Message : T("import.none"), T("import.title.short"), MessageBoxButtons.OK, MessageBoxIcon.Information);
             return false;
         }
+
+        if (parsed.Count == 1 && !string.IsNullOrWhiteSpace(requestedSubscriptionName))
+            parsed[0].Name = requestedSubscriptionName.Trim();
 
         foreach (var profile in parsed)
         {

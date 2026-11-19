@@ -14,3 +14,7 @@ html[data-theme=dark] select{color-scheme:dark}html[data-theme=light] select{col
 .reduced .setting-row input[type=checkbox][role=switch],.reduced .setting-row input[type=checkbox][role=switch]::after{transition:none}
 @media(prefers-reduced-motion:reduce){.setting-row input[type=checkbox][role=switch],.setting-row input[type=checkbox][role=switch]::after{transition:none}}
 .subscription-group>header>.subscription-header-actions{display:flex;align-items:center;justify-content:flex-end;gap:4px;flex:0 0 auto;margin-left:auto}.subscription-header-actions>.ui-button.icon-button{flex:0 0 32px;margin:0}.subscription-group>header>.group-button{min-width:0;margin-right:8px}
+
+.config-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.config-picker .config-picker-button { border-radius: 999px; padding: 10px 16px; }
+.config-picker small { color: var(--muted); }

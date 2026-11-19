@@ -1,4 +1,4 @@
-param([switch]$WindowsOnly,[switch]$RequireMacOS)
+param([switch]$WindowsOnly,[switch]$RequireMacOS,[switch]$ReuseVerifiedNative)
 $ErrorActionPreference='Stop'
 . "$PSScriptRoot/Build-FileHash.ps1"
 $root=Split-Path $PSScriptRoot -Parent
@@ -17,7 +17,7 @@ function Assert-ProjectDistNotRunning {
 try {
  Assert-ProjectDistNotRunning
  if(!$WindowsOnly){try{& "$PSScriptRoot/Build-MacOSRemote.ps1" -Preflight;$macReady=$true}catch{if($RequireMacOS){throw};Write-Host "macOS skipped: $($_.Exception.Message)" -ForegroundColor Yellow}}
- & "$PSScriptRoot/Build-WindowsDistribution.ps1" -OutputDirectory $stage
+ & "$PSScriptRoot/Build-WindowsDistribution.ps1" -OutputDirectory $stage -ReuseVerifiedNative:$ReuseVerifiedNative
  if($macReady){try{& "$PSScriptRoot/Build-MacOSRemote.ps1" -OutputDirectory $stage}catch{if($RequireMacOS){throw};Write-Host "macOS skipped: $($_.Exception.Message)" -ForegroundColor Yellow}}
  Assert-ProjectDistNotRunning
  $dist=Join-Path $root 'dist'

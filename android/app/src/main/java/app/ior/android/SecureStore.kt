@@ -12,6 +12,7 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 class SecureStore(context: Context) {
+    private val maxBytes=32*1024*1024
     private val file = File(context.noBackupFilesDir, "state.enc")
     private fun key(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -23,8 +24,9 @@ class SecureStore(context: Context) {
     }
     @Synchronized fun read(): JSONObject? {
         if (!file.exists()) return null
+        require(file.length() in 30L..maxBytes.toLong()) { "Неверный размер защищённого хранилища" }
         val bytes = file.readBytes()
-        require(bytes.size in 30..8*1024*1024 && bytes[0] == 1.toByte()) { "Неверное защищённое хранилище" }
+        require(bytes[0] == 1.toByte()) { "Неверное защищённое хранилище" }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(1,13)))
         return JSONObject(String(cipher.doFinal(bytes.copyOfRange(13,bytes.size)), Charsets.UTF_8))
@@ -33,6 +35,7 @@ class SecureStore(context: Context) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val bytes = byteArrayOf(1) + cipher.iv + cipher.doFinal(state.toString().toByteArray(Charsets.UTF_8))
+        require(bytes.size<=maxBytes){"Превышен размер хранилища конфигураций"}
         val temporary = File(file.parentFile, "state.enc.tmp")
         temporary.outputStream().use { it.write(bytes); it.fd.sync() }
         require(temporary.renameTo(file)) { "Не удалось сохранить данные" }

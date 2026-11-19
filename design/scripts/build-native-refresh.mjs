@@ -22,6 +22,9 @@ js=js.replace("const persist = ()=>{try{localStorage.setItem(key,JSON.stringify(
 js=js.replace('if(await handleFeatureAction(action,id,el))return;','if(await handleNativeAction(action,id,el))return;if(await handleFeatureAction(action,id,el))return;');
 js=js.replace(/root\.addEventListener\('click',event=>\{const el=event\.target\.closest\('\[data-action="save-rename"\]'\)[\s\S]*?\}\);/,'');
 js=js.replace("['tcp','ws','grpc','http']","['tcp','raw','ws','httpupgrade','grpc','xhttp']");
+js=js.replace("['config','WireGuard / AWG']", "['config','Файл / JSON']");
+js=js.replace('<textarea data-dialog="value" data-focus="dialog-value" aria-label="Конфигурация"', '${d.tab==="config"?`<div class="config-picker"><button type="button" class="outline config-picker-button" data-config-browse>Выбрать файл</button><input hidden type="file" data-config-file accept=".conf,.yaml,.yml,.json,.txt"><small>Можно перетащить файл в поле ниже</small></div>`:""}<textarea data-dialog="value" data-focus="dialog-value" aria-label="Конфигурация"');
+
 js=js.replace('/*__FEATURE_PACK__*/',()=> (awaitFeature)+'\n'+native);
 const styles=['prototype.css','linear-arc.css','registry-components.css','premium.css','simplified.css','feature-pack.css'];
 let css=(await Promise.all(styles.map(read))).join('\n')+'\n'+await readFile(new URL('native-refresh.css',import.meta.url),'utf8');

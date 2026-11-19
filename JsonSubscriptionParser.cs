@@ -41,8 +41,12 @@ public static class JsonSubscriptionParser
             "shadowsocks"=>ProxyProtocol.Shadowsocks,"hysteria2"=>ProxyProtocol.Hysteria2,"socks"=>ProxyProtocol.Socks,"http"=>ProxyProtocol.Http,_=>(ProxyProtocol?)null};
         if(kind is null)return null;
         var tls=Get(node,"tls");var reality=Get(tls,"reality");var transport=Get(node,"transport");
-        if(Get(node,"server_ports").ValueKind!=JsonValueKind.Undefined)
-            throw new FormatException("JSON port hopping ещё не представлен в профиле.");
+        var ports=Get(node,"server_ports");
+        var hopPorts=ports.ValueKind==JsonValueKind.Array
+            ? string.Join(",",ports.EnumerateArray().Select(port=>port.GetString()?.Replace(':','-')))
+            : String(node,"server_ports");
+        var intervalNode=Get(node,"hop_interval");
+        var hopInterval=intervalNode.ValueKind==JsonValueKind.Number ? intervalNode.GetRawText() : String(node,"hop_interval");
         var profile=new ProxyProfile {Protocol=kind.Value,Name=String(node,"tag")??String(node,"name")??String(node,"server")??type,
             Server=String(node,"server")??"",Port=Number(node,"server_port"),UserId=String(node,"uuid"),
             Password=String(node,"password"),Username=String(node,"username"),Method=String(node,"method"),Plugin=String(node,"plugin"),Security=String(node,"security"),AlterId=Number(node,"alter_id"),
@@ -51,7 +55,14 @@ public static class JsonSubscriptionParser
             PublicKey=String(reality,"public_key"),ShortId=String(reality,"short_id"),Fingerprint=String(Get(tls,"utls"),"fingerprint"),
             Network=String(transport,"type")??"tcp",Path=String(transport,"path"),ServiceName=String(transport,"service_name"),
             ObfsType=String(Get(node,"obfs"),"type"),ObfsPassword=String(Get(node,"obfs"),"password")};
-        var known=new HashSet<string>(["type","tag","name","server","server_port","uuid","password","username","method","plugin","security","alter_id","flow","tls","transport","obfs"],StringComparer.Ordinal);
+        if(kind==ProxyProtocol.Hysteria2){
+            profile.HysteriaHopPorts=hopPorts;
+            if(hopInterval is not null)
+                profile.HysteriaHopInterval=uint.TryParse(hopInterval.TrimEnd('s'),out var seconds) && seconds>=5
+                    ? seconds : throw new FormatException("Неверный интервал смены портов Hysteria2.");
+            if(profile.Port==0 && !string.IsNullOrWhiteSpace(hopPorts))profile.Port=443;
+        }
+        var known=new HashSet<string>(["type","tag","name","server","server_port","uuid","password","username","method","plugin","security","alter_id","flow","tls","transport","obfs","server_ports","hop_interval"],StringComparer.Ordinal);
         profile.UnsupportedParameters.AddRange(node.EnumerateObject().Where(field=>!known.Contains(field.Name)).Select(field=>field.Name));
         if(kind==ProxyProtocol.Vless&&transport.ValueKind==JsonValueKind.Object){
             profile.Host=String(Get(transport,"headers"),"Host")??String(transport,"host");

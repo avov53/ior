@@ -48,6 +48,23 @@ class Repository private constructor(context:Context):SubscriptionStore {
     @Synchronized fun server(id:String):JSONObject?=(0 until state.getJSONArray("servers").length()).map{state.getJSONArray("servers").getJSONObject(it)}.find{it.optString("id")==id}?.let{JSONObject(it.toString())}
     @Synchronized fun selectedServer():JSONObject?=server(state.optString("selected"))
     @Synchronized override fun subscriptions():List<JSONObject>{val a=state.getJSONArray("subscriptions");return (0 until a.length()).map{JSONObject(a.getJSONObject(it).toString())}}
+    @Synchronized fun saveAppearance(input:JSONObject){
+        val allowed=setOf("themeMode","preset","accent","background","surfaceTint","tintStrength","transparency","motion","powerSaving")
+        val next=JSONObject((state.optJSONObject("uiAppearance")?:JSONObject()).toString())
+        for(key in input.keys()){
+            require(key in allowed){"Неизвестная настройка оформления"}
+            val value=input.get(key)
+            require(value.toString().length<=32){"Некорректное оформление"}
+            when(key){
+                "accent","background","surfaceTint"->require(Regex("#[0-9a-fA-F]{6}").matches(value.toString()))
+                "themeMode"->require(value.toString() in listOf("dark","light","system"))
+                "tintStrength"->require(value is Number&&value.toInt() in 0..45)
+                "transparency","motion","powerSaving"->require(value is Boolean)
+            }
+            next.put(key,value)
+        }
+        state.put("uiAppearance",next);persist()
+    }
     @Synchronized fun saveSettings(input:JSONObject){
         if(input.has("journalMaxMb"))require(input.getInt("journalMaxMb") in listOf(5,20,50))
         if(input.has("journalDays"))require(input.getInt("journalDays") in listOf(1,7,30))
@@ -91,9 +108,45 @@ class Repository private constructor(context:Context):SubscriptionStore {
         fun filtered(array:JSONArray,predicate:(JSONObject)->Boolean)=JSONArray((0 until array.length()).map{array.getJSONObject(it)}.filter(predicate))
         state.put(key,filtered(state.getJSONArray(key)){it.optString("id")!=id})
         if(kind=="route"&&state.optString("selectedRoute")==id)state.put("selectedRoute","")
-        if(kind=="subscription")state.put("servers",filtered(state.getJSONArray("servers")){it.optString("subscriptionId")!=id})
+        if(kind=="subscription"){
+            state.put("servers",filtered(state.getJSONArray("servers")){it.optString("subscriptionId")!=id})
+            val routes=state.getJSONArray("routes")
+            state.put("routes",filtered(routes){route->
+                val keep=route.optString("localFileOwner")!=id
+                if(!keep && state.optString("selectedRoute")==route.optString("id"))state.put("selectedRoute","")
+                keep
+            })
+        }
         if(server(state.optString("selected"))==null)state.put("selected","")
         persist()
+    }
+    @Synchronized fun importDocument(doc:SubscriptionClient.ProfileDocument,name:String,raw:String){
+        val digest=java.security.MessageDigest.getInstance("SHA-256").digest(raw.toByteArray()).joinToString(""){"%02x".format(it)}
+        if(subscriptions().any{it.optString("fileDigest")==digest})return
+        val id=UUID.randomUUID().toString()
+        val title=name.ifBlank{doc.profiles.first().getString("name")}
+        val item=JSONObject().put("id",id).put("name",title).put("localFile",true).put("fileDigest",digest)
+            .put("url","").put("routeConsent","accepted").put("hwidMode","never").put("status","Локальный конфиг")
+        SubscriptionOptions.migrate(item,false)
+        doc.profiles.forEach{server->
+            val result=JSONObject(NativeCore.validate(validationRequest(server).toString()))
+            require(result.optBoolean("ok")){result.optString("code","Ошибка конфигурации сервера")}
+            server.put("subscriptionId",id)
+        }
+        doc.route?.let{route->
+            val result=JSONObject(NativeCore.validateRoutes(RouteCodec.rules(route).toString()))
+            require(result.optBoolean("ok")){"Маршрут из файла отклонён ядром"}
+            route.put("name",title).put("id",UUID.randomUUID().toString()).put("managedBy",id).put("localFileOwner",id)
+            item.put("routingId",route.getString("id"))
+        }
+        val next=JSONObject(state.toString())
+        doc.route?.let{next.getJSONArray("routes").put(it)}
+        next.getJSONArray("subscriptions").put(item)
+        doc.profiles.forEach{next.getJSONArray("servers").put(it)}
+        if(next.optString("selected").isBlank())next.put("selected",doc.profiles.first().getString("id"))
+        storage.write(next)
+        state=next
+        changed()
     }
     @Synchronized fun addSubscription(url:String,name:String):JSONObject{
         require(java.net.URI(url).scheme=="https"){"Подписка должна использовать HTTPS"}

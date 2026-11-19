@@ -10,7 +10,7 @@
     <RootNamespace>HappBox</RootNamespace>
     <Product>ior</Product>
     <Title>ior</Title>
-    <Version>1.2.6</Version>
+    <Version>1.2.7</Version>
     <ApplicationIcon>assets\app-icon\icon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <DefaultItemExcludes>$(DefaultItemExcludes);.local\**;android\**;android-output\**;windows-output\**;distandroid\**</DefaultItemExcludes>
@@ -29,7 +29,7 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
-    <Content Include="core\ior-core\ior-core-win10.exe" Condition="Exists('core\ior-core\ior-core-win10.exe')">
+    <Content Include="ior-core\target\release\ior-core.exe" Condition="Exists('ior-core\target\release\ior-core.exe')">
       <Link>core\ior-core\ior-core.exe</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
@@ -46,8 +46,13 @@
 <Content Include="assets\service-icons\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="design\index.html" Condition="Exists('design\index.html')">
+    <Content Include="design\index.html" Condition="'$(UseNewUi)' != 'true' And Exists('design\index.html')">
       <Link>webui\index.html</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="design\app\out\windows\**\*" Condition="'$(UseNewUi)' == 'true'">
+      <Link>webui\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>

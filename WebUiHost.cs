@@ -568,6 +568,24 @@ public sealed partial class MainForm
             }
             case "subscription.route-consent":
                 var routeSub=_state.Subscriptions.First(s=>s.Id==payload.GetProperty("id").GetString());if(payload.TryGetProperty("review",out var review)&&review.GetBoolean())routeSub.RouteConsent="ask";else SubscriptionService.ResolveRoutingConsent(_state,routeSub,payload.GetProperty("accept").GetBoolean());SaveState();PushWebSnapshot();return null;
+            case "ui.appearance":
+            {
+                var allowed=new HashSet<string>{"themeMode","preset","accent","background","surfaceTint","tintStrength","layout","transparency","motion"};
+                if(payload.ValueKind!=JsonValueKind.Object)throw new InvalidOperationException("Некорректные настройки оформления.");
+                var next=new Dictionary<string,string>(_state.UiAppearance);
+                foreach(var property in payload.EnumerateObject()){
+                    if(!allowed.Contains(property.Name))throw new InvalidOperationException("Неизвестная настройка оформления.");
+                    var value=property.Value.ToString();
+                    if(value.Length>32)throw new InvalidOperationException("Некорректная настройка оформления.");
+                    if(property.Name is "accent" or "background" or "surfaceTint" && !System.Text.RegularExpressions.Regex.IsMatch(value,"^#[0-9a-fA-F]{6}$"))throw new InvalidOperationException("Некорректный цвет.");
+                    if(property.Name=="themeMode" && value is not ("system" or "dark" or "light"))throw new InvalidOperationException("Некорректная тема.");
+                    if(property.Name=="layout" && value is not ("compact" or "split"))throw new InvalidOperationException("Некорректная компоновка.");
+                    if(property.Name=="tintStrength" && (!int.TryParse(value,out var strength)||strength<0||strength>45))throw new InvalidOperationException("Некорректная интенсивность.");
+                    if(property.Name is "motion" or "transparency" && !bool.TryParse(value,out _))throw new InvalidOperationException("Некорректная настройка анимации.");
+                    next[property.Name]=value;
+                }
+                _state.UiAppearance=next;SaveState();PushWebSnapshot();return null;
+            }
             case "subscription.settings": SaveSubscriptionOptions(payload);return null;
             case "lan.settings": await SaveLanAsync(payload);return null;
             case "lan.firewall": ConfigureLanFirewall();return null;
@@ -843,7 +861,7 @@ public sealed partial class MainForm
                 _state.TunEnabled ? "TUN" : "Proxy", _state.SystemProxyApplied),
             settings = new
             {
-                journal=_state.Journal,launchWithWindows=_state.LaunchWithWindows,connectAtWindowsStartup=_state.ConnectAtWindowsStartup,windowsStartupProfileId=_state.WindowsStartupProfileId,restoreAfterSleep=_state.RestoreAfterSleep,windowsStartupStatus=_windowsStartupStatus,
+                uiAppearance=_state.UiAppearance,journal=_state.Journal,launchWithWindows=_state.LaunchWithWindows,connectAtWindowsStartup=_state.ConnectAtWindowsStartup,windowsStartupProfileId=_state.WindowsStartupProfileId,restoreAfterSleep=_state.RestoreAfterSleep,windowsStartupStatus=_windowsStartupStatus,
                 lan = _state.Lan, lanInterfaces=LanInterfaces(), lanStatus=_lanStatus,
                 tunEnabled = _state.TunEnabled, mixedProxyEnabled = _state.MixedProxyEnabled, mixedProxyPort = _state.MixedProxyPort,
                 tunMtu = _state.TunMtu, sniffEnabled = _state.SniffEnabled, autoRoute = _state.AutoRoute,
@@ -860,7 +878,7 @@ public sealed partial class MainForm
             },
             servers = _state.Profiles.Where(p=>!RemovedProtocolPolicy.IsRemoved(p)).Select(profile => new
             {
-                profile.Id, profile.Name, protocol = profile.Protocol.ToString(), profile.Server, profile.Port, profile.CountryCode,
+                profile.Id, profile.Name, protocol = profile.Protocol.ToString(), profile.Server, profile.Port, countryCode = CountryCodeForDisplay(profile) is var code && code != "UN" ? code : null,
                 profile.CountryName, profile.SubscriptionId, uploadBytes = profile.SubscriptionUploadBytes,
                 downloadBytes = profile.SubscriptionDownloadBytes, totalBytes = profile.SubscriptionTotalBytes,
                 expireUtc = profile.SubscriptionExpireUtc,

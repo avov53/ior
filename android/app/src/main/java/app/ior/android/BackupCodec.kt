@@ -11,6 +11,7 @@ import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
 object BackupCodec {
+    const val MAX_BACKUP_BYTES=48*1024*1024
     private const val ITERATIONS=600000
     fun encode(state:JSONObject,password:CharArray?):ByteArray {
         val data=JSONObject(state.toString())
@@ -35,7 +36,7 @@ object BackupCodec {
         return envelope.toString().toByteArray(Charsets.UTF_8)
     }
     fun decode(bytes:ByteArray,password:CharArray?):JSONObject {
-        require(bytes.size<=8*1024*1024)
+        require(bytes.size<=MAX_BACKUP_BYTES)
         val envelope=JSONObject(String(bytes,Charsets.UTF_8));require(envelope.optString("type")=="ior-android-backup"&&envelope.optInt("version")==1){"Неверная версия резервной копии"}
         if(!envelope.optBoolean("includesSecrets"))return envelope.getJSONObject("data")
         require(password!=null && envelope.getInt("iterations")==ITERATIONS)

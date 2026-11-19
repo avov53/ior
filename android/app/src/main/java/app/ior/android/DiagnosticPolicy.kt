@@ -6,6 +6,7 @@ import org.json.JSONObject
 internal object DiagnosticPolicy {
     private val scalarKeys=("eventUnixMs stage flowId sessionId protocol profileTransport classification direction phase severity elapsedMs durationMs sentBytes receivedBytes queueWaitUs sendWaitUs readWaitUs waitCount queryType errorType transport side operation readEof writeClosed kind reason rttEstimateMs udpSessionId rxQueuedDatagrams rxQueueCapacity rxQueueHighWater newReceiveQueueDrops proxyQueueDrops tunQueueDrops queuedDatagrams queuedBytes receiveQueueDrops cwndBytes lostPackets sentPackets count droppedEvents lastReceivedAgoMs lastSentAgoMs afterFirstSendMs receiveWaitUs dnsNameCount ttlSeconds tunDeliveredBytes forwardedPackets receivedPackets droppedPackets rxQueuedBytes txQueuedBytes parentFlowId firstResponseUs active fallback maxPacketBytes mtu icmpType icmpCode rxWindowBytes peerWindowBytes rxZeroWindowUs peerZeroWindowUs applicationWaitUs reassemblyDroppedPackets path target addressFamily nameSource sampleWindowMs receiveBytesPerSecond sendBytesPerSecond hint evidence appVersion versionCode physicalTransport validated metered linkDownstreamKbps linkUpstreamKbps playbackState quality").split(' ').toSet()
     private val token=Regex("[A-Za-z0-9_-]{1,80}")
+    private val handshakeNumericKeys = setOf("attemptStartedUnixMs", "elapsedUs", "wireBytes", "quicBytes", "omittedSamples")
     private val domain=Regex("[A-Za-z0-9._-]{1,253}")
     private val endpoint=Regex("(?:[0-9]{1,3}\\.){3}[0-9]{1,3}:[0-9]{1,5}|\\[[0-9a-fA-F:%]+\\]:[0-9]{1,5}")
     fun normalize(originalCode:String, fields:JSONObject):Pair<String,JSONObject> {
@@ -13,6 +14,8 @@ internal object DiagnosticPolicy {
         for(key in fields.keys()){
             val value=fields.opt(key)
             when {
+                originalCode in setOf("HYSTERIA2_HANDSHAKE_UDP_COUNTS", "HYSTERIA2_HANDSHAKE_UDP_SAMPLE") &&
+                    key in handshakeNumericKeys && value is Number && value.toDouble().isFinite() -> safe.put(key,value)
                 key in scalarKeys && (value is Boolean || value is Number && value.toDouble().isFinite() || value is String && token.matches(value)) -> safe.put(key,value)
                 key in listOf("destinationName","host","domain") && value is String && domain.matches(value) -> safe.put(key,value)
                 key in listOf("source","destination","resolver") && value is String && endpoint.matches(value) -> safe.put(key,value)
@@ -38,7 +41,7 @@ internal object DiagnosticPolicy {
     fun console(code:String, fields:JSONObject, debug:Boolean):Boolean = debug ||
         fields.optString("severity") in listOf("WARN","ERROR") ||
         code in setOf("ANDROID_DIAGNOSTIC_SESSION_STARTED","VPN_CONNECTED","VPN_STOPPED","VIDEO_PLAYBACK_STALL_REPORTED") ||
-        code.contains("HANDSHAKE") || code.contains("HTTPS_PROBE")
+        (code.contains("HANDSHAKE") && code != "HYSTERIA2_HANDSHAKE_UDP_SAMPLE") || code.contains("HTTPS_PROBE")
 }
 
 /** Observed encrypted traffic is not a player buffer or a 4K bandwidth requirement. */

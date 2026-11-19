@@ -160,6 +160,9 @@ public static class CoreRuntimeContract
                 Options = new CoreProtocolOptions {
                     Obfs = protocol=="hysteria2" ? profile.ObfsType?.ToLowerInvariant() : null,
                     ObfsPassword = protocol=="hysteria2" ? profile.ObfsPassword : null,
+                    HysteriaHopPorts = profile.HysteriaHopPorts,
+                    HysteriaHopInterval = profile.HysteriaHopInterval,
+                    HysteriaCertificatePin = profile.HysteriaCertificatePin,
                     Method = protocol == "vmess" ? profile.Security ?? "auto" : profile.Method,
                     AlterId = protocol == "vmess" ? profile.AlterId : null, Tls = profile.TlsEnabled, Transport = profile.Network,
                     Host = profile.Host, Path = profile.Path, ServiceName = profile.ServiceName, VlessTransport = profile.VlessTransport, Alpn=profile.Alpn,
@@ -250,6 +253,12 @@ public sealed class CoreProtocolOptions
     public bool AwgNamedIpv4Fallback { get; set; }
     public string? Obfs {get;set;}
     public string? ObfsPassword {get;set;}
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? HysteriaHopPorts {get;set;}
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public uint? HysteriaHopInterval {get;set;}
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? HysteriaCertificatePin {get;set;}
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public string? AwgEngine { get; set; }
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]

@@ -1,4 +1,5 @@
 import {readFile,writeFile,mkdir,readdir,copyFile} from 'node:fs/promises';
+import './build-country-ui.mjs';
 const prototype=new URL('../design/prototypes/mobile/index.html',import.meta.url);
 let androidRuntime=await readFile(new URL('ui-runtime.js',import.meta.url),'utf8');
 androidRuntime+='\n'+await readFile(new URL('sheet-gestures.js',import.meta.url),'utf8');
@@ -6,6 +7,13 @@ androidRuntime=androidRuntime.replace('const nativeTranslations=',(await readFil
 androidRuntime+='\n'+await readFile(new URL('../design/scripts/subscription-routing-ui.js',import.meta.url),'utf8')+`\nconst routingUiSettingsContext=()=>screen==='setting-subscription'?{id:nativeSubscriptionId,node:root.querySelector('.native-options')}:null;const routingUiReview=id=>command('route-consent',{id,review:true});const routingUiCopy=text=>command('copy',{text});const routingUiConsent=(id,accept)=>command('route-consent',{id,accept});const routingUiModalBusy=()=>!!sheet;const routingUiReduced=()=>reduceMotion();const routingUiRender=render;render=function(){routingUiRender();subscriptionRoutingPaint(state,true);};`;
 const androidStyles=await readFile(new URL('native-ui.css',import.meta.url),'utf8');
 let html=await readFile(prototype,'utf8');
+const countryAnchor = 'const flag=window.mobileFlags?.[server.country];';
+if (!html.includes(countryAnchor)) throw Error('Mobile server row changed: review country rendering');
+html = html.replace(countryAnchor, "const country=window.iorServerCountry?.(server);const flag=country?.code?'./flags/'+country.code+'.svg':null;");
+html = html.replace('alt="${esc(server.countryName)}"', 'alt="${esc(country.city||country.code)}"');
+html = html.replace("${server.demo?' · пример':''}", "${country?.city?' · '+esc(country.city):''}");
+html = html.replace('esc(s.address||s.protocol)', "esc(window.iorServerCountry?.(s)?.city||s.protocol)");
+html = html.replace('</head>', '<script src="./country-ui.js"></script></head>');
 const prototypeSwipe="if(event.button!==0||!sheet||sheet.closing||!event.target.closest('.grabber,.sheet-heading')";
 if(!html.includes(prototypeSwipe))throw Error('Mobile prototype swipe changed: review Android gestures');
 html=html.replace(prototypeSwipe,"if(event.button!==0||!sheet||sheet.kind==='import'||sheet.closing||!event.target.closest('.grabber,.sheet-heading')");
@@ -29,14 +37,14 @@ html=html.replace(anchor,anchor+`
     else if(value.event==='journal-size'){nativeJournalBytes=value.data;render();}
     else if(value.event==='apps-error'){nativeAppsLoading=false;nativeAppsError=value.data;render();}
     else if(value.event==='apps-invalidated'){nativeAppsLoaded=false;nativeAppsLoading=false;nativeAppsError='';if(screen==='setting-apps')render();}
-    else if(value.event==='import'){const text=String(value.data).trim(),tab=text.toLowerCase().startsWith('https://')?'subscription':text.startsWith('[Interface]')?'file':'link';state.drafts[tab].value=text;openSheet('import',{tab});render();}
+    else if(value.event==='import'){const text=String(value.data).trim(),tab=text.toLowerCase().startsWith('https://')?'subscription':['vless','hy2','hysteria2','amneziawg','wg','awg','vpn','wireguard'].includes(text.split('://')[0].toLowerCase())?'link':'file';state.drafts[tab].value=text;openSheet('import',{tab});render();}
     else if(value.event==='editor-saved'){if(editor){original=JSON.stringify(editor);back();}notify('Сохранено');}
     else if(value.event==='message'){notify(value.data);}
   };
   root.addEventListener('click',event=>{
     const button=event.target.closest('[data-action]');if(!button)return;
     const action=button.dataset.action,id=button.dataset.id||'';
-    const handled=['connect','select','confirm-server-switch','import-save','save-editor','duplicate','delete-object','validate-config','refresh','refresh-subscription','apps-examples','copy-share','copy-logs','clear-logs','paste','unavailable','examples','clear-data','android-share','android-backup','android-restore','android-auto-update','object-import-save','export-object','android-actions','ping-group','ping-cancel','hwid-mode','native-settings-save','export-diagnostics','video-stall-marker'];
+    const handled=['connect','select','confirm-server-switch','import-save','save-editor','duplicate','delete-object','validate-config','refresh','refresh-subscription','apps-examples','copy-share','copy-logs','clear-logs','paste','unavailable','examples','clear-data','android-share','android-backup','android-restore','android-auto-update','check-app-update','object-import-save','export-object','android-actions','ping-group','ping-cancel','hwid-mode','native-settings-save','export-diagnostics','video-stall-marker'];
     if(!handled.includes(action))return;
     event.preventDefault();event.stopImmediatePropagation();
     if(action==='android-actions'){const row=button.closest('[data-context]');openSheet('menu',{objectKind:row.dataset.context,id:row.dataset.object,position:{x:event.clientX,y:event.clientY}});return;}
@@ -45,6 +53,7 @@ html=html.replace(anchor,anchor+`
     if(action==='export-diagnostics'||action==='video-stall-marker'){event.stopImmediatePropagation();command(action);return;}
     if(action==='hwid-mode'){command(action,{id,mode:button.dataset.mode});return;}
     if(action==='native-settings-save'){saveNativeSettings();return;}
+    if(action==='check-app-update'){command(action);return;}
     if(action==='connect'){command('connect');return;}
     if(action==='select'||action==='confirm-server-switch'){command('select',{id:action==='select'?id:sheet.id});if(sheet)back();return;}
     if(action==='import-save'){const draft=state.drafts[sheet.tab];command('import',{...draft,tab:sheet.tab});back();return;}
@@ -104,7 +113,9 @@ html=html.replace("<span class=\"app-tile\" aria-hidden=\"true\">\${a.letter}</s
 html=html.replace("['games','Игры'],['system','Системные']","['games','Игры'],['system','Системные'],['other','Другие']");
 html=html.replace("if(d.kind==='subscription'){title=d.name;body='<p class=\"info\">'+esc(d.url)+'</p><p>Срок и расход трафика: —</p><p class=\"info\">Загрузка и измерения не подключены.</p>';}","if(d.kind==='subscription'){const item=state.subscriptions.find(s=>s.id===d.id)||d;const m=item.metadata||{};title=item.name;body='<p>'+esc(item.status||'Нет данных')+'</p><p>Расход: '+(m.upload!=null&&m.download!=null?esc(((m.upload+m.download)/1073741824).toFixed(2))+' ГиБ':'Не предоставляется')+'</p><p>Лимит: '+(m.total!=null?esc((m.total/1073741824).toFixed(2))+' ГиБ':'Не предоставляется')+'</p><p>Срок: '+(m.expire?esc(new Date(m.expire*1000).toLocaleDateString()):'Не предоставляется')+'</p>';}");
 html=html.replaceAll('Загрузить примеры','Загрузить приложения').replaceAll('демонстрационный каталог','каталог установленных приложений');
-html=html.replaceAll('WG / AWG','AWG');
+html=html.replaceAll('WG / AWG','Конфиги').replaceAll('Конфигурация .conf','Конфиг, JSON или ссылка')
+  .replace('accept=".conf,.txt,text/plain"', 'accept=".json,.yaml,.yml,.conf,.txt,application/json,text/plain"')
+  .replace("btn('choose-file','Выбрать файл','outline'):", "btn('choose-file','Выбрать файл','outline')+btn('paste','Вставить','outline'):");
 html=html.replace('<title>ior · мобильный прототип</title>','<title>ior Android</title>').replaceAll('Экспорт макета','Экспорт маршрута');
 html=html.replace('</head>','<style>.icon-button{min-width:48px;min-height:48px}.menu-button{min-height:48px}</style></head>');
 html=html.replace('В Android подключение потребует системного разрешения VPN. Здесь показан только интерфейс.','VPN работает через ior-core Rust. При первом подключении Android запросит разрешение.');

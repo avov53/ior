@@ -18,9 +18,11 @@ object ProfileCodec {
     private fun decode(value: String) = URLDecoder.decode(value.replace("+", "%2B"), "UTF-8")
     private fun base64(value: String): ByteArray = Base64.getDecoder().decode(value.replace('-', '+').replace('_', '/').filterNot { it.isWhitespace() })
     fun parse(input: String, name: String = ""): JSONObject {
-        require(input.length in 1..1024*1024) { "Размер конфигурации недопустим" }
+        require(input.length in 1..5*1024*1024) { "Размер конфигурации недопустим" }
         val raw = input.trim()
-        if (raw.startsWith("[Interface]", true)) return awg(raw, name, raw, false)
+        val firstLine=raw.lineSequence().map{it.trim()}.firstOrNull{it.isNotEmpty() && !it.startsWith('#') && !it.startsWith(';')}
+        if (firstLine.equals("[Interface]", true)) return awg(raw, name, raw, false)
+        require(raw.length<=1024*1024) { "Слишком длинная ссылка" }
         val scheme = raw.substringBefore("://").lowercase()
         require(scheme !in listOf("vmess","ss","shadowsocks","trojan")){"VMess, Shadowsocks и Trojan пока не поддерживаются"}
         if (scheme in listOf("awg", "amneziawg", "vpn", "wireguard")) {
@@ -80,6 +82,15 @@ object ProfileCodec {
             if(network=="grpc")transport.remove("mode")
             options.put("vlessTransport",transport)
         }
+        if(!isVless){
+            params["mport"]?.let{options.put("hysteriaHopPorts",it)}
+            params["hopInterval"]?.let{
+                val seconds=it.toLongOrNull()
+                require(seconds!=null && seconds>=5){"Неверный интервал смены портов Hysteria2"}
+                options.put("hysteriaHopInterval",seconds)
+            }
+            params["pinSHA256"]?.let{options.put("hysteriaCertificatePin",it)}
+        }
         val wire = JSONObject().put("protocol",if (isReality) "vless_reality" else if(isVless) "vless_tls" else "hysteria2")
             .put("server",host).put("port",port).put("credential",credential)
             .put("serverName",params["sni"] ?: params["peer"] ?: params["serverName"] ?: host)
@@ -114,8 +125,10 @@ object ProfileCodec {
         var section = ""
         var peers = 0
         val values = mutableMapOf<String,String>()
+        val allowedIps=JSONArray()
         for (line in text.lineSequence()) {
             val clean = line.substringBefore('#').trim()
+            if(clean.startsWith(';'))continue
             if (clean.startsWith('[')) { section=clean.lowercase(); if (section=="[peer]") peers++; continue }
             if (clean.isBlank()) continue
             require(clean.contains('=')) { "Неверная строка AWG" }
@@ -123,7 +136,11 @@ object ProfileCodec {
             val value=clean.substringAfter('=').trim()
             require(section in listOf("[interface]","[peer]")) { "Неверная секция AWG" }
             val full=section+key
-            require(!values.containsKey(full)) { "Повтор параметра AWG" }
+            if(full=="[peer]allowedips"){
+                value.splitToSequence(',').map{it.trim()}.filter{it.isNotEmpty()}.forEach{allowedIps.put(it)}
+                continue
+            }
+            require(full !in values) { "Повтор параметра AWG: $key" }
             val known = if(section=="[interface]") key in listOf("privatekey","address","dns","mtu") || awgNames.containsKey(key) else key in listOf("publickey","presharedkey","endpoint","allowedips","persistentkeepalive")
             require(known) { "Неизвестный параметр AWG: $key" }
             values[full]=value
@@ -142,7 +159,7 @@ object ProfileCodec {
         require(base64(privateKey).size==32 && base64(publicKey).size==32) { "Неверный ключ AWG" }
         fun list(text:String?)=JSONArray(text?.split(',')?.map { it.trim() }?.filter { it.isNotBlank() } ?: emptyList<String>())
         options.put("awg",parameters).put("awgEngine","rust").put("awgRoutingMode","rules")
-            .put("localAddresses",list(value("interface","address"))).put("allowedIps",list(value("peer","allowedips")))
+            .put("localAddresses",list(value("interface","address"))).put("allowedIps",allowedIps)
             .put("peerPublicKey",publicKey).put("presharedKey",value("peer","presharedkey") ?: JSONObject.NULL)
             .put("keepalive",value("peer","persistentkeepalive")?.toInt() ?: JSONObject.NULL).put("mtu",value("interface","mtu")?.toInt() ?: 1280)
         val wire=JSONObject().put("protocol","amneziawg").put("server",endpointUri.host.removeSurrounding("[","]")).put("port",endpointUri.port)

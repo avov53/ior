@@ -144,7 +144,11 @@ public sealed class IorCoreControlClient : IAsyncDisposable
         await _process.StandardInput.FlushAsync(token);
         var result = await ReadAsync(token);
         if (result.RequestId != id || result.Operation != (operation == "stop" ? "stopped" : operation))
-            throw new InvalidDataException("ior-core response identity mismatch.");
+        {
+            var received = result.Operation is "ready" or "status" or "configureLan" or "probeDirect" or "stopped" or "error"
+                ? result.Operation : "unknown";
+            throw new InvalidDataException($"ior-core response identity mismatch (command={operation}, response={received}, sameRequest={result.RequestId == id}).");
+        }
         return result;
     }
 

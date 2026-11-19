@@ -1,4 +1,5 @@
-param([switch]$SkipNative, [switch]$Debug, [string]$OutputDirectory='android-output/current')
+param([switch]$SkipNative, [switch]$Debug, [string]$OutputDirectory='android-output/current',
+    [switch]$ReuseVerifiedNative, [switch]$NewInterface, [switch]$RunUiChecks, [string]$BaselineDirectory='.local/backups/ui-integration-20261117')
 $ErrorActionPreference='Stop'
 function Invoke-AndroidBuildTool([string]$Tool,[string[]]$Arguments,[string]$Log='') {
     # Windows PowerShell 5 treats normal native stderr (JAVA_TOOL_OPTIONS,
@@ -9,6 +10,17 @@ function Invoke-AndroidBuildTool([string]$Tool,[string[]]$Arguments,[string]$Log
     if($code -ne 0){if($Log){Get-Content -LiteralPath $Log -Tail 35};throw "Android build tool failed ($code): $Tool"}
 }
 $workspaceRoot=Split-Path $PSScriptRoot -Parent
+if($ReuseVerifiedNative){
+    . "$PSScriptRoot/Verified-UiNative.ps1"
+    $baseline=Resolve-UiNativeBaseline $workspaceRoot $BaselineDirectory
+    $nativeManifest=Get-Content -LiteralPath "$baseline/native-hashes.json" -Raw | ConvertFrom-Json
+    $nativeEntries=@($nativeManifest | Where-Object platform -eq android)
+    $nativeEntry=@($nativeEntries | Where-Object path -eq 'lib/arm64-v8a/libior_android.so')
+    if($nativeEntry.Count -ne 1){throw 'Expected one verified Android core library'}
+    $verifiedNative=Join-Path $baseline 'native/android/libior_android.so'
+    if((Get-FileHash -LiteralPath $verifiedNative -Algorithm SHA256).Hash -ne $nativeEntry[0].sha256){throw 'Android native baseline changed'}
+    $SkipNative=$true
+}
 $tools=Join-Path $workspaceRoot '.local/android-tools'
 $java=Get-ChildItem (Join-Path $tools 'java') -Directory | Select-Object -First 1
 if (!$java) { throw 'Run scripts/Setup-Android.ps1 first.' }
@@ -28,16 +40,38 @@ $ndk=Join-Path $env:ANDROID_HOME 'ndk/27.2.12479018'
 $compiler=Join-Path $ndk 'toolchains/llvm/prebuilt/windows-x86_64/bin'
 $env:PATH=(Join-Path $env:JAVA_HOME 'bin')+';'+(Join-Path $env:ANDROID_HOME 'cmake/3.22.1/bin')+';'+$compiler+';'+$env:PATH
 $output=if([IO.Path]::IsPathRooted($OutputDirectory)){[IO.Path]::GetFullPath($OutputDirectory)}else{[IO.Path]::GetFullPath((Join-Path $workspaceRoot $OutputDirectory))}
+if($NewInterface -and (Test-Path -LiteralPath (Join-Path $output 'ior-android-arm64.apk'))){throw 'Use a new output directory to preserve the previous UI test APK'}
 New-Item -ItemType Directory -Force $output | Out-Null
 Push-Location $workspaceRoot
 try {
-    & node android/build-ui.mjs
-    if($LASTEXITCODE -ne 0){throw 'Android interface build failed'}
-    & node android/build-geodata.mjs
-    if($LASTEXITCODE -ne 0){throw 'Routing geodata build failed'}
-    $prebuiltNative=Join-Path $workspaceRoot 'core/android/libior_android.so'
-    $usePrebuilt=Test-Path -LiteralPath $prebuiltNative
-    if (!$SkipNative -and !$usePrebuilt) {
+    if($NewInterface){
+        if($SkipNative -and !$ReuseVerifiedNative){throw 'New interface builds require a fresh or verified Android core'}
+        & node design/app/build.mjs android
+        if($LASTEXITCODE -ne 0){throw 'New Android interface build failed'}
+        $assetStage=Join-Path $output 'assets'
+        New-Item -ItemType Directory -Force $assetStage | Out-Null
+        $oldChunks=Join-Path $assetStage 'assets'
+        $newChunks=Join-Path $workspaceRoot 'design/app/out/android/assets'
+        if(Test-Path -LiteralPath $oldChunks){
+            $expected=@(Get-ChildItem -LiteralPath $newChunks -File | Select-Object -ExpandProperty Name)
+            $stageRoot=[IO.Path]::GetFullPath($oldChunks).TrimEnd('\')+'\'
+            Get-ChildItem -LiteralPath $oldChunks -File | Where-Object {$_.Name -match '^(index|browser)-[A-Za-z0-9_-]+\.(js|css)$' -and $_.Name -notin $expected} | ForEach-Object {
+                if(!$_.FullName.StartsWith($stageRoot,[StringComparison]::OrdinalIgnoreCase)){throw 'Invalid UI staging path'}
+                Remove-Item -LiteralPath $_.FullName
+            }
+        }
+        Copy-Item -Path "$workspaceRoot/android/app/src/main/assets/*" -Destination $assetStage -Recurse -Force
+        Copy-Item -Path "$workspaceRoot/design/app/out/android/*" -Destination $assetStage -Recurse -Force
+        $env:IOR_ANDROID_UI_ASSETS=$assetStage
+    }else{
+        & node android/build-ui.mjs
+        if($LASTEXITCODE -ne 0){throw 'Android interface build failed'}
+    }
+    if($NewInterface){
+        & node android/build-geodata.mjs
+        if($LASTEXITCODE -ne 0){throw 'Routing geodata build failed'}
+    }
+    if (!$SkipNative) {
         $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=Join-Path $compiler 'aarch64-linux-android29-clang.cmd'
         $env:CC_aarch64_linux_android=$env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
         $env:CXX_aarch64_linux_android=Join-Path $compiler 'aarch64-linux-android29-clang++.cmd'
@@ -50,19 +84,19 @@ try {
         Push-Location ior-core
         try { Invoke-AndroidBuildTool 'cargo' @('build','-p','ior-android','--release','--locked','--target','aarch64-linux-android') (Join-Path $output 'rust-build.log') } finally { Pop-Location }
     }
-    $native=if($usePrebuilt){$prebuiltNative}else{Join-Path $workspaceRoot 'ior-core/target/aarch64-linux-android/release/libior_android.so'}
-    if($usePrebuilt){
-        $manifest=Get-Content -LiteralPath (Join-Path $workspaceRoot 'core/native-package-manifest.json') -Raw|ConvertFrom-Json
-        if((Get-FileHash -LiteralPath $native).Hash -ne $manifest.'android-arm64'){throw 'Pinned Android native core mismatch'}
-    }
+    $native=if($ReuseVerifiedNative){$verifiedNative}else{Join-Path $workspaceRoot 'ior-core/target/aarch64-linux-android/release/libior_android.so'}
     if(!(Test-Path -LiteralPath $native)){throw 'Native ior-core library missing'}
-    $jni=Join-Path $workspaceRoot 'android/app/src/main/jniLibs/arm64-v8a'
+    $jni=if($ReuseVerifiedNative){Join-Path $output 'jniLibs/arm64-v8a'}else{Join-Path $workspaceRoot 'android/app/src/main/jniLibs/arm64-v8a'}
+    if($ReuseVerifiedNative){$env:IOR_ANDROID_UI_JNI=Split-Path $jni -Parent}
     New-Item -ItemType Directory -Force $jni | Out-Null
     Copy-Item -LiteralPath $native -Destination (Join-Path $jni 'libior_android.so')
-    & (Join-Path $compiler 'llvm-strip.exe') --strip-unneeded (Join-Path $jni 'libior_android.so')
-    if($LASTEXITCODE -ne 0){throw 'Native strip failed'}
+    if(!$ReuseVerifiedNative){
+        & (Join-Path $compiler 'llvm-strip.exe') --strip-unneeded (Join-Path $jni 'libior_android.so')
+        if($LASTEXITCODE -ne 0){throw 'Native strip failed'}
+    }
     if(!$Debug) {
         $keys=Join-Path $workspaceRoot '.local/android-signing'
+        if($ReuseVerifiedNative -and (!(Test-Path -LiteralPath "$keys/signing.json") -or !(Test-Path -LiteralPath "$keys/ior-release.jks"))){throw 'UI-only builds require the existing Android signing key; creating a different key is prohibited.'}
         New-Item -ItemType Directory -Force $keys | Out-Null
         $secrets=Join-Path $keys 'signing.json'
         if(!(Test-Path -LiteralPath $secrets)){
@@ -80,10 +114,41 @@ try {
         }
     }
     $task=if($Debug){'assembleDebug'}else{'assembleRelease'}
-    Invoke-AndroidBuildTool $gradle @('-p','android','--no-daemon',$task) (Join-Path $output 'apk-build.log')
+    if($RunUiChecks){
+        $env:IOR_UI_TEST_CLASSPATH=Join-Path $output 'ui-test-classpath.txt'
+        Invoke-AndroidBuildTool $gradle @('-p','android','--no-daemon','exportUiTestClasspath') (Join-Path $output 'unit-compile.log')
+        Invoke-AndroidBuildTool 'node.exe' @('scripts/run-android-ui-tests.cjs',$env:IOR_UI_TEST_CLASSPATH) (Join-Path $output 'unit-tests.log')
+    }
+    Invoke-AndroidBuildTool $gradle @('-p','android','--no-daemon',':app:clean',$task) (Join-Path $output 'apk-build.log')
     $variant=if($Debug){'debug'}else{'release'}
     $apk=Join-Path $output 'ior-android-arm64.apk'
     Copy-Item -LiteralPath "android/app/build/outputs/apk/$variant/app-$variant.apk" -Destination $apk
+    & "$PSScriptRoot/Assert-AndroidApkClasses.ps1" -Apk $apk
     Invoke-AndroidBuildTool (Join-Path $env:ANDROID_HOME 'build-tools/36.0.0/apksigner.bat') @('verify',$apk)
+    if($ReuseVerifiedNative){
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip=[IO.Compression.ZipFile]::OpenRead($apk)
+        try {
+            $packagedLibraries=@($zip.Entries | Where-Object FullName -Match '\.so$')
+            if($packagedLibraries.Count -ne $nativeEntries.Count){throw 'Packaged Android native library set changed'}
+            foreach($expected in $nativeEntries){
+                $entry=$zip.GetEntry($expected.path)
+                if(!$entry){throw 'Packaged native library missing'}
+                $stream=$entry.Open();$sha=[Security.Cryptography.SHA256]::Create()
+                try{$actual=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','')}finally{$stream.Dispose();$sha.Dispose()}
+                if($actual -ne $expected.sha256){throw 'Packaged Android native library changed'}
+            }
+        } finally {$zip.Dispose()}
+        $signer=Join-Path $env:ANDROID_HOME 'build-tools/36.0.0/apksigner.bat'
+        function Read-UiApkCertificate([string]$File){
+            $ErrorActionPreference='Continue'
+            $report=& $signer verify --print-certs $File 2>&1
+            if($LASTEXITCODE -ne 0){throw 'APK certificate verification failed'}
+            $digest=($report | ForEach-Object {if("$_" -match '^Signer #1 certificate SHA-256 digest: (\w+)$'){$Matches[1]}} | Select-Object -First 1)
+            if(!$digest){throw 'APK certificate digest missing'}
+            return $digest
+        }
+        if((Read-UiApkCertificate "$baseline/distandroid/ior-android-arm64.apk") -ne (Read-UiApkCertificate $apk)){throw 'Android signing certificate changed'}
+    }
     Write-Host "APK ready: $apk"
-} finally { Pop-Location; Remove-Item Env:IOR_ANDROID_KEY_PASSWORD -ErrorAction SilentlyContinue }
+} finally { Pop-Location; Remove-Item Env:IOR_ANDROID_KEY_PASSWORD -ErrorAction SilentlyContinue;Remove-Item Env:IOR_ANDROID_UI_ASSETS -ErrorAction SilentlyContinue;Remove-Item Env:IOR_ANDROID_UI_JNI -ErrorAction SilentlyContinue;Remove-Item Env:IOR_UI_TEST_CLASSPATH -ErrorAction SilentlyContinue }

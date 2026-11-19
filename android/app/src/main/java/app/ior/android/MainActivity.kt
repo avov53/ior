@@ -64,7 +64,7 @@ class MainActivity:ComponentActivity() {
     private val notificationPermission=registerForActivityResult(ActivityResultContracts.RequestPermission()){}
     private val scanner=registerForActivityResult(ActivityResultContracts.StartActivityForResult()){if(it.resultCode==RESULT_OK)it.data?.getStringExtra("text")?.let{text->send("import",text)}}
     private val backupFile=registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")){uri->val bytes=pendingBackup;pendingBackup=null;if(uri!=null&&bytes!=null)worker.execute{try{contentResolver.openOutputStream(uri,"wt")!!.use{it.write(bytes)};message("Файл сохранён")}catch(_:Exception){message("Не удалось сохранить файл")}}}
-    private val restoreFile=registerForActivityResult(ActivityResultContracts.OpenDocument()){uri->if(uri!=null)worker.execute{try{val bytes=contentResolver.openInputStream(uri)!!.use{it.readNBytes(8*1024*1024+1)};val data=JSONObject(String(bytes,Charsets.UTF_8));runOnUiThread{if(data.optBoolean("includesSecrets"))password("Пароль резервной копии"){pass->restore(bytes,pass)}else restore(bytes,null)}}catch(_:Exception){message("Не удалось открыть резервную копию")}}}
+    private val restoreFile=registerForActivityResult(ActivityResultContracts.OpenDocument()){uri->if(uri!=null)worker.execute{try{val bytes=contentResolver.openInputStream(uri)!!.use{it.readNBytes(BackupCodec.MAX_BACKUP_BYTES+1)};require(bytes.size<=BackupCodec.MAX_BACKUP_BYTES);val data=JSONObject(String(bytes,Charsets.UTF_8));runOnUiThread{if(data.optBoolean("includesSecrets"))password("Пароль резервной копии"){pass->restore(bytes,pass)}else restore(bytes,null)}}catch(_:Exception){message("Не удалось открыть резервную копию")}}}
     override fun onCreate(savedInstanceState:Bundle?){
         super.onCreate(savedInstanceState)
         androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window,false)
@@ -85,15 +85,16 @@ class MainActivity:ComponentActivity() {
         }
         web.webChromeClient=object:WebChromeClient(){
             override fun onJsConfirm(view:WebView,url:String,message:String,result:android.webkit.JsResult):Boolean{AlertDialog.Builder(this@MainActivity).setMessage(message.take(500)).setPositiveButton("Да"){_,_->result.confirm()}.setNegativeButton("Отмена"){_,_->result.cancel()}.setOnCancelListener{result.cancel()}.localizedShow();return true}
-            override fun onShowFileChooser(view:WebView,callback:android.webkit.ValueCallback<Array<Uri>>,params:FileChooserParams):Boolean{fileCallback?.onReceiveValue(null);fileCallback=callback;importFile.launch(arrayOf("text/*","application/octet-stream","application/json"));return true}
+            override fun onShowFileChooser(view:WebView,callback:android.webkit.ValueCallback<Array<Uri>>,params:FileChooserParams):Boolean{fileCallback?.onReceiveValue(null);fileCallback=callback;importFile.launch(arrayOf("*/*"));return true}
         }
         if(!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)){setContentView(TextView(this).apply{text="Обновите Android System WebView для работы ior."});return}
         WebViewCompat.addWebMessageListener(web,"iorNative",setOf("https://appassets.androidplatform.net")){_,webMessage,origin,isMainFrame,_->
             if(isMainFrame&&origin.scheme=="https"&&origin.host=="appassets.androidplatform.net"&&origin.port in listOf(-1,443))try{
                 val raw=webMessage.data ?: return@addWebMessageListener
-                require(raw.length<=1024*1024)
+                require(raw.length<=12*1024*1024)
                 val command=JSONObject(raw);require(command.optInt("version")==1)
-                dispatch(command.getString("action"),command.optJSONObject("data") ?: JSONObject())
+                require(raw.length<=1024*1024 || command.optString("action")=="import")
+                dispatch(command.getString("action"),command.optJSONObject("data") ?: JSONObject(),command.optString("id"))
             }catch(_:Exception){message("Неверная команда интерфейса")}
         }
         ViewCompat.setOnApplyWindowInsetsListener(container){_,insets->
@@ -129,15 +130,45 @@ class MainActivity:ComponentActivity() {
         val target=when(selectedSub.optString("startupSelection","last")){"random"->candidates.randomOrNull();"lowest"->candidates.firstOrNull();else->candidates.firstOrNull{it.getString("id")==selectedSub.optString("lastUsedServerId")}?:candidates.firstOrNull()}?:run{message("Нет доступного сервера для автоподключения");return}
         runOnUiThread{if(epoch==startupEpoch.get()&&uiVisible&&repo.connection=="off"&&!isDestroyed){repo.select(target.getString("id"));val permission=VpnService.prepare(this);if(permission!=null)vpnPermission.launch(permission)else startVpn()}}
     }
+    private fun importServerFileOrLink(input:String,name:String) {
+        val raw=input.trim().removePrefix("\uFEFF")
+        require(raw.toByteArray().size<=5*1024*1024){"Файл больше 5 МиБ"}
+        if(raw.startsWith("https://",true)){
+            refresh(repo.addSubscription(raw,name).getString("id"))
+        }else if(raw.startsWith("{") || (raw.startsWith("[") && !raw.startsWith("[Interface]",true)) || Regex("(?m)^proxies\\s*:").containsMatchIn(raw)){
+            val document=SubscriptionClient(repo).parseProfileDocument(raw)
+            repo.importDocument(document,name,raw)
+            message(if(document.hasClientSettings)"Конфиг добавлен. Для DNS и TUN используются настройки ior." else "Конфиг добавлен")
+        }else{
+            repo.addServer(raw,name)
+            message("Конфигурация добавлена")
+        }
+    }
+    private fun readConfig(input:java.io.InputStream):String {
+        val limit=5*1024*1024
+        val output=java.io.ByteArrayOutputStream()
+        val buffer=ByteArray(8192)
+        while(true){
+            val count=input.read(buffer)
+            if(count<0)break
+            require(output.size()+count<=limit)
+            output.write(buffer,0,count)
+        }
+        return output.toString("UTF-8").removePrefix("\uFEFF")
+    }
     private var fileCallback:android.webkit.ValueCallback<Array<Uri>>?=null
     private val importFile=registerForActivityResult(ActivityResultContracts.OpenDocument()){uri->
         fileCallback?.onReceiveValue(null);fileCallback=null
-        if(uri!=null)worker.execute{try{val raw=contentResolver.openInputStream(uri)!!.use{String(it.readNBytes(1024*1024+1),Charsets.UTF_8)};require(raw.length<=1024*1024);send("import",raw)}catch(_:Exception){message("Не удалось открыть конфигурацию")}}
+        if(uri!=null)worker.execute{try{val raw=contentResolver.openInputStream(uri)!!.use{readConfig(it)};send("import",raw)}catch(_:Exception){message("Не удалось открыть конфигурацию")}}
     }
-    private fun dispatch(action:String,data:JSONObject){
+    private fun uiCommandResult(id:String,ok:Boolean,error:String=""){
+        if(id.isNotBlank())send("command-result",JSONObject().put("id",id).put("ok",ok).put("error",error))
+    }
+    private fun dispatch(action:String,data:JSONObject,requestId:String=""){
         if(action in listOf("connect","select","confirm-server-switch","subscription-settings"))startupEpoch.incrementAndGet()
         when(action){
-            "load"->{pageReady=true;send("state",repo.snapshot());SubscriptionWorker.schedule(this,true);if(startupClaimed.compareAndSet(false,true))startupWorker.execute{startupSubscriptions()}}
+            "check-app-update"->checkAppUpdate(true)
+            "load"->{pageReady=true;send("state",repo.snapshot());SubscriptionWorker.schedule(this,true);if(startupClaimed.compareAndSet(false,true)){startupWorker.execute{startupSubscriptions()};checkAppUpdate(false)}}
             "connect"->{cancelPingChecks();if(repo.connection=="on"&&repo.activeId==repo.selectedServer()?.optString("id")){startService(Intent(this,IorVpnService::class.java).setAction(IorVpnService.STOP))}else if(repo.connection in listOf("pending","reconnecting")){startService(Intent(this,IorVpnService::class.java).setAction(IorVpnService.STOP))}else{val permission=VpnService.prepare(this);if(permission!=null)vpnPermission.launch(permission)else startVpn()}}
             "scan"->scanner.launch(Intent(this,QrActivity::class.java))
             "paste"->{val clipboard=getSystemService(ClipboardManager::class.java);clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.let{send("import",it)}}
@@ -151,8 +182,10 @@ class MainActivity:ComponentActivity() {
             "export-diagnostics"->AlertDialog.Builder(this).setTitle("Экспорт диагностики").setMessage("Архив содержит события VPN, адреса серверов, домены и сетевые метрики. Конфигурации, пароли и ключи не включаются.").setPositiveButton("Экспортировать"){_,_->worker.execute{try{IorVpnService.flushDiagnostics();pendingDiagnostics=Diagnostics.get(this).export();runOnUiThread{diagnosticsFile.launch("ior-diagnostics.zip")}}catch(_:Exception){message("Не удалось экспортировать диагностику")}}}.setNegativeButton("Отмена",null).localizedShow()
             "vpn-system-settings"->try{startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS))}catch(_:Exception){message("Откройте системные настройки VPN")}
             "ping-group"->{val a=repo.snapshot().getJSONArray("servers");for(i in 0 until a.length()){val s=a.getJSONObject(i);if(s.optString("subscriptionId")==data.getString("id"))measure(s.getString("id"))}}
+            "ping-server"->measure(data.getString("id"))
             "ping-cancel"->cancelPingChecks()
             else->worker.execute{try{when(action){
+                "ui-appearance"->repo.saveAppearance(data)
                 "settings"->{repo.saveSettings(data);val settings=repo.snapshot();Diagnostics.get(this).configure(settings.optInt("journalMaxMb",20),settings.optInt("journalDays",7));MobileTrafficPolicy.changed();send("journal-size",Diagnostics.get(this).size())}
                 "journal-size"->{val settings=repo.snapshot();Diagnostics.get(this).configure(settings.optInt("journalMaxMb",20),settings.optInt("journalDays",7));send("journal-size",Diagnostics.get(this).size())}
                 "lan-settings"->{repo.saveLan(data);if(repo.connection!="on")message("LAN включится после подключения VPN")}
@@ -161,7 +194,7 @@ class MainActivity:ComponentActivity() {
                 "route-enabled"->changeRouting{repo.routingEnabled(data.getBoolean("enabled"))}
                 "hwid-mode"->repo.setHwidMode(data.getString("id"),data.getString("mode"))
                 "select"->{val id=data.getString("id");repo.select(id);measure(id);if(repo.connection=="on"&&repo.activeId!=id)message("Сервер выбран. Нажмите подключение, чтобы переподключиться")}
-                "import"->{if(data.optString("tab")=="subscription"){val item=repo.addSubscription(data.getString("value"),data.optString("name"));refresh(item.getString("id"))}else{repo.addServer(data.getString("value"),data.optString("name"));message("Конфигурация добавлена")}}
+                "import"->{if(data.optString("tab")=="subscription"){val item=repo.addSubscription(data.getString("value").trim(),data.optString("name"));refresh(item.getString("id"))}else importServerFileOrLink(data.getString("value"),data.optString("name"))}
                 "edit"->{if(data.optString("kind")=="route")repo.saveRoute(data)else repo.addServer(data.getString("raw"),data.getString("name"),data.optString("id").ifBlank{null});send("editor-saved",true)}
                 "duplicate"->{val source=repo.server(data.getString("id")) ?: error("Сервер удалён");repo.addServer(source.getString("raw"),source.getString("name")+" · копия",java.util.UUID.randomUUID().toString());message("Создана копия")}
                 "delete"->{if(data.optString("kind")=="subscription")androidx.work.WorkManager.getInstance(this).cancelUniqueWork("ior-subscription-"+data.getString("id"));val id=data.getString("id");require(repo.activeId!=id && !(data.getString("kind")=="subscription" && repo.activeId.isNotBlank() && repo.server(repo.activeId)?.optString("subscriptionId")==id)){"Сначала отключите активный сервер"};repo.delete(data.getString("kind"),id)}
@@ -173,13 +206,13 @@ class MainActivity:ComponentActivity() {
                 "clear-logs"->{IorVpnService.flushDiagnostics();Diagnostics.get(this).clear();repo.clearLogs();send("journal-size",Diagnostics.get(this).size())}
                 "import-route"->{val document=JSONObject(data.getString("raw"));require(document.optString("type")=="ior-android-route"&&document.optInt("version")==1);val route=document.getJSONObject("item").put("id",java.util.UUID.randomUUID().toString());repo.saveRoute(route);message("Маршрут импортирован")}
                 "export-route"->{val routes=repo.snapshot().getJSONArray("routes");val route=(0 until routes.length()).map{routes.getJSONObject(it)}.first{it.getString("id")==data.getString("id")};pendingBackup=JSONObject().put("type","ior-android-route").put("version",1).put("item",route).toString().toByteArray();runOnUiThread{backupFile.launch("ior-android-route.json")}}
-                else->message("Действие не поддерживается")
-            }}catch(error:Exception){message(error.message?.takeIf{it.length<=120&&!it.contains("://")} ?: "Не удалось выполнить действие")}}
+                else->error("Действие не поддерживается")
+            };uiCommandResult(requestId,true)}catch(error:Exception){val safe=error.message?.takeIf{it.length<=120&&!it.contains("://")} ?: "Не удалось выполнить действие";message(safe);uiCommandResult(requestId,false,safe)}}
         }
     }
     private fun changeRouting(change:()->Unit){
         require(repo.connection in listOf("on","off")){"Дождитесь завершения подключения"}
-        val before=repo.snapshot()
+        val before=repo.snapshot().let{JSONObject().put("selectedRoute",it.optString("selectedRoute")).put("routingEnabled",it.optBoolean("routingEnabled",true))}
         try{change();repo.selectedServer()?.let{repo.request(it)};if(repo.connection=="on")ContextCompat.startForegroundService(this,Intent(this,IorVpnService::class.java).setAction("app.ior.android.ROUTING").putExtra("previousRouting",before.toString()))}
         catch(error:Exception){repo.restoreRouting(before);throw error}
     }
@@ -227,12 +260,35 @@ class MainActivity:ComponentActivity() {
     private fun restore(bytes:ByteArray,password:CharArray?){worker.execute{try{val imported=BackupCodec.decode(bytes,password);val count=imported.getJSONArray("servers").length();runOnUiThread{AlertDialog.Builder(this).setTitle("Заменить данные приложения?").setMessage("Серверов: $count. Существующие конфигурации будут заменены. VPN должен быть отключён.").setPositiveButton("Восстановить"){_,_->worker.execute{try{repo.replace(imported);message("Данные восстановлены")}catch(_:Exception){message("Восстановление не выполнено")}}}.setNegativeButton("Отмена",null).localizedShow()}}catch(_:Exception){message("Неверный пароль или повреждённая копия")}finally{password?.fill('\u0000')}}}
     private fun password(title:String,callback:(CharArray)->Unit){val field=EditText(this).apply{inputType=android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD};AlertDialog.Builder(this).setTitle(title).setView(field).setPositiveButton("Продолжить"){_,_->val pass=field.text.toString().toCharArray();field.text.clear();callback(pass)}.setNegativeButton("Отмена",null).localizedShow()}
     private fun AlertDialog.Builder.localizedShow():AlertDialog {val dialog=show();dialog.window?.decorView?.let{Localization.apply(this@MainActivity,repo.snapshot(),it)};return dialog}
+    private val updateInProgress=java.util.concurrent.atomic.AtomicBoolean(false)
+    private fun checkAppUpdate(manual:Boolean){
+        if(!updateInProgress.compareAndSet(false,true))return
+        Thread({
+            try{
+                val link=AppUpdate.check()
+                runOnUiThread{
+                    if(isDestroyed || isFinishing)return@runOnUiThread
+                    if(link!=null)AlertDialog.Builder(this)
+                        .setTitle("Доступно обновление ior")
+                        .setMessage(link.substringAfterLast('/'))
+                        .setPositiveButton("Открыть релиз"){_,_->
+                            try{startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(link)))}
+                            catch(_:android.content.ActivityNotFoundException){message("Не удалось открыть страницу релиза")}
+                        }
+                        .setNegativeButton("Позже",null).localizedShow()
+                    else if(manual)message("Установлена актуальная версия ior")
+                }
+            }catch(_:Exception){
+                if(manual)message("Не удалось проверить обновление ior")
+            }finally{updateInProgress.set(false)}
+        },"ior-app-update").start()
+    }
     private fun message(text:String){send("message",Localization.translate(this,repo.snapshot(),text))}
-    private fun send(event:String,data:Any){if(!uiVisible&&event in listOf("state","stats","latency","log"))return;val json=JSONObject().put("event",event).put("data",data).toString();runOnUiThread{if(::web.isInitialized&&pageReady&&!isFinishing&&!isDestroyed)web.evaluateJavascript("window.iorAndroidReceive($json)",null)}}
+    private fun send(event:String,data:Any){if(event=="state"&&data is JSONObject)data.put("appVersion",BuildConfig.VERSION_NAME);if(!uiVisible&&event in listOf("state","stats","latency","log"))return;val json=JSONObject().put("event",event).put("data",data).toString();runOnUiThread{if(::web.isInitialized&&pageReady&&!isFinishing&&!isDestroyed)web.evaluateJavascript("window.iorAndroidReceive($json)",null)}}
     private fun receiveIntent(intent:Intent?){
         if(intent==null)return
         val stream=if(intent.action==Intent.ACTION_SEND){if(Build.VERSION.SDK_INT>=33)intent.getParcelableExtra(Intent.EXTRA_STREAM,Uri::class.java)else @Suppress("DEPRECATION") intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)}else if(intent.action==Intent.ACTION_VIEW&&intent.data?.scheme=="content")intent.data else null
-        if(stream!=null){worker.execute{try{val raw=contentResolver.openInputStream(stream)!!.use{String(it.readNBytes(1024*1024+1),Charsets.UTF_8)};require(raw.length<=1024*1024);runOnUiThread{if(pageReady)send("import",raw)else pendingImport=raw}}catch(_:Exception){message("Не удалось открыть переданный файл")}};return}
+        if(stream!=null){worker.execute{try{val raw=contentResolver.openInputStream(stream)!!.use{readConfig(it)};runOnUiThread{if(pageReady)send("import",raw)else pendingImport=raw}}catch(_:Exception){message("Не удалось открыть переданный файл")}};return}
         pendingImport=when(intent.action){Intent.ACTION_SEND->intent.getStringExtra(Intent.EXTRA_TEXT);Intent.ACTION_VIEW->intent.dataString;else->null}
     }
     override fun onNewIntent(intent:Intent){super.onNewIntent(intent);receiveIntent(intent);pendingImport?.let{if(pageReady){send("import",it);pendingImport=null}}}

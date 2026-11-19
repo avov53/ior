@@ -3,12 +3,16 @@ android {
     namespace = "app.ior.android"
     compileSdk = 36
     buildFeatures { buildConfig = true }
+    val uiAssets = System.getenv("IOR_ANDROID_UI_ASSETS")
+    if (uiAssets != null) sourceSets.getByName("main").assets.setSrcDirs(listOf(uiAssets))
+    val uiJni = System.getenv("IOR_ANDROID_UI_JNI")
+    if (uiJni != null) sourceSets.getByName("main").jniLibs.setSrcDirs(listOf(uiJni))
     defaultConfig {
         applicationId = "app.ior.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 22
-        versionName = "1.2.6"
+        versionCode = 23
+        versionName = "1.2.7"
         ndk { abiFilters += "arm64-v8a" }
     }
     signingConfigs {
@@ -46,4 +50,16 @@ dependencies {
     testImplementation("org.json:json:20240303")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     testImplementation("com.squareup.okhttp3:okhttp-tls:4.12.0")
+}
+
+// Export the same local test classpath without Gradle's Windows @argfile
+// worker launcher, which misreads non-ASCII paths with JDK 17.
+tasks.register("exportUiTestClasspath") {
+    val unitTest = tasks.named<org.gradle.api.tasks.testing.Test>("testReleaseUnitTest")
+    dependsOn("compileReleaseUnitTestKotlin", "compileReleaseUnitTestJavaWithJavac",
+        "processReleaseUnitTestJavaRes", "bundleReleaseClassesToRuntimeJar", "processReleaseResources")
+    doLast {
+        val target = System.getenv("IOR_UI_TEST_CLASSPATH") ?: error("IOR_UI_TEST_CLASSPATH is required")
+        file(target).writeText(unitTest.get().classpath.asPath, Charsets.UTF_8)
+    }
 }

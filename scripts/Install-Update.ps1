@@ -4,7 +4,7 @@ function Get-InstallerFileHash([string]$LiteralPath){
  $stream=[IO.File]::OpenRead($LiteralPath);$algorithm=[Security.Cryptography.SHA256]::Create()
  try{return @{Hash=[BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-','')}}finally{$algorithm.Dispose();$stream.Dispose()}
 }
-$job=Get-Content -LiteralPath $Manifest -Raw|ConvertFrom-Json
+$job=Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8|ConvertFrom-Json
 $source=[IO.Path]::GetFullPath($job.source)
 $target=[IO.Path]::GetFullPath($job.target).TrimEnd('\')
 $root=[IO.Path]::GetFullPath($job.root).TrimEnd('\')

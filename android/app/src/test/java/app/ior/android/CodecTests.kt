@@ -136,6 +136,8 @@ class CodecTests {
         val raw="[Interface]\nPrivateKey = $key\nAddress = 10.7.0.2/32\nJc = 2\nH1 = 100-110\n[Peer]\nPublicKey = $key\nEndpoint = example.com:1234\nAllowedIPs = 0.0.0.0/0"
         val profile=ProfileCodec.parse(raw)
         assertEquals("100-110",profile.getJSONObject("wire").getJSONObject("options").getJSONObject("awg").getString("h1"))
+        val commented=ProfileCodec.parse("# exported config\n"+raw+"\nAllowedIPs = ::/0")
+        assertEquals(2,commented.getJSONObject("wire").getJSONObject("options").getJSONArray("allowedIps").length())
         assertThrows(IllegalArgumentException::class.java){ProfileCodec.parse(raw.replace("Jc = 2","NotAWG = 2"))}
     }
     @Test fun routesRetainOrderAndRejectUnknownActions(){

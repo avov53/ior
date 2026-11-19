@@ -149,3 +149,36 @@ tableView=function(){return subscriptionHeaderTable().replace(/<button[^>]*data-
 const subscriptionHeaderMenu=menuView;menuView=function(){return subscriptionHeaderMenu().replace(/<button[^>]*data-action="subscription-refresh"[^>]*>[\s\S]*?<\/button>/g,'');};
 const subscriptionHeaderAction=handleNativeAction;handleNativeAction=async function(action,id,el){if(action==='subscription-ping'){await perform('subscription.latency.refresh',{id},result=>showToast('Проверка пинга завершена: '+(result?.count||0)));return true;}return subscriptionHeaderAction(action,id,el);};
 const subscriptionHeaderDOM=updatePrototypeDOM;updatePrototypeDOM=function(html){subscriptionHeaderDOM(html);for(const button of root.querySelectorAll('[data-action=subscription-ping]'))button.disabled=nativeBusy;};
+
+async function loadDroppedConfig(file) {
+  const target = dialog;
+  if (!file || target?.kind !== 'import') return;
+  try {
+    if (file.size > 5000000) throw new Error('Файл конфигурации слишком большой');
+    const value = (await file.text()).replace(/^\uFEFF/, '').trim();
+    if (!value) throw new Error('Файл конфигурации пуст');
+    if (dialog !== target) return;
+    Object.assign(target, { tab: 'config', value, error: '' });
+    render();
+  } catch (error) {
+    if (dialog === target) { target.error = error.message; render(); }
+  }
+}
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-config-browse]');
+  if (button) button.parentElement.querySelector('[data-config-file]').click();
+});
+document.addEventListener('change', event => {
+  if (event.target.matches('[data-config-file]')) void loadDroppedConfig(event.target.files[0]);
+});
+for (const type of ['dragover', 'drop']) {
+  document.addEventListener(type, event => {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    const field = event.target.closest('textarea[data-dialog="value"]');
+    if (type === 'drop' && dialog?.kind === 'import' && field) {
+      if (event.dataTransfer.files.length === 1) void loadDroppedConfig(event.dataTransfer.files[0]);
+      else showToast('Перетащите один файл конфигурации');
+    }
+  });
+}

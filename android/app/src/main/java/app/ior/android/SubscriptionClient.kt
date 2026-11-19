@@ -37,6 +37,10 @@ class SubscriptionClient(
     }
     private fun refreshOnce(id:String,automatic:Boolean) {
         val item=repo.subscriptions().first{it.getString("id")==id}
+        if(item.optBoolean("localFile")){
+            require(automatic){"Это локальный файл. Для обновления импортируйте новый конфиг."}
+            return
+        }
         val deadline=System.nanoTime()+item.optInt("requestTimeoutMs",10000).coerceIn(5000,15000)*1000000L
         try {
             MobileTrafficPolicy.check(automatic)
@@ -92,7 +96,11 @@ class SubscriptionClient(
                     require(response.isSuccessful){"Ошибка HTTP ${response.code}"}
                     val bytes=response.body?.byteStream()?.use{it.readNBytes(5*1024*1024+1)} ?: error("Пустая подписка")
                     require(bytes.size<=5*1024*1024){"Подписка слишком велика"}
-                    val servers=parse(String(bytes,Charsets.UTF_8))
+                    val body=String(bytes,Charsets.UTF_8).trim().removePrefix("\uFEFF")
+                    val json=if(body.startsWith('{'))JSONObject(body) else null
+                    val routingFlag=response.header("Routing-Enable")?.lowercase()
+                    val embedded=if(routingFlag==null && json?.has("proxies")==true && json.has("rules"))parseProfileDocument(body) else null
+                    val servers=embedded?.profiles ?: parse(body)
                     if(skipped.isNotEmpty())item.put("importWarning","Пропущены записи: "+skipped.entries.joinToString{it.key+": "+it.value})else item.remove("importWarning")
                     if(servers.isEmpty()&&skipped.isNotEmpty()){item.put("status",item.getString("importWarning"));repo.updateSubscription(item,null,false);return}
                     require(servers.isNotEmpty()){ "Нет поддерживаемых конфигураций в подписке" }
@@ -101,11 +109,11 @@ class SubscriptionClient(
                     val info=response.header("subscription-userinfo")
                     if(info!=null){val metadata=JSONObject();info.split(';').forEach{val parts=it.trim().split('=',limit=2);if(parts.size==2&&parts[0] in listOf("upload","download","total","expire"))parts[1].toLongOrNull()?.let{n->metadata.put(parts[0],n)}};item.put("metadata",metadata)}
                     response.header("Announce")?.takeIf{it.length<=4096}?.let{encoded->item.put("announcement",try{String(Base64.getDecoder().decode(encoded),Charsets.UTF_8).take(2048)}catch(_:Exception){encoded.take(2048)})}
-                    val routingFlag=response.header("Routing-Enable")?.lowercase()
                     if(routingFlag in listOf("true","1")){
                         try {val supplied=response.header("Routing") ?: error("Routing header пуст");repo.synchronizeRoute(item,SubscriptionRoutes.decode(supplied,requestHttp),true)}catch(_:Exception){MobileTrafficPolicy.check(automatic);item.put("routingWarning","Не удалось обновить маршрут; прежний сохранён")}
                     }else if(routingFlag in listOf("false","0"))repo.synchronizeRoute(item,null,false)
-                    else if(String(bytes,Charsets.UTF_8).contains("proxies:")){
+                    else if(embedded?.route!=null)repo.synchronizeRoute(item,embedded.route.put("name","Маршрут Clash"),true)
+                    else if(body.contains("proxies:")){
                         val yaml=Yaml(SafeConstructor(LoaderOptions().apply{codePointLimit=5*1024*1024;maxAliasesForCollections=20})).load<Map<String,Any>>(String(bytes,Charsets.UTF_8))
                         if(yaml.containsKey("rules"))repo.synchronizeRoute(item,JSONObject().put("name","Маршрут Clash").put("format","clash").put("sourceFormat","clash").put("raw",String(bytes,Charsets.UTF_8)),true)
                     }
@@ -118,6 +126,66 @@ class SubscriptionClient(
     }
     private val skipped=linkedMapOf<String,Int>()
     private fun excluded(type:String):Boolean{val name=when(type.lowercase()){ "vmess"->"VMess";"ss","shadowsocks"->"Shadowsocks";"trojan"->"Trojan";else->return false};skipped[name]=(skipped[name]?:0)+1;return true}
+    data class ProfileDocument(val profiles:List<JSONObject>,val route:JSONObject?,val hasClientSettings:Boolean)
+    fun parseProfileDocument(text:String):ProfileDocument {
+        val yaml=Yaml(SafeConstructor(LoaderOptions().apply{codePointLimit=5*1024*1024;maxAliasesForCollections=20}))
+        fun unpack(value:Any?):Any?=when(value){
+            is JSONObject->value.keys().asSequence().associateWith{unpack(value.get(it))}
+            is JSONArray->(0 until value.length()).map{unpack(value.get(it))}
+            JSONObject.NULL->null
+            else->value
+        }
+        val document=when(text.trimStart().first()){
+            '{'->unpack(JSONObject(text))
+            '['->unpack(JSONArray(text))
+            else->yaml.load<Any>(text)
+        }
+        val mapping=document as? Map<*,*>
+        val single=mapping?.takeIf{it.containsKey("raw") || it.containsKey("type") || it.containsKey("protocol")}
+        val entries=(mapping?.get("proxies") ?: mapping?.get("outbounds") ?: mapping?.get("profiles") ?: mapping?.get("servers") ?: single?.let{listOf(it)} ?: document) as? List<*> ?: error("В файле нет списка серверов")
+        require(entries.isNotEmpty()){"В файле Clash нет серверов"}
+        val profiles=entries.map{entry->
+            if(entry is String)return@map ProfileCodec.parse(entry)
+            val map=entry as? Map<*,*> ?: error("Некорректная запись сервера")
+            (map["raw"] as? String)?.let{return@map ProfileCodec.parse(it,map["name"]?.toString().orEmpty())}
+            fromMap(map)
+        }
+        val route=mapping?.get("rules")?.let{source->
+            require(source is List<*>){"Ожидается список правил Clash"}
+            val names=profiles.map{it.getString("name")}.toSet()
+            val groups=(mapping["proxy-groups"] as? List<*>).orEmpty().filterIsInstance<Map<*,*>>()
+            val rules=JSONArray()
+            var expandedLength=0L
+            for(line in source){
+                val parts=line.toString().split(',').map{it.trim()}
+                val match=parts.first().equals("MATCH",true)
+                require(if(match) parts.size==2 else parts.size==3 || parts.size==4 && parts.last().equals("no-resolve",true)){"Неподдерживаемое правило Clash"}
+                val action=parts[if(match)1 else 2]
+                val group=groups.find{it["name"]==action}
+                val target=when{
+                    action in setOf("DIRECT","REJECT","PROXY")->action
+                    names.size==1 && action in names->"PROXY"
+                    group?.get("type")=="select" && (group["proxies"] as? List<*>)?.toSet()==names->"PROXY"
+                    else->error("Действие правила нельзя применить к выбранному серверу")
+                }
+                var kind=parts.first().uppercase()
+                var value=if(match) "" else parts[1]
+                if(kind=="RULE-SET"){
+                    val provider=(mapping["rule-providers"] as? Map<*,*>)?.get(value) as? Map<*,*>
+                    require(provider?.get("type")=="inline" && provider["behavior"]=="ipcidr"){"Поддерживаются встроенные списки IP-подсетей"}
+                    val payload=provider?.get("payload") as? List<*> ?: error("Пустой список подсетей")
+                    require(payload.isNotEmpty() && payload.all{it is String && it.isNotBlank() && !it.contains('\n')})
+                    expandedLength+=payload.sumOf{(it as String).length.toLong()+1}
+                    require(expandedLength<=5*1024*1024){"Встроенные списки подсетей слишком велики"}
+                    kind="IP-SET"
+                    value=payload.joinToString("\n")
+                }
+                rules.put(JSONObject().put("kind",kind).put("value",value).put("target",target).put("noResolve",parts.size==4))
+            }
+            JSONObject().put("format","ior").put("sourceFormat","clash").put("raw",rules.toString())
+        }
+        return ProfileDocument(profiles,route,mapping?.keys?.any{it in setOf("dns","tun","hosts","mixed-port")}==true)
+    }
     private fun parse(raw:String):List<JSONObject> {
         skipped.clear()
         var text=raw.trim()
@@ -145,7 +213,7 @@ class SubscriptionClient(
         val stream=map["transport"] as? Map<*,*>
         val network=value("network").ifBlank{stream?.get("type")?.toString().orEmpty().ifBlank{"tcp"}}
         require(network in listOf("tcp","raw","ws","websocket","grpc","httpupgrade","xhttp")){"Транспорт не поддерживается"}
-        require(value("obfs").isBlank() && value("skip-cert-verify")!="true"){"Параметры безопасности не поддерживаются"}
+        require((type in listOf("hy2","hysteria2") || value("obfs").isBlank()) && value("skip-cert-verify")!="true"){"Параметры безопасности не поддерживаются"}
         val host=value("server");val authority=if(host.contains(':'))"[$host]" else host;val port=value("port","server_port").ifBlank{"443"}
         val tls=map["tls"] as? Map<*,*>
         require(tls?.get("insecure")!=true){"Отключение проверки TLS не поддерживается"}
@@ -188,7 +256,12 @@ class SubscriptionClient(
             val kind=obfsMap?.get("type")?.toString() ?: obfs?.toString().orEmpty()
             val password=obfsMap?.get("password")?.toString() ?: value("obfs-password")
             val insecure=map["skip-cert-verify"] ?: tls?.get("insecure") ?: map["insecure"]
-            link+"&obfs=${encode(kind)}&obfs-password=${encode(password)}"+(if(insecure!=null)"&insecure=$insecure" else "")
+            val ports=(map["server_ports"] as? List<*>)?.joinToString(","){it.toString().replace(':','-')} ?: value("ports")
+            val interval=value("hop-interval","hop_interval").removeSuffix("s")
+            val pin=value("fingerprint")
+            link+(if(ports.isNotBlank())"&mport=${encode(ports)}" else "")+
+                (if(interval.isNotBlank())"&hopInterval=${encode(interval)}" else "")+
+                (if(pin.isNotBlank())"&pinSHA256=${encode(pin)}" else "")+"&obfs=${encode(kind)}&obfs-password=${encode(password)}"+(if(insecure!=null)"&insecure=$insecure" else "")
         }else link
         return ProfileCodec.parse(completeLink,value("name","tag"))
     }

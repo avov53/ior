@@ -1,7 +1,7 @@
 @echo off
 setlocal
-echo Building current Android APK with ior-core Rust...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\Build-Android.ps1" -OutputDirectory "%~dp0distandroid"
+echo Building Android distribution...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\Build-AndroidDistribution.ps1" %*
 if errorlevel 1 (
     echo.
     echo Android build failed. See the error above.

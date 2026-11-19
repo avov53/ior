@@ -4,6 +4,9 @@ namespace HappBox;
 
 public sealed class AppState
 {
+    // Presentation only. Never used to generate a core/network configuration.
+    private Dictionary<string,string> _uiAppearance=[];
+    public Dictionary<string, string> UiAppearance { get => _uiAppearance; set => _uiAppearance=value??[]; }
     public string ServiceAvailableColor {get;set;}="#34c759";
     public string ServiceUnavailableColor {get;set;}="#ff453a";
     public JournalPolicy Journal {get;set;}=new();
@@ -132,6 +135,9 @@ public sealed class ProxyProfile
     public CoreVlessTransportOptions? VlessTransport { get; set; }
     public string? ObfsType { get; set; }
     public string? ObfsPassword { get; set; }
+    public string? HysteriaHopPorts { get; set; }
+    public uint? HysteriaHopInterval { get; set; }
+    public string? HysteriaCertificatePin { get; set; }
     public string? PrivateKey { get; set; }
     public string? PeerPublicKey { get; set; }
     public string? PreSharedKey { get; set; }

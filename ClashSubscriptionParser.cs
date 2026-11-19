@@ -13,7 +13,7 @@ public static class ClashSubscriptionParser
         line.TrimStart('\uFEFF', ' ', '\t').StartsWith("proxy-providers:", StringComparison.Ordinal) ||
         line.TrimStart('\uFEFF', ' ', '\t').StartsWith("proxy-groups:", StringComparison.Ordinal));
 
-    public static Result Parse(string yaml, string? name = null)
+    public static Result Parse(string yaml, string? name = null, bool includeRouting = true)
     {
         if (yaml.Length > 2_000_000) throw new FormatException("Clash-подписка слишком велика.");
         if(IsJsonClash(yaml))yaml=NormalizeJson(yaml);
@@ -42,13 +42,13 @@ public static class ClashSubscriptionParser
                 if (!names.Add(profile.Name)) throw new FormatException("Повторяющееся имя Clash-сервера.");
                 if(RemovedProtocolPolicy.IsRemoved(profile)){removed++;rejected++;}else profiles.Add(profile);
             }
-            catch (FormatException) { rejected++; }
+            catch (FormatException) when (includeRouting || nodes.Children.Count != 1) { rejected++; }
         }
         if (profiles.Count == 0 && removed == 0)
             throw new FormatException($"В Clash-подписке нет поддерживаемых встроенных серверов (отклонено: {rejected}). Предыдущее состояние сохранено.");
 
         HappRoutingProfile? routing = null;
-        if (Get(root, "rules") is YamlSequenceNode rules && rules.Children.Count > 0)
+        if (includeRouting && Get(root, "rules") is YamlSequenceNode rules && rules.Children.Count > 0)
             routing = ClashProfileParser.Parse(yaml, name);
         return new Result(profiles, rejected, routing, removed);
     }
@@ -158,15 +158,18 @@ public static class ClashSubscriptionParser
                 profile.TlsEnabled = true;
                 profile.ObfsType = Value(item, "obfs");
                 profile.ObfsPassword = Value(item, "obfs-password");
-                if (Get(item, "ports") is not null)
-                    throw new FormatException("Переключение портов Hysteria2 пока не представлено в модели ior.");
+                profile.HysteriaHopPorts = Value(item, "ports");
+                if (Value(item, "hop-interval") is string interval)
+                    profile.HysteriaHopInterval = uint.TryParse(interval.TrimEnd('s'), out var seconds) && seconds >= 5
+                        ? seconds : throw new FormatException("Неверный интервал смены портов Hysteria2.");
+                profile.HysteriaCertificatePin = Value(item, "fingerprint");
                 break;
             default:
                 throw new FormatException($"Неподдерживаемый тип Clash-сервера: {type}.");
         }
         profile.Awg=item.Children.Where(field=>field.Key is YamlScalarNode key && RemovedProtocolPolicy.IsParameter(key.Value??"")).ToDictionary(field=>ProfileParser.AwgParameterNames.First(pair=>pair.Key.Equals(((YamlScalarNode)field.Key).Value,StringComparison.OrdinalIgnoreCase)||pair.Value.Equals(((YamlScalarNode)field.Key).Value,StringComparison.OrdinalIgnoreCase)).Value,field=>((YamlScalarNode)field.Value).Value??"");
         if(type is "awg" or "amneziawg" || profile.Awg.Count>0)profile.Protocol=ProxyProtocol.AmneziaWG;
-        var known=new HashSet<string>(["name","type","server","port","servername","sni","skip-cert-verify","udp","network","tls","client-fingerprint","ws-opts","grpc-opts","xhttp-opts","httpupgrade-opts","username","password","cipher","uuid","alterId","plugin","plugin-opts","flow","reality-opts","private-key","public-key","pre-shared-key","ip","ipv6","allowed-ips","mtu","persistent-keepalive","dns","obfs","obfs-password"],StringComparer.Ordinal);
+        var known=new HashSet<string>(["name","type","server","port","servername","sni","skip-cert-verify","udp","network","tls","client-fingerprint","ws-opts","grpc-opts","xhttp-opts","httpupgrade-opts","username","password","cipher","uuid","alterId","plugin","plugin-opts","flow","reality-opts","private-key","public-key","pre-shared-key","ip","ipv6","allowed-ips","mtu","persistent-keepalive","dns","obfs","obfs-password","ports","hop-interval","fingerprint","alpn"],StringComparer.Ordinal);
         foreach(var pair in ProfileParser.AwgParameterNames){known.Add(pair.Key);known.Add(pair.Value);}
         profile.UnsupportedParameters.AddRange(item.Children.Keys.OfType<YamlScalarNode>().Select(key=>key.Value??"").Where(key=>!known.Contains(key)));
         return profile;

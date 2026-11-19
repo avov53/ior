@@ -64,6 +64,8 @@ public static class CoreEngineService
                 var xrayPath = XrayCorePath(state);
                 if (!File.Exists(xrayPath))
                 { reason = "Xray не установлен. Добавьте проверенный xray.exe в папку core/xray приложения."; return false; }
+                if (profile.HysteriaHopPorts is not null || profile.HysteriaHopInterval is not null || profile.HysteriaCertificatePin is not null)
+                { reason = "Для Hysteria2 со сменой портов или проверкой отпечатка выберите ior-core."; return false; }
                 if (profile.Protocol == ProxyProtocol.Hysteria2 && !SupportsHysteria2(xrayPath))
                 { reason = "Этот xray.exe не поддерживает Hysteria2. Нужен Xray 26.9.9 или новее; встроенный бинарник обновлён."; return false; }
                 if (state.TunEnabled)

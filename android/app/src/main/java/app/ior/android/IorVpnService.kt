@@ -97,12 +97,32 @@ class IorVpnService:VpnService() {
                 val protocol=profile.getString("protocol")
                 val transport=profile.getJSONObject("options").optString("transport").ifBlank{when(protocol){"amneziawg"->"packet";"hysteria2"->"quic";else->"tcp"}}
                 synchronized(this){videoSamples.reset();trafficSamples.reset();lastTrafficSample=0
+                    socketOutcomes.clear()
                     Diagnostics.get(this).beginSession(request.getString("requestId"),protocol,transport)}
                 Diagnostics.get(this).record("ANDROID_PHYSICAL_NETWORK",networkFields())
                 val mtu=server.getJSONObject("wire").getJSONObject("options").optInt("mtu",1500)
                 val descriptor=ensureTun(physical)
+                Diagnostics.get(this).record("ANDROID_TUN_DESCRIPTOR_READY")
                 if(!wanted||revision!=generation.get())return@execute
-                val result=JSONObject(NativeCore.start(request.toString(),descriptor.fd,mtu,this))
+                repo.log("[INFO] VPN_STARTING · "+server.optString("protocol"))
+                val cellular=connectivity.getNetworkCapabilities(physical)?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)==true
+                val prepared=if(cellular) HysteriaBootstrap.resolvedRequest(request){host->
+                    resolveCellularEndpoint(physical,host)
+                } else null
+                if(!wanted||revision!=generation.get())return@execute
+                var result=JSONObject(NativeCore.start((prepared ?: request).toString(),descriptor.fd,mtu,this))
+                if(prepared==null && wanted && revision==generation.get()){
+                    val retry=HysteriaBootstrap.retryRequest(request,result){host->
+                        Diagnostics.get(this).record("ANDROID_BOOTSTRAP_NETWORK_DNS_STARTED")
+                        try{physical.getByName(host)}catch(_:java.net.UnknownHostException){
+                            error("ANDROID_BOOTSTRAP_NETWORK_DNS_FAILED")
+                        }
+                    }
+                    if(retry!=null && wanted && revision==generation.get()){
+                        Diagnostics.get(this).record("ANDROID_BOOTSTRAP_NETWORK_DNS_RESOLVED")
+                        result=JSONObject(NativeCore.start(retry.toString(),descriptor.fd,mtu,this))
+                    }
+                }
                 drainEvents()
                 if(!wanted||revision!=generation.get()){NativeCore.stop();return@execute}
                 require(result.optBoolean("ok")){result.optString("code","ANDROID_CORE_START_FAILED")}
@@ -111,6 +131,8 @@ class IorVpnService:VpnService() {
             } catch(error:Exception){
                 if(wanted&&revision==generation.get()){
                     previousRouting?.let{repo.restoreRouting(it);activeRequest=previousRequest;previousRouting=null;previousRequest=null;repo.log("ROUTING_APPLY_FAILED_PREVIOUS_RESTORED")}
+                    repo.log("[ERROR] VPN_START_FAILED · "+activeServer?.optString("protocol").orEmpty()+" · "+safeError(error))
+                    repo.log("[INFO] VPN_RETRY_SCHEDULED · Повторная попытка подключения через 5 с.")
                     repo.status("reconnecting",safeError(error),activeServer?.optString("id").orEmpty())
                     Diagnostics.get(this).record("ANDROID_VPN_RETRY",JSONObject().put("reason","TRANSPORT_UNAVAILABLE"))
                     worker.schedule({if(wanted&&revision==generation.get())network?.let{reconnect(it)}},5,TimeUnit.SECONDS)
@@ -147,11 +169,45 @@ class IorVpnService:VpnService() {
     }
     // Called by native Rust worker threads before any external connect/send.
     fun protectLanSocket(fd:Int):Boolean = wanted&&protect(fd)
+    private fun resolveCellularEndpoint(physical:Network,host:String):java.net.InetAddress? {
+        val answer=java.util.concurrent.CompletableFuture<java.net.InetAddress?>()
+        val cancel=android.os.CancellationSignal()
+        val diagnostics=Diagnostics.get(this)
+        diagnostics.record("ANDROID_BOOTSTRAP_NETWORK_DNS_STARTED")
+        return try {
+            android.net.DnsResolver.getInstance().query(physical,host,0,java.util.concurrent.Executor{it.run()},cancel,
+                object:android.net.DnsResolver.Callback<List<java.net.InetAddress>> {
+                    override fun onAnswer(addresses:List<java.net.InetAddress>,rcode:Int){
+                        answer.complete(if(rcode==0)addresses.firstOrNull() else null)
+                    }
+                    override fun onError(error:android.net.DnsResolver.DnsException){answer.complete(null)}
+                })
+            val address=answer.get(1200,TimeUnit.MILLISECONDS)
+            diagnostics.record(if(address!=null)"ANDROID_BOOTSTRAP_NETWORK_DNS_RESOLVED" else "ANDROID_BOOTSTRAP_NETWORK_DNS_UNAVAILABLE")
+            address
+        }catch(_:Exception){
+            diagnostics.record("ANDROID_BOOTSTRAP_NETWORK_DNS_UNAVAILABLE")
+            null
+        }finally{cancel.cancel()}
+    }
+
+    private val socketOutcomes=java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun socketOutcome(reason:String):Boolean {
+        if(socketOutcomes.add(reason)){
+            Diagnostics.get(this).record("ANDROID_SOCKET_BIND_RESULT",JSONObject().put("reason",reason))
+        }
+        return reason=="PROTECTED_AND_BOUND"
+    }
+
     fun protectSocket(fd:Int):Boolean {
         if(!wanted)return false
-        val physical=network ?: return false
-        if(!protect(fd))return false
-        return try{ParcelFileDescriptor.fromFd(fd).use{physical.bindSocket(it.fileDescriptor)};true}catch(_:Exception){false}
+        val physical=network ?: return socketOutcome("NO_PHYSICAL_NETWORK")
+        if(!protect(fd))return socketOutcome("VPN_PROTECT_FAILED")
+        return try{
+            ParcelFileDescriptor.fromFd(fd).use{physical.bindSocket(it.fileDescriptor)}
+            socketOutcome("PROTECTED_AND_BOUND")
+        }catch(_:Exception){socketOutcome("PHYSICAL_BIND_FAILED")}
     }
     private fun notification(status:String,name:String):Notification {
         val open=PendingIntent.getActivity(this,0,Intent(this,MainActivity::class.java),PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -169,8 +225,12 @@ class IorVpnService:VpnService() {
     }
     override fun onRevoke(){stopConnection("VPN_PERMISSION_REVOKED");super.onRevoke()}
     private fun networkFields():JSONObject {
-        val capabilities=network?.let{connectivity.getNetworkCapabilities(it)} ?: return JSONObject().put("physicalTransport","unavailable")
+        val selected=network ?: return JSONObject().put("physicalTransport","unavailable")
+        val addresses=connectivity.getLinkProperties(selected)?.linkAddresses.orEmpty()
+        val v4=addresses.any{it.address is java.net.Inet4Address};val v6=addresses.any{it.address is java.net.Inet6Address && !it.address.isLinkLocalAddress}
+        val capabilities=connectivity.getNetworkCapabilities(selected) ?: return JSONObject().put("physicalTransport","unavailable")
         return JSONObject().put("physicalTransport",when{capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)->"wifi";capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)->"cellular";capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)->"ethernet";else->"other"})
+            .put("addressFamily",when{v4&&v6->"dual";v4->"ipv4";v6->"ipv6";else->"unknown"})
             .put("validated",capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)).put("metered",!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED))
             .put("linkDownstreamKbps",capabilities.linkDownstreamBandwidthKbps).put("linkUpstreamKbps",capabilities.linkUpstreamBandwidthKbps)
     }
@@ -182,7 +242,13 @@ class IorVpnService:VpnService() {
             // File evidence is independent of the screen's INFO/DEBUG filter.
             diagnostics.record(code,safe)
             videoSamples.observe(code,event)?.let{diagnostics.record("VIDEO_NETWORK_SAMPLE",it)}
-            if(DiagnosticPolicy.console(code,safe,debug))repo.log("["+safe.optString("severity")+"] "+code+listOf("sessionId","flowId","phase","destination","destinationName","durationMs","reason","classification").filter{safe.has(it)}.joinToString("",transform={" · "+it+"="+safe.opt(it)}))
+            if (DiagnosticPolicy.console(code,safe,debug)) {
+                val fields = listOf("sessionId","flowId","phase","destination","destinationName","durationMs","reason","classification")
+                val visibleFields = if (code == "HYSTERIA2_HANDSHAKE_UDP_COUNTS") {
+                    fields + listOf("sentPackets", "receivedPackets", "forwardedPackets", "droppedPackets", "omittedSamples")
+                } else fields
+                repo.log("["+safe.optString("severity")+"] "+code+visibleFields.filter{safe.has(it)}.joinToString("",transform={" · "+it+"="+safe.opt(it)}))
+            }
         }
         val now=android.os.SystemClock.elapsedRealtime()
         if(repo.connection=="on" && now-lastTrafficSample>=5000){

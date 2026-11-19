@@ -131,6 +131,10 @@ html[data-theme=dark] select{color-scheme:dark}html[data-theme=light] select{col
 .reduced .setting-row input[type=checkbox][role=switch],.reduced .setting-row input[type=checkbox][role=switch]::after{transition:none}
 @media(prefers-reduced-motion:reduce){.setting-row input[type=checkbox][role=switch],.setting-row input[type=checkbox][role=switch]::after{transition:none}}
 .subscription-group>header>.subscription-header-actions{display:flex;align-items:center;justify-content:flex-end;gap:4px;flex:0 0 auto;margin-left:auto}.subscription-header-actions>.ui-button.icon-button{flex:0 0 32px;margin:0}.subscription-group>header>.group-button{min-width:0;margin-right:8px}
+
+.config-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.config-picker .config-picker-button { border-radius: 999px; padding: 10px 16px; }
+.config-picker small { color: var(--muted); }
 </style><script type="text/plain" id="third-party-licenses"># Components used by this prototype
 
 - Discovery catalog: https://www.shadcn.io/icons and https://www.shadcn.io/blocks
@@ -332,7 +336,7 @@ Minimum version required to store current data is: `+c+`.
     if(d.kind==='link')return `<div class="overlay"><section class="dialog" role="dialog" aria-modal="true" aria-label="Сохранённая ссылка"><div class="dialog-heading"><h2>Сохранённая ссылка</h2>${button('close-dialog',icon('close'),'icon-button','aria-label="Закрыть"')}</div><textarea readonly aria-label="Ссылка">${escape(d.value)}</textarea><p class="dialog-info">Ссылка может содержать секреты. Это конфигурация прототипа.</p></section></div>`;
     if(d.kind==='help')return `<div class="overlay"><section class="dialog" role="dialog" aria-modal="true" aria-label="О прототипе"><div class="dialog-heading"><div><h2>О прототипе</h2><p>Новый интерфейс ior</p></div>${button('close-dialog',icon('close'),'icon-button','aria-label="Закрыть"')}</div><p>Этот вариант создан отдельно от действующего интерфейса. Здесь можно оценить страницы, темы, меню и состояния. VPN и системные операции не запускаются.</p><p class="dialog-info">Перенос в приложение потребует отдельного решения. Работающие команды C# остаются в основном проекте.</p></section></div>`;
     const importing=d.kind==='import',route=d.kind==='route',title=importing?'Добавить сервер':d.id?(route?'Изменить маршрут':'Изменить профиль'):(route?'Новый маршрут':'Новый профиль');
-    return `<div class="overlay"><section class="dialog" role="dialog" aria-modal="true" aria-label="${title}"><div class="dialog-heading"><div><h2>${title}</h2><p>Данные только для визуального прототипа</p></div>${button('close-dialog',icon('close'),'icon-button','aria-label="Закрыть"')}</div><label class="dialog-field"><span>${importing?'Название (необязательно)':'Название'}</span><input data-dialog="name" data-focus="dialog-name" aria-label="Название" value="${escape(d.name)}" placeholder="${importing?'Название конфигурации':'Например, Работа'}"></label>${importing?`<div class="dialog-tabs" role="tablist" aria-label="Способ добавления">${[['link','Ссылка'],['subscription','Подписка'],['config','WireGuard / AWG']].map(([id,text])=>`<button data-action="import-tab" data-value="${id}" data-focus="import-${id}" role="tab" aria-selected="${d.tab===id}">${text}</button>`).join('')}</div><textarea data-dialog="value" data-focus="dialog-value" aria-label="Конфигурация" placeholder="${d.tab==='subscription'?'Ссылка на подписку':d.tab==='config'?'Содержимое конфигурации':'Ссылка на сервер'}">${escape(d.value)}</textarea><div class="input-helper"><small>Содержимое не передаётся серверу и не проверяется ядром.</small>${button('paste','Вставить','outline')}</div>`:route?`<label class="dialog-field"><span>Домены через VPN</span><textarea data-dialog="value" data-focus="dialog-value" aria-label="Домены" placeholder="example.com">${escape(d.value)}</textarea></label>`:'<p>Связь с реальными подписками и маршрутами подключается при переносе. Этот профиль используется только для оценки списка и редактора.</p>'}${d.error?`<div class="form-error" role="alert">${escape(d.error)}</div>`:''}<div class="dialog-actions">${button('close-dialog','Отмена','outline')}${button('save-dialog',importing?'Добавить в прототип':'Сохранить в прототип','primary')}</div></section></div>`;
+    return `<div class="overlay"><section class="dialog" role="dialog" aria-modal="true" aria-label="${title}"><div class="dialog-heading"><div><h2>${title}</h2><p>Данные только для визуального прототипа</p></div>${button('close-dialog',icon('close'),'icon-button','aria-label="Закрыть"')}</div><label class="dialog-field"><span>${importing?'Название (необязательно)':'Название'}</span><input data-dialog="name" data-focus="dialog-name" aria-label="Название" value="${escape(d.name)}" placeholder="${importing?'Название конфигурации':'Например, Работа'}"></label>${importing?`<div class="dialog-tabs" role="tablist" aria-label="Способ добавления">${[['link','Ссылка'],['subscription','Подписка'],['config','Файл / JSON']].map(([id,text])=>`<button data-action="import-tab" data-value="${id}" data-focus="import-${id}" role="tab" aria-selected="${d.tab===id}">${text}</button>`).join('')}</div>${d.tab==="config"?`<div class="config-picker"><button type="button" class="outline config-picker-button" data-config-browse>Выбрать файл</button><input hidden type="file" data-config-file accept=".conf,.yaml,.yml,.json,.txt"><small>Можно перетащить файл в поле ниже</small></div>`:""}<textarea data-dialog="value" data-focus="dialog-value" aria-label="Конфигурация" placeholder="${d.tab==='subscription'?'Ссылка на подписку':d.tab==='config'?'Содержимое конфигурации':'Ссылка на сервер'}">${escape(d.value)}</textarea><div class="input-helper"><small>Содержимое не передаётся серверу и не проверяется ядром.</small>${button('paste','Вставить','outline')}</div>`:route?`<label class="dialog-field"><span>Домены через VPN</span><textarea data-dialog="value" data-focus="dialog-value" aria-label="Домены" placeholder="example.com">${escape(d.value)}</textarea></label>`:'<p>Связь с реальными подписками и маршрутами подключается при переносе. Этот профиль используется только для оценки списка и редактора.</p>'}${d.error?`<div class="form-error" role="alert">${escape(d.error)}</div>`:''}<div class="dialog-actions">${button('close-dialog','Отмена','outline')}${button('save-dialog',importing?'Добавить в прототип':'Сохранить в прототип','primary')}</div></section></div>`;
   }
   function menuView(){if(!menu)return '';const m=menu;let content;
     if(m.kind==='app')content=`<div class="menu-heading">ior<small>Изолированный визуальный прототип</small></div>${button('menu-settings',icon('settings')+'Настройки<small>Ctrl+,</small>','', 'role="menuitem"')}${button('theme-quick',icon('sun')+(state.theme==='dark'?'Светлая тема':'Тёмная тема'),'','role="menuitem"')}<div class="divider"></div>${button('help',icon('info')+'О прототипе','','role="menuitem"')}${button('examples',icon('servers')+'Открыть тестовые примеры','','role="menuitem"')}`;
@@ -685,6 +689,39 @@ tableView=function(){return subscriptionHeaderTable().replace(/<button[^>]*data-
 const subscriptionHeaderMenu=menuView;menuView=function(){return subscriptionHeaderMenu().replace(/<button[^>]*data-action="subscription-refresh"[^>]*>[\s\S]*?<\/button>/g,'');};
 const subscriptionHeaderAction=handleNativeAction;handleNativeAction=async function(action,id,el){if(action==='subscription-ping'){await perform('subscription.latency.refresh',{id},result=>showToast('Проверка пинга завершена: '+(result?.count||0)));return true;}return subscriptionHeaderAction(action,id,el);};
 const subscriptionHeaderDOM=updatePrototypeDOM;updatePrototypeDOM=function(html){subscriptionHeaderDOM(html);for(const button of root.querySelectorAll('[data-action=subscription-ping]'))button.disabled=nativeBusy;};
+
+async function loadDroppedConfig(file) {
+  const target = dialog;
+  if (!file || target?.kind !== 'import') return;
+  try {
+    if (file.size > 5000000) throw new Error('Файл конфигурации слишком большой');
+    const value = (await file.text()).replace(/^\uFEFF/, '').trim();
+    if (!value) throw new Error('Файл конфигурации пуст');
+    if (dialog !== target) return;
+    Object.assign(target, { tab: 'config', value, error: '' });
+    render();
+  } catch (error) {
+    if (dialog === target) { target.error = error.message; render(); }
+  }
+}
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-config-browse]');
+  if (button) button.parentElement.querySelector('[data-config-file]').click();
+});
+document.addEventListener('change', event => {
+  if (event.target.matches('[data-config-file]')) void loadDroppedConfig(event.target.files[0]);
+});
+for (const type of ['dragover', 'drop']) {
+  document.addEventListener(type, event => {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    const field = event.target.closest('textarea[data-dialog="value"]');
+    if (type === 'drop' && dialog?.kind === 'import' && field) {
+      if (event.dataTransfer.files.length === 1) void loadDroppedConfig(event.dataTransfer.files[0]);
+      else showToast('Перетащите один файл конфигурации');
+    }
+  });
+}
 
 // Production-only subscription settings and opt-in LAN controls.
 function optionsToggle(key,label,value,disabled=false){return '<label class="setting-row"><strong>'+label+'</strong><input type="checkbox" role="switch" data-sub-option="'+key+'" '+(value?'checked ':'')+(disabled?'disabled ':'')+'></label>';}

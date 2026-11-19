@@ -17,5 +17,5 @@ object SubscriptionOptions {
         keys.forEach{if(input.has(it)&&!(required>0&&it=="refreshIntervalHours"))item.put(it,input.get(it))}
     }
     fun interval(item:JSONObject)=item.optInt("serverRefreshIntervalHours",0).takeIf{it in 1..168}?:item.optInt("refreshIntervalHours",6)
-    fun enabled(item:JSONObject)=item.optInt("serverRefreshIntervalHours",0)>0||item.optBoolean("autoRefreshEnabled",true)
+    fun enabled(item:JSONObject)=!item.optBoolean("localFile") && (item.optInt("serverRefreshIntervalHours",0)>0||item.optBoolean("autoRefreshEnabled",true))
 }

@@ -12,12 +12,12 @@ public static class ProfileParser
         return ParseManyDetailed(input).Profiles;
     }
 
-    public static ProfileParseResult ParseManyDetailed(string input)
+    public static ProfileParseResult ParseManyDetailed(string input, bool includeClashRouting = true)
     {
         var text = input.Trim();
         var profiles = new List<ProxyProfile>();
         if(ClashSubscriptionParser.LooksLikeClash(text))
-        { var clash=ClashSubscriptionParser.Parse(text);return new ProfileParseResult(clash.Profiles,clash.RejectedCount,clash.RemovedProtocolCount); }
+        { var clash=ClashSubscriptionParser.Parse(text, includeRouting: includeClashRouting);return new ProfileParseResult(clash.Profiles,clash.RejectedCount,clash.RemovedProtocolCount); }
         if(text.StartsWith('{') || text.StartsWith('[') && !text.StartsWith("[Interface]",StringComparison.OrdinalIgnoreCase))
             return JsonSubscriptionParser.Parse(text);
 
@@ -326,7 +326,14 @@ public static class ProfileParser
             }
 
             var parts = raw.Split('=', 2);
-            if (parts.Length == 2 && !result.TryAdd($"{section}.{parts[0].Trim()}", parts[1].Trim())) throw new FormatException("Повторный параметр WireGuard: " + parts[0].Trim());
+            if (parts.Length != 2) continue;
+            var parameter = parts[0].Trim();
+            var key = $"{section}.{parameter}";
+            var value = parts[1].Trim();
+            if (result.TryAdd(key, value)) continue;
+            if (!key.Equals("Peer.AllowedIPs", StringComparison.OrdinalIgnoreCase))
+                throw new FormatException("Повторный параметр WireGuard: " + parameter);
+            result[key] += "," + value;
         }
 
         return result;
